@@ -1,0 +1,48 @@
+{
+  "name": "attr",
+  "title": "wsync attr",
+  "category": "Live writes",
+  "description": "Lists, sets, or removes attributes on a live Studio instance.",
+  "subcommands": [
+    "set",
+    "rm",
+    "ls"
+  ],
+  "subcommandMetadata": {
+    "set": {
+      "safety": "mutates-studio",
+      "requires": [
+        "project",
+        "daemon",
+        "studio-plugin"
+      ]
+    },
+    "rm": {
+      "safety": "mutates-studio",
+      "requires": [
+        "project",
+        "daemon",
+        "studio-plugin"
+      ]
+    },
+    "ls": {
+      "safety": "read-only",
+      "requires": [
+        "project",
+        "daemon",
+        "studio-plugin"
+      ]
+    }
+  },
+  "usage": "wsync attr <set|rm|ls> [--project <path>] [--port <port>] --path <studio-path> [--name <attribute>] [--value <json>] [--raw]",
+  "examples": [
+    "wsync attr set --project . --path Workspace/Box --name Speed --value 12.5",
+    "wsync attr rm --project . --path Workspace/Box --name Speed",
+    "wsync attr ls --project . --path Workspace/Box"
+  ],
+  "notes": [
+    "`attr ls` is read-only; `attr set` and `attr rm` are written to `writes.log`.",
+    "`--value` uses the same JSON literal and tagged-value codec as `wsync set --value`.",
+    "Attributes on projected instances sync back to their `.data.json` sidecar. Setting the boolean `AvoidSync` attribute to true excludes that subtree from sync in both directions, including divergence comparison."
+  ]
+}

@@ -1,0 +1,7 @@
+/src-tauri/target/
+/src-tauri/gen/
+/src-tauri/binaries/*
+!/src-tauri/binaries/.gitkeep
+
+# Release-staged plugin artifact pair (build.rs populates on release builds)
+/src-tauri/resources/*

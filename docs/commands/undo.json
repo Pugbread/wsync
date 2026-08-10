@@ -1,0 +1,14 @@
+{
+  "name": "undo",
+  "title": "wsync undo",
+  "category": "Live writes",
+  "description": "Requests Studio to undo one change-history entry.",
+  "usage": "wsync undo [--project <path>] [--port <port>] [--raw]",
+  "examples": [
+    "wsync undo --project ."
+  ],
+  "notes": [
+    "Pairs naturally with `--waypoint` on `wsync set` for reversible batches.",
+    "A completed bulk disk-to-Studio pull is one recording, so one undo reverses the whole pull."
+  ]
+}

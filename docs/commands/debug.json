@@ -1,0 +1,52 @@
+{
+  "name": "debug",
+  "title": "wsync debug",
+  "category": "Studio control",
+  "description": "Drives Studio's play controls through keystroke automation.",
+  "subcommands": [
+    "play",
+    "run",
+    "start",
+    "stop"
+  ],
+  "subcommandMetadata": {
+    "play": {
+      "safety": "controls-studio-playtest",
+      "requires": [
+        "studio-application"
+      ]
+    },
+    "run": {
+      "safety": "controls-studio-playtest",
+      "requires": [
+        "studio-application"
+      ]
+    },
+    "start": {
+      "safety": "controls-studio-playtest",
+      "requires": [
+        "studio-application"
+      ]
+    },
+    "stop": {
+      "safety": "controls-studio-playtest",
+      "requires": [
+        "studio-application"
+      ]
+    }
+  },
+  "usage": "wsync debug [play|run|start|stop]",
+  "examples": [
+    "wsync debug",
+    "wsync debug run",
+    "wsync debug start",
+    "wsync debug stop"
+  ],
+  "notes": [
+    "Defaults to `play`. `play` starts a playtest with a character, `run` runs the place without one, `start` starts a local server plus one client, and `stop` ends the current session.",
+    "Implemented as keyboard shortcuts sent to Studio; macOS and Windows only, and Studio must be running and frontmost. On macOS the calling application needs Accessibility permission.",
+    "Requires the Studio application, not a daemon or plugin connection. It reports what it sent, not what Studio did — there is no confirmation channel.",
+    "For scripted, observable playtests with return values, streamed logs, virtual input, and captures, use `wsync playtest` instead.",
+    "Runtime changes made during a debug session never sync to disk."
+  ]
+}

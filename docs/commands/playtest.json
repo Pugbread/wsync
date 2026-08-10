@@ -1,0 +1,147 @@
+{
+  "name": "playtest",
+  "title": "wsync playtest",
+  "category": "Agent runtime",
+  "description": "Runs playscript-owned foreground sessions or controls lower-level asynchronous Studio playtests and isolated PlayServer and PlayClient runtime agents.",
+  "subcommands": [
+    "run",
+    "start",
+    "status",
+    "contexts",
+    "wait",
+    "exec",
+    "logs",
+    "ui",
+    "input",
+    "capture",
+    "stop",
+    "request"
+  ],
+  "subcommandMetadata": {
+    "run": {
+      "safety": "controls-playtest-and-runtime-execution",
+      "requires": [
+        "project",
+        "daemon",
+        "studio-plugin"
+      ]
+    },
+    "start": {
+      "safety": "controls-playtest",
+      "requires": [
+        "project",
+        "daemon",
+        "studio-plugin"
+      ]
+    },
+    "status": {
+      "safety": "read-only",
+      "requires": [
+        "project",
+        "daemon",
+        "studio-plugin"
+      ]
+    },
+    "contexts": {
+      "safety": "read-only",
+      "requires": [
+        "project",
+        "daemon",
+        "studio-plugin"
+      ]
+    },
+    "wait": {
+      "safety": "streaming-read",
+      "requires": [
+        "project",
+        "daemon",
+        "studio-plugin"
+      ]
+    },
+    "exec": {
+      "safety": "risky-live-execution",
+      "requires": [
+        "project",
+        "daemon",
+        "studio-plugin"
+      ]
+    },
+    "logs": {
+      "safety": "read-only",
+      "requires": [
+        "project",
+        "daemon",
+        "studio-plugin"
+      ]
+    },
+    "ui": {
+      "safety": "read-only",
+      "requires": [
+        "project",
+        "daemon",
+        "studio-plugin"
+      ]
+    },
+    "input": {
+      "safety": "mutates-playtest-input",
+      "requires": [
+        "project",
+        "daemon",
+        "studio-plugin"
+      ]
+    },
+    "capture": {
+      "safety": "writes-local-artifact",
+      "requires": [
+        "project",
+        "daemon",
+        "studio-plugin"
+      ]
+    },
+    "stop": {
+      "safety": "controls-playtest",
+      "requires": [
+        "project",
+        "daemon",
+        "studio-plugin"
+      ]
+    },
+    "request": {
+      "safety": "risky-live-execution",
+      "requires": [
+        "project",
+        "daemon",
+        "studio-plugin"
+      ]
+    }
+  },
+  "usage": "wsync playtest <run|start|status|contexts|wait|exec|logs|ui|input|capture|stop|request> [options]",
+  "examples": [
+    "wsync playtest run --project . --script ./check.server.luau --raw",
+    "wsync playtest run --project . --script ./bench.server.luau --client-script ./join.client.luau --mode multiplayer --players 2 --args '{\"map\":\"Lighthouse\",\"laps\":3}' --timeout 600 --raw",
+    "wsync playtest run --project . --script ./repro.server.luau --keep-open --logs warn",
+    "wsync playtest start --project . --mode play --wait --raw",
+    "wsync playtest start --project . --mode multiplayer --players 2 --wait --timeout 60 --raw",
+    "wsync playtest contexts --project . --raw",
+    "wsync playtest exec --project . --context server --source 'return #game.Players:GetPlayers()' --identity game --raw",
+    "wsync playtest logs --project . --context client:1 --since-seq 0 --limit 200 --raw",
+    "wsync playtest ui --project . --context client:1 --class TextButton --limit 200 --raw",
+    "wsync playtest input --project . --context client:1 --file ./input-actions.json --raw",
+    "wsync playtest capture --project . --context client:1 --skybox --ui overlay --size 1024x576 --output ./captures/client-1.png --raw",
+    "wsync playtest stop --project . --raw"
+  ],
+  "notes": [
+    "`run --script <file>` owns the complete foreground lifecycle: it starts a Studio playtest, waits for the selected `--context` (`server` by default), injects the playscript, streams progress, prints the return value, and stops the playtest without another WSync invocation.",
+    "Run flags are `--script`, `--context server|client:N`, optional `--client-script`, `--mode play|run|multiplayer`, `--players` (1-8), JSON `--args`, `--timeout` (600 seconds by default, maximum 3600), `--identity game|plugin`, `--logs off|info|warn|error`, `--keep-open`, `--quiet`, and `--raw`. Invalid JSON is rejected before a job starts.",
+    "The injected API exposes `playtest.args`, `mode`, `context`, and `jobId`; `emit(data)` and `log(msg)` stream progress; `done(value)` and `fail(msg)` complete from any task; and generation-scoped `signal`, `await`, and server-only `awaitClients` coordinate contexts.",
+    "The first completion wins. Main return or `done` exits 0; a main-script error or `fail` exits 2; hard timeout exits 3; an externally ended job exits 4 with its fetched `jobStatus`; and boot or required-context failure exits 5. Runs stop automatically except with `--keep-open`, which prints the job ID for later `exec`, `logs`, `capture`, and `stop` use.",
+    "`--client-script` runs once in every client as it becomes ready. Each return is a `clientResult`; a client error is an event and never ends the main session. The main script decides whether missing or failed client work matters.",
+    "`--raw` is live NDJSON with `started`, `ready`, `event`, `log`, `clientResult`, `dropped`, `aborted`, and `result` records. Each physical line is independently valid JSON. Events are not deduplicated or sampled by the CLI; source rate limiting is visible through accurate `dropped` counts.",
+    "Runtime heartbeats distinguish quiet scripts from vanished jobs. Missing heartbeats cause a status confirmation before `aborted` is emitted, and every failure reports the final observed job status instead of an empty exec-style value.",
+    "Encoded main/client results are capped at 1 MiB. An oversized value is replaced by `{\"truncated\":true,\"bytes\":N}` with its original byte count; stream bulk telemetry through `emit` instead.",
+    "`--identity game` is the default and runs through a temporary Script/LocalScript in the disposable playtest clone. Plugin identity is an explicit escape hatch in the plugin sandbox and cannot require game modules.",
+    "All runtime changes are temporary and never sync to disk or persist to edit mode. Play and Run DataModels are a separate environment and never reverse-sync. Run coordination is authenticated with the private job generation token. The start audit record includes script paths and SHA-256 hashes; the completion record includes the outcome and exit code.",
+    "`start` returns a lower-level asynchronous job. Use `--wait`, `playtest wait`, `status`, and `contexts` to synchronize with `server` and `client:N`; the low-level commands remain supported and unchanged.",
+    "Runtime copies communicate only with the edit-mode plugin through PluginConnectionService. They do not connect to localhost. `playtest capture` accepts only a PlayClient context plus optional `--size`, `--skybox`, and `--ui none|overlay`. It returns bounded raw RGBA to the CLI for validated local PNG encoding and never requests screenshot permission or uploads a PNG artifact from Studio."
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "name": "watch",
+  "title": "wsync watch",
+  "category": "Live diagnostics",
+  "description": "Streams raw daemon WebSocket frames for debugging sync traffic.",
+  "usage": "wsync watch [--project <path>] [--port <port>] [--compact]",
+  "examples": [
+    "wsync watch",
+    "wsync watch --project .",
+    "wsync watch --compact"
+  ],
+  "notes": [
+    "Connects as a `watch` role client and prints `wsync/1` JSON text frames as they pass: `sync`, `push`, `event`, `request`, `response`, and lifecycle frames.",
+    "Use this for debugging daemon/plugin traffic; `wsync tail` is better for Studio output."
+  ]
+}

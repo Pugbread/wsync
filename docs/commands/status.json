@@ -1,0 +1,14 @@
+{
+  "name": "status",
+  "title": "wsync status",
+  "category": "Live diagnostics",
+  "description": "Summarizes daemon reachability, plugin handshake, project config, sourcemap, and write-log health.",
+  "usage": "wsync status [--project <path>] [--port <port>] [--raw]",
+  "examples": [
+    "wsync status --project .",
+    "wsync status --project . --raw"
+  ],
+  "notes": [
+    "Useful as the first live check before making further CLI calls; `wsync context` and `wsync status --raw` are the canonical opening pair for an agent."
+  ]
+}

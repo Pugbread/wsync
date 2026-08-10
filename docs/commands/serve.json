@@ -1,0 +1,19 @@
+{
+  "name": "serve",
+  "title": "wsync serve",
+  "category": "Daemon",
+  "description": "Runs the local HTTP/WebSocket daemon that bridges the Studio plugin, filesystem watcher, and CLI in the foreground.",
+  "usage": "wsync serve --project <path> [--port <port>] [--projects-root <path>] [--sourcemap] [--ts] [--game-id <id>] [--group-id <id>] [--place-id <id>]...",
+  "examples": [
+    "wsync serve --project . --port 7978",
+    "wsync serve --project . --sourcemap",
+    "wsync serve --project . --port 7978 --game-id 1234567890"
+  ],
+  "notes": [
+    "`serve` stays in the foreground for launchd, systemd, Task Scheduler, containers, or development terminals.",
+    "For an ordinary CLI-managed background process, use `wsync daemon start` instead.",
+    "The port defaults to 7978 and, with `scan_ports` enabled, auto-scans upward to `port_scan_max` for the first free port. Each serve registers a session in `~/.wsync/sessions.toml` so `wsync stop` can end it.",
+    "`--sourcemap` keeps a sourcemap regenerated from the live tree for as long as the daemon runs; `--ts` enables the roblox-ts passthrough.",
+    "`--projects-root` advertises the authenticated Studio project initializer and constrains creation to one direct child below that canonical directory. Omit it for ordinary manual daemons."
+  ]
+}

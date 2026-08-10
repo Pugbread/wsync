@@ -1,0 +1,16 @@
+{
+  "name": "mv",
+  "title": "wsync mv",
+  "category": "Live writes",
+  "description": "Reparents a live Studio instance to a destination parent path.",
+  "usage": "wsync mv [--project <path>] [--port <port>] --from <studio-path> --to <parent-path> [--force] [--raw]",
+  "examples": [
+    "wsync mv --project . --from Workspace/Box --to Workspace/Folder",
+    "wsync mv --project . --from Workspace/Box --to ServerStorage --force"
+  ],
+  "notes": [
+    "Cross-service moves require `--force` to catch accidental DataModel reshuffles.",
+    "Use this instead of `wsync set --prop Parent`.",
+    "A reparent reaches disk as a remove plus an add, so file history does not follow the move."
+  ]
+}

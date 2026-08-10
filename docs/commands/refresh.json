@@ -1,0 +1,17 @@
+{
+  "name": "refresh",
+  "title": "wsync refresh",
+  "category": "Project docs",
+  "description": "Refreshes generated WSync agent docs without starting the daemon.",
+  "usage": "wsync refresh [--project <path>] [--raw]",
+  "examples": [
+    "wsync refresh --project .",
+    "wsync refresh --project . --raw"
+  ],
+  "notes": [
+    "Updates `wsync.md`, `AGENTS.md`, `CLAUDE.md`, and `.codex/config.toml` while preserving project notes outside the generated marker blocks. Marker blocks owned by other tools are left untouched.",
+    "The generated docs also regenerate automatically on every plugin connect.",
+    "The generated content is templated from the live project config: the sync-scope statement, synced-roots list, and filesystem-conventions table are rendered from the project's actual tree and sync rules, including custom `syncRules` and `OnlyCodeMode`, so the steering never describes a scope this project does not have.",
+    "When Wally is enabled or a `wally.toml` is present, the regenerated `AGENTS.md` block embeds the resolved Wally settings and package config."
+  ]
+}

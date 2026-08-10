@@ -1,0 +1,62 @@
+{
+  "name": "daemon",
+  "title": "wsync daemon",
+  "category": "Daemon",
+  "description": "Starts, inspects, gracefully stops, restarts, or reads logs from one project-scoped managed background daemon.",
+  "subcommands": [
+    "start",
+    "status",
+    "stop",
+    "restart",
+    "logs"
+  ],
+  "subcommandMetadata": {
+    "start": {
+      "safety": "controls-local-service",
+      "requires": [
+        "project"
+      ]
+    },
+    "status": {
+      "safety": "read-only",
+      "requires": [
+        "project"
+      ]
+    },
+    "stop": {
+      "safety": "controls-local-service",
+      "requires": [
+        "project"
+      ]
+    },
+    "restart": {
+      "safety": "controls-local-service",
+      "requires": [
+        "project"
+      ]
+    },
+    "logs": {
+      "safety": "read-only",
+      "requires": [
+        "project"
+      ]
+    }
+  },
+  "usage": "wsync daemon <start|status|stop|restart|logs> --project <path> [options]",
+  "examples": [
+    "wsync daemon start --project . --raw",
+    "wsync daemon status --project . --raw",
+    "wsync daemon stop --project . --timeout 10 --raw",
+    "wsync daemon restart --project . --game-id 123 --place-id 456 --raw",
+    "wsync daemon logs --project . --lines 100"
+  ],
+  "notes": [
+    "`start` and `restart` accept `--port`, `--projects-root`, `--managed-by`, `--data-dir`, `--timeout`, `--game-id`, `--group-id`, and repeated `--place-id`. `status`, `stop`, and `logs` use the same canonical project identity and optional `--data-dir`.",
+    "`--projects-root` enables the authenticated Studio project initializer for a manager-authorized canonical root; it is not required for normal project daemons.",
+    "A matching daemon already running for the project is returned instead of spawning a duplicate. A requested port serving another project is a hard error. `restart` prefers the port the daemon was already on.",
+    "Stop authenticates an exact canonical project and boot ID before graceful shutdown. WSync never kills a PID read from a stale runtime record.",
+    "Runtime records live under the platform data directory at `WSync/daemons/<sha256(project)>.json` beside their start lock and log file; the mutation audit log is `WSync/writes.log`.",
+    "`wsync daemon stop --project <path>` is the authenticated per-project form. `wsync stop` is the session-level form and works over `~/.wsync/sessions.toml`.",
+    "Desktop managers should supply their browser capability through `--owner-token-env <ENV>`; secrets are never returned by lifecycle JSON."
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "name": "commands",
+  "title": "wsync commands",
+  "category": "Command registry",
+  "description": "Prints generated command docs as JSON, either as a compact LLM index, one command entry, or the full registry.",
+  "usage": "wsync commands [command-name] [--compact]",
+  "examples": [
+    "wsync commands --compact",
+    "wsync commands get",
+    "wsync commands resolve",
+    "wsync commands upload --compact"
+  ],
+  "notes": [
+    "This is the LLM-facing replacement for scraping `--help` text.",
+    "Prefer `--compact` for choosing between command families. Prefer `wsync commands <name>` for the exact usage of the command about to be run.",
+    "Plain `wsync commands` prints the full registry and should be reserved for explicit full-doc requests.",
+    "The output is embedded verbatim from `docs/client-commands.generated.json`, which is rebuilt from `docs/commands/*.json`. The desktop Docs view and the published docs render the same bundle."
+  ]
+}

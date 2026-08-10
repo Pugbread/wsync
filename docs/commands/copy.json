@@ -1,0 +1,19 @@
+{
+  "name": "copy",
+  "title": "wsync copy",
+  "category": "Studio clipboard",
+  "description": "Copies arbitrary native Studio instance trees into WSync's private cross-project clipboard.",
+  "usage": "wsync copy [<studio-path>]... [--path <studio-path>]... [--project <path>] [--port <port>] [--timeout <seconds>] [--raw]",
+  "examples": [
+    "wsync copy --project .",
+    "wsync copy Workspace/Map/Boss ReplicatedStorage/Shared/BossConfig --project .",
+    "wsync copy --project . --path StarterGui/HUD --path ReplicatedStorage/HUDAssets"
+  ],
+  "notes": [
+    "With no paths, copies the current Studio Explorer selection.",
+    "Roblox SerializationService preserves native instance types, descendants, properties, attributes, tags, scripts, and references among roots copied together.",
+    "The private clipboard is shared across WSync projects and survives CLI process exit; a successful copy atomically replaces it.",
+    "Services cannot be copied. References to instances outside the copied roots cannot cross places, matching native Studio behavior.",
+    "Bounded at 256 roots and 128 MiB per copy."
+  ]
+}

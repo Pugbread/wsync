@@ -1,0 +1,18 @@
+{
+  "name": "install",
+  "title": "wsync install",
+  "category": "Tool management",
+  "description": "Installs the running WSync binary to `~/.wsync/bin` and adds it to PATH, behind an explicit prompt.",
+  "usage": "wsync install [-y]",
+  "examples": [
+    "wsync install",
+    "wsync install -y"
+  ],
+  "notes": [
+    "Writes only to `~/.wsync/bin` and shell PATH configuration; requires no daemon, project, or Studio.",
+    "Prompts before installing. Non-interactive runs are refused unless the global `-y` flag is passed.",
+    "The binary it was invoked from is never deleted or moved. This command replaces the removed first-run auto-installer, which could delete the invoked binary in non-interactive shells.",
+    "A package-managed binary (Homebrew, cargo install, and similar) is refused; use the package manager's own upgrade path instead.",
+    "`wsync update cli` keeps a self-installed binary current afterwards."
+  ]
+}

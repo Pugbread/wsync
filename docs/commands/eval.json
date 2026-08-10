@@ -1,0 +1,15 @@
+{
+  "name": "eval",
+  "title": "wsync eval",
+  "category": "Live writes",
+  "description": "Executes Luau source inside Studio through the plugin sandbox and returns the result.",
+  "usage": "wsync eval [--project <path>] [--port <port>] --source <luau> [--raw]",
+  "examples": [
+    "wsync eval --project . --source 'return #game.Workspace:GetChildren()'"
+  ],
+  "notes": [
+    "Use `return ...` when you need a returned value.",
+    "`eval` is request/response against one connected Studio session and carries the standard 5 second remote-op timeout. `wsync exec` is the fire-and-forget broadcast form and returns no value.",
+    "This is the broadest escape hatch; ask before using it for mutations."
+  ]
+}

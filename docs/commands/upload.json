@@ -1,0 +1,18 @@
+{
+  "name": "upload",
+  "title": "wsync upload",
+  "category": "Open Cloud",
+  "description": "Uploads Roblox assets through Open Cloud from files or directories.",
+  "usage": "wsync upload <files-or-directories>... [--project <path>] [--creator user:<id>|group:<id>] [--name <name>] [--asset-type animation|audio|image|decal|mesh|model|video] [--manifest <file>] [--auth bearer] [--api-key-env <name>] [--no-wait] [--raw]",
+  "examples": [
+    "wsync upload ./icon.png --creator user:123456",
+    "wsync upload ./sound.mp3 ./models --project . --manifest uploaded-assets.json",
+    "wsync upload ./clip.rbxm --project . --asset-type animation"
+  ],
+  "notes": [
+    "Credentials resolve from the `wsync auth` store first, then the environment variable named by `--api-key-env`, then `ROBLOX_API_KEY`, `CLOUD_API_KEY`, and `ROBLOX_OPEN_CLOUD_API_KEY`.",
+    "Without `--creator`, the project's `groupId` is used as the default creator context.",
+    "Directories recurse by default, skip unsupported files, and continue after per-file failures.",
+    "Use `--auth bearer` for OAuth tokens instead of API keys. `--no-wait` returns operation handles instead of polling each asset to completion."
+  ]
+}

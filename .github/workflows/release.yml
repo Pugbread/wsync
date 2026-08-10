@@ -1,0 +1,630 @@
+name: Release
+
+# Design 8.5, 10.5 and 15 Phase 7: a tag becomes a set of artifacts that were
+# all built from that one commit, and a release-identity job says so before
+# anything is published.
+#
+# Same ground rule as ci.yml: every step runs today and means something. Where a
+# release needs something the repository does not have yet — the ed25519 signing
+# key, a public repository for the updater endpoint — the step is written so its
+# absence is *visible* rather than fatal: an unsigned build still happens, it is
+# labelled a prerelease, and no `latest.json` is published for it. Fail-closed
+# beats a signed-looking artifact nobody signed.
+#
+# The graph:
+#
+#   plugin ──┬─► engine (macOS arm64, Linux x86_64) ─┬─► identity ─► publish
+#            │                                       │                  ▲
+#            └─► desktop (macOS arm64) ──────────────┴──────────────────┘
+#
+# `engine` needs `plugin` because the CLI embeds the artifact (`--features
+# plugin`), so `wsync plugin install` works from the downloaded binary alone;
+# `desktop` needs both because it packages the engine as its sidecar and the
+# plugin pair as app resources.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      draft:
+        description: "Publish the release as a draft (tag builds only)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+# Releases are not interruptible: a half-built tag is worse than a slow one.
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  NODE_VERSION: "22"
+  # Same pins as ci.yml's plugin-artifact job — aftman downloads and runs other
+  # binaries, so it is pinned by tag *and* checksum. Re-pin with:
+  #   curl -sSL https://github.com/LPGhatguy/aftman/releases/download/\
+  #     v<ver>/aftman-<ver>-linux-x86_64.zip | sha256sum
+  AFTMAN_VERSION: "0.3.0"
+  AFTMAN_LINUX_SHA256: "194fe81e24ae7cc1f3141fd1d42db6cb60f03d42735d12ae865fe2db11ea6f0e"
+  # The bundler that turns the shell into a .app/.dmg. Pinned exactly, and the
+  # pin is *verified* after installation, so it does not matter which of the two
+  # install paths below ran.
+  TAURI_CLI_VERSION: "2.11.4"
+  # cargo-binstall only exists here to avoid a five-minute `cargo install`; it
+  # is a downloaded executable, so it is pinned by version and sha256 the same
+  # way aftman is. Re-pin with:
+  #   gh api repos/cargo-bins/cargo-binstall/releases/tags/v<ver> \
+  #     --jq '.assets[] | "\(.name) \(.digest)"'
+  CARGO_BINSTALL_VERSION: "1.21.1"
+  CARGO_BINSTALL_MACOS_ARM64_SHA256: "4e0ed7b3f0fee8686d847ddfb02e48cd44b3df4fbb97522f20ab1ba33ce674db"
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Studio plugin — the same steps ci.yml's plugin-artifact job runs, because
+  # the artifact a release ships must be built the way CI proves it can be.
+  # --------------------------------------------------------------------------
+  plugin:
+    name: Studio plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Fetch pinned aftman
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/aftman.zip"
+          curl --fail --location --silent --show-error --retry 3 \
+            --output "$archive" \
+            "https://github.com/LPGhatguy/aftman/releases/download/v${AFTMAN_VERSION}/aftman-${AFTMAN_VERSION}-linux-x86_64.zip"
+          echo "${AFTMAN_LINUX_SHA256}  ${archive}" | sha256sum --check --strict
+          unzip -o -j "$archive" aftman -d "${RUNNER_TEMP}/aftman"
+          chmod +x "${RUNNER_TEMP}/aftman/aftman"
+
+      - name: Install rojo and wally at plugin/aftman.toml's pins
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pins=$(grep -E '^(rojo|wally)[[:space:]]*=' plugin/aftman.toml || true)
+          count=$(printf '%s' "$pins" | grep -c '=' || true)
+          if [ "$count" -ne 2 ]; then
+            echo "::error file=plugin/aftman.toml::expected a rojo pin and a wally pin, found $count"
+            exit 1
+          fi
+          mkdir -p "${RUNNER_TEMP}/toolchain"
+          printf '[tools]\n%s\n' "$pins" | tee "${RUNNER_TEMP}/toolchain/aftman.toml"
+
+          mkdir -p "${HOME}/.aftman"
+          printf 'github = "%s"\n' "$GH_TOKEN" > "${HOME}/.aftman/auth.toml"
+          chmod 600 "${HOME}/.aftman/auth.toml"
+
+          cd "${RUNNER_TEMP}/toolchain"
+          "${RUNNER_TEMP}/aftman/aftman" install --no-trust-check
+          echo "${HOME}/.aftman/bin" >> "$GITHUB_PATH"
+
+      - name: Toolchain resolves inside the plugin project
+        working-directory: plugin
+        run: |
+          rojo --version
+          wally --version
+
+      # --check first, against the manifest exactly as committed: a release
+      # must not be the moment anyone discovers the manifest was stale.
+      - name: Committed manifest matches a fresh build
+        run: node plugin/scripts/build.mjs --check
+
+      - name: Build the plugin
+        run: node plugin/scripts/build.mjs
+
+      - name: The pair is real
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s plugin/WSync.rbxm || { echo "::error::plugin/WSync.rbxm is missing or empty"; exit 1; }
+          test -s plugin/WSync.build.json || { echo "::error::plugin/WSync.build.json is missing or empty"; exit 1; }
+          node -e '
+            const fs = require("node:fs");
+            const crypto = require("node:crypto");
+            const manifest = JSON.parse(fs.readFileSync("plugin/WSync.build.json", "utf8"));
+            const digest = crypto.createHash("sha256").update(fs.readFileSync("plugin/WSync.rbxm")).digest("hex");
+            if (digest !== manifest.sha256) {
+              console.error(`::error::WSync.rbxm is ${digest}, the manifest says ${manifest.sha256}`);
+              process.exit(1);
+            }
+            console.log(`plugin ${manifest.pluginVersion}, protocol ${manifest.protocolVersion}, commit ${manifest.buildCommit}`);
+          '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wsync-plugin
+          path: |
+            plugin/WSync.rbxm
+            plugin/WSync.build.json
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # Engine — the released `wsync` binary, one per target.
+  # --------------------------------------------------------------------------
+  engine:
+    name: Engine (${{ matrix.target }})
+    needs: plugin
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      # Nothing here cross-compiles: the runner *is* the target. GitHub has
+      # moved what `macos-latest` points at before, so the assumption is
+      # checked rather than trusted — a runner that changed architecture would
+      # otherwise publish a binary under the wrong name.
+      - name: The runner is the target
+        shell: bash
+        run: |
+          set -euo pipefail
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          if [ "$host" != "${{ matrix.target }}" ]; then
+            echo "::error::${{ matrix.runner }} builds $host, this job publishes it as ${{ matrix.target }}"
+            exit 1
+          fi
+          echo "building ${{ matrix.target }} on ${{ matrix.runner }}"
+
+      # The plugin the CLI embeds is the plugin this release ships, not
+      # whatever a contributor last built locally: build.rs picks up
+      # plugin/WSync.rbxm when the `plugin` feature is on, and bundles an empty
+      # placeholder when it is missing (which `installer.rs` then refuses to
+      # install). Downloading it first is what makes `--features plugin` mean
+      # something.
+      - uses: actions/download-artifact@v4
+        with:
+          name: wsync-plugin
+          path: plugin
+
+      - name: Build
+        run: cargo build --release --locked --features plugin
+
+      # The binary has to answer offline — the release-identity job depends on
+      # exactly these two commands, and so do agents with no daemon running.
+      - name: The binary answers without a daemon
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/release/wsync --version
+          ./target/release/wsync commands --compact > /dev/null
+          ./target/release/wsync commands | cmp - docs/client-commands.generated.json \
+            || { echo "::error::the embedded command registry is not docs/client-commands.generated.json"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wsync-${{ matrix.target }}
+          path: target/release/wsync
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # Desktop app — macOS only, because that is the only platform the shell is
+  # packaged on today (same reason ci.yml's desktop job is macOS).
+  # --------------------------------------------------------------------------
+  desktop:
+    name: Desktop app
+    needs: [plugin, engine]
+    runs-on: macos-latest
+    outputs:
+      signed: ${{ steps.signing.outputs.signed }}
+      bundle-version: ${{ steps.bundles.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+          key: release-desktop
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: wsync-aarch64-apple-darwin
+          path: ${{ runner.temp }}/engine
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: wsync-plugin
+          path: plugin
+
+      # `bundle.externalBin: ["binaries/wsync"]` makes Tauri look for
+      # `binaries/wsync-<target triple>` — the suffix comes from
+      # tauri_utils::resources::external_binaries, which is
+      # `{path}-{triple}{.exe on Windows}`. upload-artifact does not preserve
+      # the executable bit, hence `install -m 0755` rather than `cp`.
+      - name: Stage the engine as the sidecar
+        shell: bash
+        run: |
+          set -euo pipefail
+          triple=$(rustc -vV | sed -n 's/^host: //p')
+          if [ "$triple" != "aarch64-apple-darwin" ]; then
+            echo "::error::this job packages the aarch64-apple-darwin engine but runs on $triple"
+            exit 1
+          fi
+          install -d desktop/src-tauri/binaries
+          install -m 0755 "${RUNNER_TEMP}/engine/wsync" "desktop/src-tauri/binaries/wsync-${triple}"
+          desktop/src-tauri/binaries/wsync-${triple} --version
+
+      # The plugin pair is staged into `desktop/src-tauri/resources/` by the
+      # desktop build.rs, from `plugin/` — downloaded above. A release build
+      # refuses to continue without a manifest that names the artifact and
+      # carries a usable sha256, so there is nothing to check here beyond
+      # having put the files where build.rs looks.
+      - name: The plugin pair is where build.rs expects it
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s plugin/WSync.rbxm
+          test -s plugin/WSync.build.json
+          node -e 'const m=require("./plugin/WSync.build.json"); console.log(`plugin ${m.pluginVersion}, protocol ${m.protocolVersion}, sha256 ${m.sha256.slice(0,12)}…`)'
+
+      # Two ways in, one pin. cargo-binstall is the fast path and is itself
+      # checksum-pinned; `cargo install --locked` is the slow one and verifies
+      # the crate against the registry index. Whichever ran, the version is
+      # asserted afterwards — a pin nobody checks is a comment.
+      - name: Install tauri-cli ${{ env.TAURI_CLI_VERSION }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/cargo-binstall.zip"
+          installed=no
+
+          if curl --fail --location --silent --show-error --retry 3 --output "$archive" \
+            "https://github.com/cargo-bins/cargo-binstall/releases/download/v${CARGO_BINSTALL_VERSION}/cargo-binstall-aarch64-apple-darwin.full.zip"
+          then
+            echo "${CARGO_BINSTALL_MACOS_ARM64_SHA256}  ${archive}" | shasum --algorithm 256 --check --strict
+            unzip -o -j "$archive" cargo-binstall -d "${RUNNER_TEMP}/binstall"
+            chmod +x "${RUNNER_TEMP}/binstall/cargo-binstall"
+            if "${RUNNER_TEMP}/binstall/cargo-binstall" --no-confirm --locked \
+              "tauri-cli@${TAURI_CLI_VERSION}"
+            then
+              installed=yes
+            else
+              echo "::warning::cargo-binstall could not install tauri-cli; falling back to cargo install"
+            fi
+          else
+            echo "::warning::cargo-binstall ${CARGO_BINSTALL_VERSION} could not be downloaded; falling back to cargo install"
+          fi
+
+          if [ "$installed" != yes ]; then
+            cargo install --locked --version "${TAURI_CLI_VERSION}" tauri-cli
+          fi
+
+          reported=$(cargo tauri --version)
+          case "$reported" in
+            *"${TAURI_CLI_VERSION}"*) echo "tauri-cli ${TAURI_CLI_VERSION} ($reported)" ;;
+            *) echo "::error::installed $reported, expected tauri-cli ${TAURI_CLI_VERSION}"; exit 1 ;;
+          esac
+
+      # Both keys or neither. A private key with no public key produces updates
+      # no client can verify; a public key with no private key produces an app
+      # that waits for updates nobody will ever sign. Either half alone is a
+      # misconfiguration worth stopping for (Design 8.5).
+      - name: Decide whether this build can be signed
+        id: signing
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          PUBLIC_KEY: ${{ secrets.WSYNC_UPDATER_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -n "${SIGNING_KEY:-}" ] && [ -n "${PUBLIC_KEY:-}" ]; then
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+            echo "signing on: updates will be signed and the app carries the matching public key"
+          elif [ -z "${SIGNING_KEY:-}" ] && [ -z "${PUBLIC_KEY:-}" ]; then
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::no TAURI_SIGNING_PRIVATE_KEY and no WSYNC_UPDATER_PUBLIC_KEY — building UNSIGNED. The app will report updaterConfigured:false, no latest.json will be published, and the release is marked prerelease."
+          elif [ -z "${SIGNING_KEY:-}" ]; then
+            echo "::error::WSYNC_UPDATER_PUBLIC_KEY is set but TAURI_SIGNING_PRIVATE_KEY is not — the app would expect signed updates that this pipeline cannot produce"
+            exit 1
+          else
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is set but WSYNC_UPDATER_PUBLIC_KEY is not — this would sign updates the app has no key to verify"
+            exit 1
+          fi
+
+      # `createUpdaterArtifacts` defaults to false (tauri_utils::config::Updater),
+      # so the .app.tar.gz + .sig the updater consumes only exist when it is
+      # turned on. It lives here rather than in tauri.conf.json because it is a
+      # property of a *release* build, not of the app.
+      - name: Build the app (signed)
+        if: steps.signing.outputs.signed == 'true'
+        working-directory: desktop/src-tauri
+        env:
+          WSYNC_UPDATER_PUBLIC_KEY: ${{ secrets.WSYNC_UPDATER_PUBLIC_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: cargo tauri build --config '{"bundle":{"createUpdaterArtifacts":true}}'
+
+      - name: Build the app (UNSIGNED — no updater)
+        if: steps.signing.outputs.signed != 'true'
+        working-directory: desktop/src-tauri
+        run: cargo tauri build
+
+      - name: Collect the bundles
+        id: bundles
+        shell: bash
+        env:
+          SIGNED: ${{ steps.signing.outputs.signed }}
+        run: |
+          set -euo pipefail
+          bundle=desktop/src-tauri/target/release/bundle
+          staged="${RUNNER_TEMP}/desktop"
+          mkdir -p "$staged"
+
+          shopt -s nullglob
+          dmgs=("$bundle"/dmg/*.dmg)
+          if [ "${#dmgs[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one .dmg in $bundle/dmg, found ${#dmgs[@]}"
+            ls -R "$bundle" || true
+            exit 1
+          fi
+          cp "${dmgs[0]}" "$staged/"
+
+          version=$(node -p 'require("./desktop/src-tauri/tauri.conf.json").version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          if [ "${SIGNED:-}" = true ]; then
+            updater=("$bundle"/macos/*.app.tar.gz)
+            if [ "${#updater[@]}" -ne 1 ]; then
+              echo "::error::a signed build must produce exactly one .app.tar.gz, found ${#updater[@]}"
+              ls -R "$bundle" || true
+              exit 1
+            fi
+            test -s "${updater[0]}.sig" || { echo "::error::${updater[0]}.sig is missing or empty"; exit 1; }
+            cp "${updater[0]}" "${updater[0]}.sig" "$staged/"
+          fi
+
+          ls -l "$staged"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wsync-desktop-aarch64-apple-darwin
+          path: ${{ runner.temp }}/desktop
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # Release identity — Design 8.5 and 10.5. One commit, one version, one
+  # protocol number, one docs bundle. Once per engine target, because the check
+  # *runs* the binary and a runner can only run its own.
+  # --------------------------------------------------------------------------
+  identity:
+    name: Release identity (${{ matrix.target }})
+    needs: [plugin, engine, desktop]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # Deliberately *not* into plugin/: the checkout must stay pristine, or
+      # the check's own "was this built from a committed tree" assertion would
+      # be answering a question about its own downloads. plugin/WSync.build.json
+      # is committed, and a freshly built one legitimately differs from it in
+      # buildCommit.
+      - uses: actions/download-artifact@v4
+        with:
+          name: wsync-${{ matrix.target }}
+          path: ${{ runner.temp }}/engine
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: wsync-plugin
+          path: ${{ runner.temp }}/plugin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: wsync-desktop-aarch64-apple-darwin
+          path: ${{ runner.temp }}/desktop
+
+      # upload-artifact does not preserve the executable bit, and the check
+      # below runs the binary. The desktop bundles are re-counted here rather
+      # than trusted: the desktop job checked them before uploading, this
+      # checks what actually arrived.
+      - name: Everything the release will publish is here
+        shell: bash
+        env:
+          SIGNED: ${{ needs.desktop.outputs.signed }}
+        run: |
+          set -euo pipefail
+          chmod +x "${RUNNER_TEMP}/engine/wsync"
+          ls -l "${RUNNER_TEMP}/engine" "${RUNNER_TEMP}/plugin" "${RUNNER_TEMP}/desktop"
+
+          shopt -s nullglob
+          dmgs=("${RUNNER_TEMP}"/desktop/*.dmg)
+          if [ "${#dmgs[@]}" -ne 1 ]; then
+            echo "::error::expected one desktop .dmg, got ${#dmgs[@]}"
+            exit 1
+          fi
+
+          if [ "${SIGNED:-}" = true ]; then
+            archives=("${RUNNER_TEMP}"/desktop/*.app.tar.gz)
+            if [ "${#archives[@]}" -ne 1 ]; then
+              echo "::error::a signed build must carry one .app.tar.gz, got ${#archives[@]}"
+              exit 1
+            fi
+            test -s "${archives[0]}.sig" || { echo "::error::the updater archive arrived without its .sig"; exit 1; }
+          else
+            echo "::warning::unsigned desktop build — this release cannot be offered as an update"
+          fi
+
+      - name: Binary, plugin, protocol and docs come from one commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/check-release-identity.mjs \
+            --bin "${RUNNER_TEMP}/engine/wsync" \
+            --plugin-manifest "${RUNNER_TEMP}/plugin/WSync.build.json" \
+            --plugin-artifact "${RUNNER_TEMP}/plugin/WSync.rbxm" \
+            --commit "${GITHUB_SHA}"
+
+  # --------------------------------------------------------------------------
+  # Publish — tags only, draft by default. Nothing reaches a release page that
+  # the identity job has not already agreed with.
+  # --------------------------------------------------------------------------
+  publish:
+    name: Publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [plugin, engine, desktop, identity]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/artifacts
+
+      - name: Stage the release assets
+        id: assets
+        shell: bash
+        env:
+          SIGNED: ${{ needs.desktop.outputs.signed }}
+          BUNDLE_VERSION: ${{ needs.desktop.outputs.bundle-version }}
+        run: |
+          set -euo pipefail
+          artifacts="${RUNNER_TEMP}/artifacts"
+          dist="${RUNNER_TEMP}/dist"
+          mkdir -p "$dist"
+
+          # The engine binaries all arrive named `wsync`; the asset name is
+          # what tells a downloader which one they took.
+          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu; do
+            source="$artifacts/wsync-$target/wsync"
+            test -s "$source" || { echo "::error::$source is missing"; exit 1; }
+            install -m 0755 "$source" "$dist/wsync-$target"
+          done
+
+          cp "$artifacts/wsync-plugin/WSync.rbxm" "$artifacts/wsync-plugin/WSync.build.json" "$dist/"
+
+          shopt -s nullglob
+          for file in "$artifacts"/wsync-desktop-*/*; do
+            cp "$file" "$dist/"
+          done
+
+          version=$(node -e '
+            const text = require("node:fs").readFileSync("Cargo.toml", "utf8");
+            const section = text.split(/^\s*\[/m).find((part) => part.startsWith("package]"));
+            process.stdout.write(section.match(/^\s*version\s*=\s*"([^"]+)"/m)[1]);
+          ')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          tag="${GITHUB_REF_NAME}"
+          if [ "$tag" != "v$version" ]; then
+            echo "::error::tag $tag does not match the version in Cargo.toml ($version)"
+            exit 1
+          fi
+          if [ "${BUNDLE_VERSION:-}" != "$version" ]; then
+            echo "::error::the desktop app bundled version ${BUNDLE_VERSION:-<none>}, this release is $version"
+            exit 1
+          fi
+
+          if [ "${SIGNED:-}" = true ]; then
+            # The archive is named after productName, so it is found rather
+            # than spelled out: a renamed bundle would otherwise publish a
+            # latest.json pointing at a URL the release does not serve.
+            updater=("$dist"/*.app.tar.gz)
+            if [ "${#updater[@]}" -ne 1 ]; then
+              echo "::error::expected one .app.tar.gz among the staged assets, found ${#updater[@]}"
+              exit 1
+            fi
+            node scripts/release/make-latest-json.mjs \
+              --version "$version" \
+              --base-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${tag}" \
+              --platform "darwin-aarch64=${updater[0]}" \
+              --notes "WSync $version" \
+              --out "$dist/latest.json"
+          else
+            echo "::warning::unsigned build — no latest.json, so no installed app will offer this as an update"
+          fi
+
+          ( cd "$dist" && sha256sum -- * > SHA256SUMS )
+          ls -l "$dist"
+
+      - name: Release notes
+        id: notes
+        shell: bash
+        env:
+          SIGNED: ${{ needs.desktop.outputs.signed }}
+          VERSION: ${{ steps.assets.outputs.version }}
+        run: |
+          set -euo pipefail
+          notes="${RUNNER_TEMP}/notes.md"
+          {
+            echo "WSync ${VERSION} — built from \`${GITHUB_SHA}\`."
+            echo
+            echo "Release identity was verified before publishing: the engine binary's embedded"
+            echo "command registry, \`WSync.build.json\`, the protocol number and the generated"
+            echo "docs all come from this commit (\`scripts/check-release-identity.mjs\`)."
+            echo
+            if [ "${SIGNED:-}" = true ]; then
+              echo "Desktop updates are signed; \`latest.json\` is attached."
+            else
+              echo "> **This build is UNSIGNED.** No signing key was available, so the desktop app"
+              echo "> was built without an updater public key: it reports \`updaterConfigured: false\`,"
+              echo "> hides every update affordance, and no \`latest.json\` is attached. Marked as a"
+              echo "> prerelease for that reason."
+            fi
+            echo
+            echo "\`SHA256SUMS\` covers every asset here."
+          } > "$notes"
+          echo "path=$notes" >> "$GITHUB_OUTPUT"
+          cat "$notes"
+
+      # Pinned to the commit behind v3.0.2 — a third-party action runs with the
+      # job's token, so the tag it was released under is not the thing to trust.
+      # Re-pin with:
+      #   gh api repos/softprops/action-gh-release/git/ref/tags/v<ver> \
+      #     --jq '.object.sha'   # deref if it reports type "tag"
+      - name: Draft the release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228
+        with:
+          draft: ${{ github.event_name != 'workflow_dispatch' || inputs.draft }}
+          prerelease: ${{ needs.desktop.outputs.signed != 'true' }}
+          name: WSync ${{ steps.assets.outputs.version }}
+          body_path: ${{ steps.notes.outputs.path }}
+          fail_on_unmatched_files: true
+          files: ${{ runner.temp }}/dist/*

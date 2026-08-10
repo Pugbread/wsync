@@ -1,0 +1,15 @@
+[package]
+name = "wsync/plugin"
+authors = ["Pugbread"]
+description = "WSync Studio plugin - full-DataModel two-way sync (fork of argon-roblox)"
+registry = "https://github.com/UpliftGames/wally-index"
+license = "Apache-2.0"
+version = "0.1.0"
+realm = "shared"
+private = true
+
+[dependencies]
+Fusion = "dervexhero/fusion-03-dev@0.3.0-dev.1"
+Signal = "dervexhero/advancedsignal@1.0.1"
+Promise = "lukadev-0/typed-promise@4.0.2"
+Highlighter = "boatbomber/highlighter@0.9.0"

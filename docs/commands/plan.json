@@ -1,0 +1,47 @@
+{
+  "name": "plan",
+  "title": "wsync plan",
+  "category": "Command registry",
+  "description": "Builds a read-only JSON plan for a mutating command without executing it.",
+  "subcommands": [
+    "set",
+    "new",
+    "rm",
+    "mv",
+    "resolve"
+  ],
+  "subcommandMetadata": {
+    "set": {
+      "safety": "read-only",
+      "requires": []
+    },
+    "new": {
+      "safety": "read-only",
+      "requires": []
+    },
+    "rm": {
+      "safety": "read-only",
+      "requires": []
+    },
+    "mv": {
+      "safety": "read-only",
+      "requires": []
+    },
+    "resolve": {
+      "safety": "read-only",
+      "requires": []
+    }
+  },
+  "usage": "wsync plan set --path <studio-path> --prop <property> --value <json>\nwsync plan new --path <parent-path> --class <ClassName> [--name <Name>] [--props <json-object>]\nwsync plan rm --path <studio-path>\nwsync plan mv --from <studio-path> --to <parent-path> [--force]\nwsync plan resolve --path <filesystem-path> (--disk | --studio)",
+  "examples": [
+    "wsync plan set --path ReplicatedStorage/Config --prop Source --value '\"return {}\"'",
+    "wsync plan new --path ReplicatedStorage --class Folder --name Shared",
+    "wsync plan rm --path Workspace/OldPart",
+    "wsync plan resolve --path src/Client/UIController.client.luau --studio"
+  ],
+  "notes": [
+    "Does not mutate disk or Studio.",
+    "Returns `mutates`, `requires`, `risks`, and an `executeCommand` string.",
+    "Available as a dry-run explanation before a risky write; it is not a mandatory ritual before every mutation."
+  ]
+}

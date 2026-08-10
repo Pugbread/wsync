@@ -1,0 +1,123 @@
+{
+  "name": "monetization",
+  "title": "wsync monetization",
+  "category": "Open Cloud",
+  "description": "Discovers, lists, creates, edits, and uploads images for Roblox game passes and developer products through Open Cloud.",
+  "subcommands": [
+    "gamepass",
+    "product"
+  ],
+  "subcommandPaths": [
+    "gamepass discover",
+    "gamepass list",
+    "gamepass create",
+    "gamepass edit",
+    "gamepass image",
+    "gamepass images",
+    "product discover",
+    "product list",
+    "product create",
+    "product edit",
+    "product image",
+    "product images"
+  ],
+  "subcommandMetadata": {
+    "gamepass discover": {
+      "safety": "read-only",
+      "requires": [
+        "project"
+      ]
+    },
+    "gamepass list": {
+      "safety": "open-cloud-read",
+      "requires": [
+        "project",
+        "roblox-open-cloud-credential"
+      ]
+    },
+    "gamepass create": {
+      "safety": "open-cloud-mutating",
+      "requires": [
+        "project",
+        "roblox-open-cloud-credential"
+      ]
+    },
+    "gamepass edit": {
+      "safety": "open-cloud-mutating",
+      "requires": [
+        "project",
+        "roblox-open-cloud-credential"
+      ]
+    },
+    "gamepass image": {
+      "safety": "open-cloud-mutating",
+      "requires": [
+        "project",
+        "roblox-open-cloud-credential"
+      ]
+    },
+    "gamepass images": {
+      "safety": "open-cloud-mutating",
+      "requires": [
+        "project",
+        "roblox-open-cloud-credential"
+      ]
+    },
+    "product discover": {
+      "safety": "read-only",
+      "requires": [
+        "project"
+      ]
+    },
+    "product list": {
+      "safety": "open-cloud-read",
+      "requires": [
+        "project",
+        "roblox-open-cloud-credential"
+      ]
+    },
+    "product create": {
+      "safety": "open-cloud-mutating",
+      "requires": [
+        "project",
+        "roblox-open-cloud-credential"
+      ]
+    },
+    "product edit": {
+      "safety": "open-cloud-mutating",
+      "requires": [
+        "project",
+        "roblox-open-cloud-credential"
+      ]
+    },
+    "product image": {
+      "safety": "open-cloud-mutating",
+      "requires": [
+        "project",
+        "roblox-open-cloud-credential"
+      ]
+    },
+    "product images": {
+      "safety": "open-cloud-mutating",
+      "requires": [
+        "project",
+        "roblox-open-cloud-credential"
+      ]
+    }
+  },
+  "usage": "wsync monetization gamepass discover [--project <path>]\nwsync monetization gamepass list [--project <path>] [--universe-id <id>] [--api-key-env <name>] [--raw]\nwsync monetization gamepass create [--project <path>] [--universe-id <id>] [--api-key-env <name>] [--description <text>] [--image <file>] [--not-for-sale] (<entry>... | --name <name> --price <robux>)\nwsync monetization gamepass edit [--project <path>] [--universe-id <id>] [--api-key-env <name>] (--id <id> | --name <existing-name>) [--new-name <name>] [--price <robux>] [--description <text>] [--for-sale true|false]\nwsync monetization gamepass image [--project <path>] [--universe-id <id>] [--api-key-env <name>] (--id <id> | --name <existing-name>) <file>\nwsync monetization gamepass images [--project <path>] [--universe-id <id>] [--api-key-env <name>] <dir>\n# Replace gamepass with product, dp, devproduct, gp, pass, or gamepasses as needed.",
+  "examples": [
+    "wsync monetization gamepass create \"VIP 499 robux\" --project .",
+    "wsync monetization product create \"Coins Small 49 robux, Coins Large 399 robux\" --project .",
+    "wsync monetization gp edit --name VIP --price 699 --project .",
+    "wsync monetization dp image --name \"Coins Small\" ./coins-small.png --project .",
+    "wsync monetization product images ./icons --project ."
+  ],
+  "notes": [
+    "Uses multipart/form-data and Roblox Open Cloud API keys.",
+    "Credential discovery checks the `wsync auth` store, then `ROBLOX_API_KEY`, `CLOUD_API_KEY`, `ROBLOX_OPEN_CLOUD_API_KEY`, and project env files.",
+    "Universe discovery checks `--universe-id`, `ROBLOX_UNIVERSE_ID`, `UNIVERSE_ID`, `GAMEID`, `GAME_ID`, project env files, and then the `gameId` field in `default.project.json`.",
+    "`discover` reports likely monetization config files but does not guess project-specific code writes when the schema is ambiguous.",
+    "`images` matches files to assets by normalized filename, such as coins-small.png to Coins Small."
+  ]
+}

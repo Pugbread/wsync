@@ -1,0 +1,14 @@
+{
+  "name": "enum",
+  "title": "wsync enum",
+  "category": "Live inspection",
+  "description": "Lists the items for one Roblox Enum type.",
+  "usage": "wsync enum [--project <path>] [--port <port>] --name <EnumName> [--raw]",
+  "examples": [
+    "wsync enum --project . --name Material",
+    "wsync enum --project . --name KeyCode --raw"
+  ],
+  "notes": [
+    "Outputs item names and underlying integer values."
+  ]
+}

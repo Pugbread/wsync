@@ -1,0 +1,37 @@
+{
+  "name": "tag",
+  "title": "wsync tag",
+  "category": "Live writes",
+  "description": "Adds or removes CollectionService tags on a live Studio instance.",
+  "subcommands": [
+    "add",
+    "rm"
+  ],
+  "subcommandMetadata": {
+    "add": {
+      "safety": "mutates-studio",
+      "requires": [
+        "project",
+        "daemon",
+        "studio-plugin"
+      ]
+    },
+    "rm": {
+      "safety": "mutates-studio",
+      "requires": [
+        "project",
+        "daemon",
+        "studio-plugin"
+      ]
+    }
+  },
+  "usage": "wsync tag <add|rm> [--project <path>] [--port <port>] --path <studio-path> --tag <tag> [--raw]",
+  "examples": [
+    "wsync tag add --project . --path Workspace/Box --tag Enemy",
+    "wsync tag rm --project . --path Workspace/Box --tag Enemy"
+  ],
+  "notes": [
+    "Successful tag mutations are written to `writes.log`.",
+    "Tags on projected instances sync back to their `.data.json` sidecar."
+  ]
+}

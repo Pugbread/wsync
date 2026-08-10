@@ -1,0 +1,27 @@
+#!/bin/sh
+# wsync-mock — a drop-in stand-in for the `wsync` engine binary.
+#
+# Point WSYNC_DAEMON_PATH at this file and the desktop host will spawn it
+# exactly as it spawns the real engine, argv and owner-token env included:
+#
+#   cd desktop/src-tauri
+#   WSYNC_DAEMON_PATH="$PWD/../scripts/wsync-mock" cargo tauri dev
+#
+# Extra mock-only switches can be injected without touching the host:
+#
+#   WSYNC_MOCK_ARGS="--no-resolve --event-interval 800"
+#
+# See scripts/mock-daemon.mjs for the full list.
+set -eu
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+if ! command -v node >/dev/null 2>&1; then
+  # The host reads one JSON line from stdout and reports it verbatim, so an
+  # unusable shim explains itself in the app's project-error card.
+  printf '{"ok":false,"error":{"code":"no_node","message":"wsync-mock needs Node 18+ on PATH"}}\n'
+  exit 1
+fi
+
+# shellcheck disable=SC2086 # WSYNC_MOCK_ARGS is deliberately word-split.
+exec node "$here/mock-daemon.mjs" "$@" ${WSYNC_MOCK_ARGS:-}

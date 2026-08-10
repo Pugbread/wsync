@@ -1,0 +1,19 @@
+{
+  "name": "init",
+  "title": "wsync init",
+  "category": "Project setup",
+  "description": "Initializes a directory as a WSync project from a template and writes the project file, agent context, and local Luau tooling files without starting a daemon.",
+  "usage": "wsync init [--project <path>] [-T place|quick|model|package|plugin|empty] [--name <name>] [--game-id <id>] [--group-id <id>] [--place-id <id>]... [--git] [--wally] [--selene] [--docs] [--license <spdx>] [--ts] [--raw]",
+  "examples": [
+    "wsync init --project .",
+    "wsync init --project ./game -T place --git --wally --selene",
+    "wsync init --project ./game --name my-game --game-id 123 --group-id 456 --place-id 789 --raw"
+  ],
+  "notes": [
+    "Templates are `place`, `quick`, `model`, `package`, `plugin`, and `empty`. They ship embedded, install to `~/.wsync/templates/`, and are versioned and refreshed by `wsync update templates`.",
+    "Writes `default.project.json` plus the generated agent docs (`wsync.md`, `AGENTS.md`, `CLAUDE.md`, `.codex/config.toml`). Existing custom project files are preserved or merged by the same guarded writers used by `wsync refresh`.",
+    "`--name`, `--game-id`, `--group-id`, and repeated `--place-id` populate the project identity fields; `--git`, `--wally`, `--selene`, `--docs`, `--license`, and `--ts` control scaffolding.",
+    "When the target directory holds a legacy pre-WSync single-file project config, `init` migrates it into `default.project.json` instead of reading it at runtime.",
+    "This command never starts a background process."
+  ]
+}

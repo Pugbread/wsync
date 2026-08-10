@@ -1,0 +1,18 @@
+{
+  "name": "context",
+  "title": "wsync context",
+  "category": "Command registry",
+  "description": "Prints a compact LLM-oriented project context snapshot as JSON.",
+  "usage": "wsync context [--project <path>] [--port <port>] [--full-commands]",
+  "examples": [
+    "wsync context --project .",
+    "wsync context --project . --full-commands",
+    "wsync context --project . --port 7978"
+  ],
+  "notes": [
+    "Does not mutate disk or Studio.",
+    "Includes project config, synced roots, key generated files, daemon status, daemon project mismatch warnings, conflict count, and command registry pointers.",
+    "Includes the `llmPolicy` block so agents that read only `context` still get the command budget: use `wsync commands --compact` and `wsync commands <name>` instead of dumping the full registry, and do not run `diff`, `changes`, `conflicts`, or live `source` as a startup ritual.",
+    "Use `--full-commands` only when the caller needs the complete embedded command registry in the same response."
+  ]
+}

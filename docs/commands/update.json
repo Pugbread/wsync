@@ -1,0 +1,55 @@
+{
+  "name": "update",
+  "title": "wsync update",
+  "category": "Tool management",
+  "description": "Updates the WSync CLI, Studio plugin, and project templates from the published releases.",
+  "subcommands": [
+    "cli",
+    "plugin",
+    "templates",
+    "all"
+  ],
+  "subcommandMetadata": {
+    "cli": {
+      "safety": "replaces-local-binary",
+      "requires": [
+        "network"
+      ]
+    },
+    "plugin": {
+      "safety": "writes-local-files",
+      "requires": [
+        "network",
+        "roblox-plugin-directory"
+      ]
+    },
+    "templates": {
+      "safety": "writes-local-files",
+      "requires": [
+        "network"
+      ]
+    },
+    "all": {
+      "safety": "replaces-local-binary",
+      "requires": [
+        "network",
+        "roblox-plugin-directory"
+      ]
+    }
+  },
+  "usage": "wsync update [cli|plugin|templates|all] [--force] [--raw]",
+  "examples": [
+    "wsync update",
+    "wsync update cli --force",
+    "wsync update plugin",
+    "wsync update templates --raw"
+  ],
+  "notes": [
+    "Defaults to `all`. Installed versions are tracked in `~/.wsync/update.toml`.",
+    "`cli` replaces the self-installed binary in `~/.wsync/bin`. A package-managed install is refused with the package manager's own upgrade command instead of being overwritten.",
+    "`--force` reinstalls the current version and skips the already-up-to-date short-circuit.",
+    "A passive check runs at most hourly and only prints a notice; `check_updates` disables it and `auto_update` makes it apply without asking.",
+    "`plugin` writes to the Roblox Studio plugins directory and requires a Studio restart. `templates` refreshes `~/.wsync/templates/` under the `update_templates` config option.",
+    "Binary, plugin, protocol number, and generated docs are released together from one commit; update them as a set rather than individually when a protocol number changes."
+  ]
+}

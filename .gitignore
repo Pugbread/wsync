@@ -1,0 +1,24 @@
+.DS_Store
+target/
+sourcemap.json
+*.rbxm
+*.rbxmx
+*.rbxl
+*.rbxlx
+
+# Wally-vendored packages and the lockfile they resolve to
+/plugin/Packages/
+/plugin/wally.lock
+
+# Staged build inputs for the desktop bundle: the engine sidecar binaries and
+# the plugin pair copied into resources at build time
+/desktop/src-tauri/binaries/*
+!/desktop/src-tauri/binaries/.gitkeep
+/desktop/src-tauri/resources/
+
+# Tauri codegen
+/desktop/src-tauri/gen/
+
+# Local agent/editor state
+.claude/settings.local.json
+node_modules/

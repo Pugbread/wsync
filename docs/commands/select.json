@@ -1,0 +1,37 @@
+{
+  "name": "select",
+  "title": "wsync select",
+  "category": "Live writes",
+  "description": "Reads or replaces the current Studio Selection.",
+  "subcommands": [
+    "get",
+    "set"
+  ],
+  "subcommandMetadata": {
+    "get": {
+      "safety": "read-only",
+      "requires": [
+        "project",
+        "daemon",
+        "studio-plugin"
+      ]
+    },
+    "set": {
+      "safety": "mutates-studio-selection",
+      "requires": [
+        "project",
+        "daemon",
+        "studio-plugin"
+      ]
+    }
+  },
+  "usage": "wsync select <get|set> [--project <path>] [--port <port>] [--paths <json-array>] [--raw]",
+  "examples": [
+    "wsync select get --project .",
+    "wsync select set --project . --paths '[\"Workspace/Box\",\"Workspace/SpawnLocation\"]'"
+  ],
+  "notes": [
+    "`select get` is read-only; `select set` is a Studio state change.",
+    "Selection payloads are chunked; very large selections page rather than arriving in one frame."
+  ]
+}

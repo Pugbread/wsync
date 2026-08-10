@@ -1,0 +1,17 @@
+{
+  "name": "capabilities",
+  "title": "wsync capabilities",
+  "category": "Agent runtime",
+  "description": "Negotiates the connected daemon, Studio plugin, host DataModel, and optional LLM automation features before an agent chooses a command path.",
+  "usage": "wsync capabilities [--project <path>] [--port <port>] [--raw]",
+  "examples": [
+    "wsync capabilities --project .",
+    "wsync capabilities --project . --raw"
+  ],
+  "notes": [
+    "The `wsync/1` capability document reports the daemon and plugin build identity plus feature flags for exact physical-path identity, stats-first bounded per-root bootstrap with daemon-authored identity receipts, selective initial disk-to-Studio sync, native instance clipboard copy/paste, permission-free internal RGBA capture, playtesting, runtime execution, virtual input, UI inspection, artifacts, and workflows. `features.instanceClipboard` advertises `wsync copy`/`paste`; capture limits describe the unified `ui`, `model`, and `viewport` renderer.",
+    "Use this cheap read before relying on optional Studio APIs; Studio version and permission differences are reported instead of guessed.",
+    "Protocol and capability mismatches are negotiated at the WebSocket hello, so an incompatible plugin is reported here rather than failing mid-command.",
+    "`--raw` prints the complete correlated response envelope for machine use."
+  ]
+}

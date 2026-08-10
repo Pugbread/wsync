@@ -1,0 +1,208 @@
+{
+  "$comment": [
+    "Lines that may legitimately name the parent tool. Every other occurrence of",
+    "rosync / ro-sync / 'ro sync' / 7878 in docs/, src/, plugin/src/, desktop/src/,",
+    "README.md, NOTICE or CHANGELOG.md fails check-heritage.mjs.",
+    "",
+    "An entry allows a hit only when the file path, the token id AND the exact",
+    "`contains` text all match, up to `max` lines. Blanket file exemptions are",
+    "deliberately impossible: an allowlisted file must still not leak the name",
+    "anywhere except the sentence that earned the exemption.",
+    "",
+    "Adding an entry means asserting that the string is attribution or design",
+    "rationale, not a leftover. If it is a leftover, fix the source instead.",
+    "",
+    "Format: see `node scripts/check-heritage.mjs --help`."
+  ],
+  "allow": [
+    {
+      "path": "NOTICE",
+      "token": "ro-sync",
+      "contains": "clean-slate remake of Ro-Sync",
+      "max": 1,
+      "reason": "Provenance statement. NOTICE records what WSync is derived from and what it is not: the engine is an Apache-2.0 fork of Argon (attribution legally required), the product layer is a remake of the author's own prior tool (stated so the Argon attribution is not read as covering the whole product). Naming the parent is the entire point of the file."
+    },
+    {
+      "path": "README.md",
+      "token": "ro-sync",
+      "contains": "clean-slate remake of Ro-Sync",
+      "max": 1,
+      "reason": "The README's Attribution section mirrors NOTICE for readers who never open it. Same justification: it points at the licence obligation for Argon and disclaims that obligation for the product layer."
+    },
+    {
+      "path": "README.md",
+      "token": "ro-sync",
+      "contains": "Ro-Sync's product layer",
+      "max": 1,
+      "reason": "Opening one-line description of what WSync is (Design 1.3, heritage map). The project is defined by combining two lineages, and the first sentence has to say which two; the alternative is a README that describes the tool inaccurately to protect a naming rule."
+    },
+    {
+      "path": "desktop/src/views/theme.js",
+      "token": "ro-sync",
+      "contains": "Ro-Sync's",
+      "max": 1,
+      "reason": "Design-rationale comment: it records that the reference implementation had a fifth `host` theme preset for its terminal-widget surface and that WSync deliberately ships four, because WSync has only the desktop window (Design 1.4). Without the reference the omission reads like an oversight and someone re-adds it. Comment only, never rendered."
+    },
+    {
+      "path": "plugin/src/Remote/Error.luau",
+      "token": "ro-sync",
+      "contains": "from Ro-Sync",
+      "max": 1,
+      "reason": "Provenance note on a wire contract: the seven remote-op error codes (Design 5.3) are carried over unchanged, and the comment says so. A maintainer who does not know the codes are a compatibility surface will eventually rename one. Comment only; the codes themselves carry no heritage naming."
+    },
+    {
+      "path": "plugin/src/Remote/Selector.luau",
+      "token": "ro-sync",
+      "contains": "mirroring Ro-Sync's matcher",
+      "max": 1,
+      "reason": "Records where a deliberate v1 semantic restriction comes from: selector segments have no partial-segment globs, so `Work*` is a literal name. Stating the source is what stops someone 'fixing' it into a glob and silently changing query semantics."
+    },
+    {
+      "path": "src/constants.rs",
+      "token": "ro-sync",
+      "contains": "Ro-Sync invariant",
+      "max": 1,
+      "reason": "Cites the origin of a connection-lifecycle invariant (every connect has a deadline). Design 15 phase 7 names Ro-Sync's invariant list as the seed for WSync's own, so an inline citation is the intended form until that document exists. Doc comment on a constant; the constant and its value are WSync's."
+    },
+    {
+      "path": "plugin/src/Remote/Codec.luau",
+      "token": "ro-sync",
+      "contains": "Budgets are Ro-Sync's RemoteCodec",
+      "max": 1,
+      "reason": "Cites the origin of the codec budget limits (depth 64 / 20000 nodes / 10000 entries / 4 MiB strings). They are a carried-over wire contract (Design 5.4); the citation is what stops someone rounding them to nicer numbers. Comment only."
+    },
+    {
+      "path": "plugin/src/Remote/Codec.luau",
+      "token": "ro-sync",
+      "contains": "(Ro-Sync RemoteCodec): all-number keys encode",
+      "max": 1,
+      "reason": "Records the reference semantics for mixed/array table encoding, a wire-compatibility behavior the CLI depends on. Comment only."
+    },
+    {
+      "path": "plugin/src/Remote/Codec.luau",
+      "token": "ro-sync",
+      "contains": "(Ro-Sync behavior)",
+      "max": 1,
+      "reason": "Records that canonical string forms for non-finite numbers follow the reference implementation. Comment only."
+    },
+    {
+      "path": "plugin/src/Remote/Handlers/Inspect.luau",
+      "token": "ro-sync",
+      "contains": "matching the Ro-Sync view",
+      "max": 1,
+      "reason": "The get/props full-view shape (properties/attributes/tags/children, Ref and SharedString omitted) is a registry contract carried from the reference; the comment marks output-shape parity as deliberate. Comment only."
+    },
+    {
+      "path": "plugin/src/Remote/init.luau",
+      "token": "ro-sync",
+      "contains": "Error codes are Ro-Sync's",
+      "max": 1,
+      "reason": "Same justification as the existing Remote/Error.luau entry: the seven wire error codes are a compatibility surface kept verbatim (Design 5.3/5.4), and the dispatch layer restates it where the codes are consumed. Comment only."
+    },
+    {
+      "path": "src/daemon.rs",
+      "token": "ro-sync",
+      "contains": "the Ro-Sync model, reimplemented clean-room",
+      "max": 1,
+      "reason": "Module doc for the daemon lifecycle (records, locks, boot-guarded stop): Design 3.2/11/12 define this subsystem as the Ro-Sync model rebuilt clean-room, and the module header says exactly that. Internal doc comment, never user-visible."
+    },
+    {
+      "path": "src/server/lifecycle.rs",
+      "token": "ro-sync",
+      "contains": "(Ro-Sync's laptop-sleep-tolerant semantics)",
+      "max": 1,
+      "reason": "Cites the origin of the watchdog's 5-minute + 30-second suspect-grace shape. The grace window looks redundant until you know it exists for laptop sleep; the citation prevents its removal. Internal doc comment."
+    },
+    {
+      "path": "src/server/ws/frames.rs",
+      "token": "ro-sync",
+      "contains": "Ro-Sync's set kept verbatim",
+      "max": 1,
+      "reason": "Daemon-side twin of the plugin's error-code provenance notes: the same seven wire codes, same carried-over contract, cited where the Rust enum defines them. Internal doc comment."
+    },
+    {
+      "path": "src/core/conflict/mod.rs",
+      "token": "ro-sync",
+      "contains": "generalized from Ro-Sync's",
+      "max": 1,
+      "reason": "Module doc for the conflict engine: Design 6.3 defines it as Ro-Sync's per-path baseline engine generalized to instances, and the header says exactly that, including where the fail-closed race-window stance comes from. Internal doc comment."
+    },
+    {
+      "path": "desktop/src/views/diff.js",
+      "token": "ro-sync",
+      "contains": "Ro-Sync got wrong",
+      "max": 1,
+      "reason": "Design rationale: records that the reference implementation lazy-loaded its diff library from a public CDN (a documented Design 8.2 fix \u2014 'no CDN dependency') and why this module is dependency-free instead. The citation is what stops someone 'simplifying' back to a CDN import. Comment only."
+    },
+    {
+      "path": "plugin/src/Remote/Handlers/Write.luau",
+      "token": "ro-sync",
+      "contains": "the Ro-Sync ordering",
+      "max": 1,
+      "reason": "Provenance of the new-instance apply order (props while unparented, parent late, Source after parenting) \u2014 an ordering that exists because UpdateSourceAsync requires a rooted script. Naming the source marks it deliberate. Comment only."
+    },
+    {
+      "path": "src/cli/live/write.rs",
+      "token": "ro-sync",
+      "contains": "exactly like Ro-Sync: a dropped marker costs undo labelling",
+      "max": 1,
+      "reason": "Provenance of the single-write --waypoint semantics: the pre-write marker is best-effort (warn on failure, never block the write) because the plugin auto-seals every mutation \u2014 the reference established that failure mode split. Comment only."
+    },
+    {
+      "path": "plugin/src/Remote/Capture/init.luau",
+      "token": "ro-sync",
+      "contains": "Ro-Sync's Photo engine",
+      "max": 1,
+      "reason": "Provenance of the capture technique (CaptureService screenshot -> EditableImage readback with dual-pass alpha recovery) \u2014 the reference proved this API path works without screenshot permissions; the citation stops someone swapping it for a permission-gated approach. Comment only."
+    },
+    {
+      "path": "src/docsgen/render.rs",
+      "token": "ro-sync",
+      "contains": "mirrors Ro-Sync's",
+      "max": 1,
+      "reason": "Module doc citing the section arc the generated agent docs follow (Design 10.6 mandates mirroring ro-sync.md 0-7). The generated OUTPUT no longer names Ro-Sync anywhere; only this internal doc comment records the structural source."
+    },
+    {
+      "path": "src/cli/workflow.rs",
+      "token": "ro-sync",
+      "contains": "the same way Ro-Sync's workflow engine was",
+      "max": 1,
+      "reason": "Module doc citing the structural source of the workflow engine split (typed schema / whole-plan validator / executor) \u2014 run.json's schema-v1 contract is carried over, and the comment records where the shape that satisfies it came from. Internal doc comment."
+    },
+    {
+      "path": "plugin/src/Playtest/Host.luau",
+      "token": "ro-sync",
+      "contains": "Ro-Sync",
+      "max": 1,
+      "reason": "Provenance of the connection-direction-first DataModel detection order \u2014 the one that survives Run mode's misleading HostDataModelType. Citing the source stops a 'simplification' back to the naive order that misclassifies Run mode. Comment only."
+    },
+    {
+      "path": "plugin/src/Playtest/Protocol.luau",
+      "token": "ro-sync",
+      "contains": "(Ro-Sync-proven)",
+      "max": 1,
+      "reason": "Signal-coordination bounds carried from the reference implementation's tested values (queue depths, backlog caps). Comment only."
+    },
+    {
+      "path": "plugin/src/App/Pages/NotConnected.luau",
+      "token": "ro-sync",
+      "contains": "user-ruled Ro-Sync model",
+      "max": 1,
+      "reason": "Header citing the user ruling that the connection card follows the Ro-Sync model (portless auto-discovery, two-step create). Comment only."
+    },
+    {
+      "path": "plugin/src/Discovery/Policy.luau",
+      "token": "ro-sync",
+      "contains": "Ro-Sync model)",
+      "max": 1,
+      "reason": "Same ruling citation on the pure policy module (strict GameId matching, state machine). Comment only."
+    },
+    {
+      "path": "plugin/src/Discovery/init.luau",
+      "token": "ro-sync",
+      "contains": "user-ruled Ro-Sync model",
+      "max": 1,
+      "reason": "Same ruling citation on the scan orchestrator. Comment only."
+    }
+  ]
+}

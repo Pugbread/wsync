@@ -1,0 +1,14 @@
+{
+  "name": "version",
+  "title": "wsync version",
+  "category": "Live diagnostics",
+  "description": "Prints the daemon version and build identity and, when reachable, the plugin version.",
+  "usage": "wsync version [--project <path>] [--port <port>] [--raw]",
+  "examples": [
+    "wsync version --project ."
+  ],
+  "notes": [
+    "Human and raw output include the daemon build commit and dirty state. The connected plugin reports its own build identity in the nested version response.",
+    "Binary, plugin, protocol number, and generated docs are released from one commit; a mismatch reported here means an unreleased or mixed install."
+  ]
+}

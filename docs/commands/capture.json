@@ -1,0 +1,58 @@
+{
+  "name": "capture",
+  "title": "wsync capture",
+  "category": "Agent runtime",
+  "description": "Captures transparent UI, a model or scene, or the current 3D viewport through WSync's permission-free internal renderer. Every command writes a locally encoded and verified PNG without placing image bytes on stdout.",
+  "subcommands": [
+    "ui",
+    "model",
+    "viewport"
+  ],
+  "subcommandMetadata": {
+    "ui": {
+      "safety": "writes-local-artifact",
+      "requires": [
+        "project",
+        "daemon",
+        "studio-plugin"
+      ]
+    },
+    "model": {
+      "safety": "writes-local-artifact",
+      "requires": [
+        "project",
+        "daemon",
+        "studio-plugin"
+      ]
+    },
+    "viewport": {
+      "safety": "writes-local-artifact",
+      "requires": [
+        "project",
+        "daemon",
+        "studio-plugin"
+      ]
+    }
+  },
+  "usage": "wsync capture <ui|model|viewport> [TARGET] [--project <path>] [--port <port>] [--size WxH] [--region x,y,w,h] [--view <preset>] [--direction x,y,z] [--camera-cframe <12 floats>] [--padding 1.0-4.0] [--fov 1-120] [--world] [--skybox] [--framed] [--ui none|overlay] [-o|--output <file>] [--timeout <seconds>] [--raw]",
+  "examples": [
+    "wsync capture ui --project . --size 1920x1080 --output ./captures/hud.png --raw",
+    "wsync capture ui StarterGui/HUD/InventoryPanel --project . --size 1200x800 --output ./captures/inventory.png --raw",
+    "wsync capture ui --project . --region 120,80,1280,720 --size 1920x1080 -o ./captures/hud-region.png --raw",
+    "wsync capture model Workspace/Map/Boss --project . --view isometric --size 1024x1024 --padding 1.25 --fov 32 --output ./captures/boss.png --raw",
+    "wsync capture model Workspace/Map/Boss --project . --camera-cframe '0,10,20,1,0,0,0,1,0,0,0,1' --framed --size 1600x900 --output ./captures/boss-authored.png --raw",
+    "wsync capture model Workspace/Vehicle --project . --world --skybox --direction 1,-0.65,1 --size 1600x900 --output ./captures/vehicle-scene.png",
+    "wsync capture viewport --project . --region 120,80,1280,720 --size 1920x1080 --output ./captures/viewport-transparent.png --raw",
+    "wsync capture viewport --project . --skybox --ui overlay --size 1920x1080 --output ./captures/viewport-world.png --raw"
+  ],
+  "notes": [
+    "All three capture commands use the packaged internal RGBA renderer. They never request Roblox Studio screenshot permission, macOS Screen Recording permission, or a place-provided capture dependency.",
+    "`capture ui [TARGET]` captures only edit-mode ScreenGui pixels on a transparent background and never includes the 3D world or Studio chrome. TARGET is an optional ScreenGui or GuiObject path; when supplied, unrelated UI is hidden and the rendered target is tight-cropped before it is aspect-contained in `--size`. `--region x,y,width,height` selects an explicit rectangle in native viewport pixels.",
+    "`capture model TARGET` clones the target without scripts, isolates it, removes the skybox, and tight-crops its rendered alpha by default. `--world` frames the original target in place. `--skybox` keeps the world background and produces an opaque scene capture. `--framed` keeps the complete camera-framed canvas instead of applying the default subject-alpha crop.",
+    "For model captures, `--view` accepts isometric, front, back, left, right, top, or bottom; `--direction x,y,z` overrides it. `--camera-cframe` accepts exactly the 12 finite values returned by `CFrame:GetComponents()` and replaces automatic view, direction, and padding framing. `--padding` is 1.0-4.0 and `--fov` is 1-120 degrees.",
+    "`capture viewport` captures the complete current 3D viewport. It defaults to a transparent world with no in-game UI; `--skybox` preserves the rendered sky and world background, while `--ui overlay` includes visible ScreenGui layers over the scene. `--region x,y,width,height` selects an explicit rectangle in native viewport pixels.",
+    "For every no-skybox capture, WSync temporarily moves every `Sky` and `Atmosphere` descendant out from under `Lighting` before rendering and watches for matching descendants added while capture is active. Cleanup restores each object to its exact original parent—even after preparation, rendering, transport, or PNG failure—and falls back to `Lighting` only if that parent disappeared. Camera, UI, Lighting properties, and temporary clones receive the same protected cleanup.",
+    "`--size WIDTHxHEIGHT` is optional and requests exact output dimensions. Without it, model captures use the focused-render default of 1024x1024 while UI and viewport captures keep their native/current render dimensions. `--output`/`-o`, `--timeout`, and `--raw` are common to every capture type; default files are `wsync-ui.png`, `wsync-model.png`, and `wsync-viewport.png`. Each axis is limited to 4096 pixels and the image to 16777216 pixels.",
+    "The plugin sends tightly packed RGBA8 in bounded chunks. The CLI checks dimensions, exact byte length, offsets, and EOF, then encodes and verifies the PNG locally. Raw output includes the absolute output path, MIME type, byte size, dimensions, SHA-256, and prepared capture metadata without placing pixels on stdout."
+  ]
+}

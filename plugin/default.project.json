@@ -1,0 +1,22 @@
+{
+  "name": "WSync",
+  "tree": {
+    "$path": "src",
+    "Packages": {
+      "$path": "Packages"
+    },
+    "manifest": {
+      "$path": "wally.toml"
+    }
+  },
+  "ignoreGlobs": [
+    "Packages/**/wally.toml",
+    "Packages/**/wally.lock",
+    "Packages/**/aftman.toml",
+    "Packages/**/foreman.toml",
+    "Packages/**/selene.toml",
+    "Packages/**/*.md",
+    "Packages/**/.gitignore",
+    "Packages/**/LICENSE*"
+  ]
+}

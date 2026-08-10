@@ -1,0 +1,15 @@
+{
+  "name": "services",
+  "title": "wsync services",
+  "category": "Live inspection",
+  "description": "Lists the project's sync roots and whether each exists on disk and in the live Studio DataModel.",
+  "usage": "wsync services [--project <path>] [--port <port>] [--raw]",
+  "examples": [
+    "wsync services --project .",
+    "wsync services --project . --raw"
+  ],
+  "notes": [
+    "Roots come from the project file's `tree` and its `$path` mappings, not from a fixed service allowlist, so any service or nested instance the project maps is listed.",
+    "Each row reports the Studio path, the mapped project path, and presence on each side; this is the cheapest way to learn a project's sync scope."
+  ]
+}

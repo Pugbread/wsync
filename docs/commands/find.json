@@ -1,0 +1,15 @@
+{
+  "name": "find",
+  "title": "wsync find",
+  "category": "Live inspection",
+  "description": "Finds live Studio instances by class name and/or name substring.",
+  "usage": "wsync find [--project <path>] [--port <port>] [--class <ClassName>] [--name <text>] [--under <studio-path>] [--raw]",
+  "examples": [
+    "wsync find --project . --class RemoteEvent",
+    "wsync find --project . --class Part --under Workspace/Map"
+  ],
+  "notes": [
+    "Omit `--under` to search the whole DataModel.",
+    "An unbounded search is a higher-token read; scope it with `--under` when the parent is known."
+  ]
+}

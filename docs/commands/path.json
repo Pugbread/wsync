@@ -1,0 +1,16 @@
+{
+  "name": "path",
+  "title": "wsync path",
+  "category": "Path tools",
+  "description": "Translates between Studio instance paths and syncable filesystem paths using the live Studio tree.",
+  "usage": "wsync path --project <path> [--port <port>] [--from auto|studio|fs] <target> [--raw]",
+  "examples": [
+    "wsync path --project . Workspace/Camera",
+    "wsync path --project . --from fs src/Shared/Config.luau"
+  ],
+  "notes": [
+    "Resolution runs through the project's sync rules, so any instance the middleware maps answers — scripts, value modules, `.model.json`/`.rbxm` subtrees, and `.data.json`-backed instances alike.",
+    "Instances outside the projection — not under a mapped root, excluded by `ignoreGlobs`, or inside an `AvoidSync` subtree — are reported as Studio-only instead of being given an invented path.",
+    "Generated files such as `wsync.md` are not syncable Studio instances."
+  ]
+}

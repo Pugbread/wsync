@@ -1,0 +1,11 @@
+.DS_Store
+/Packages
+/sourcemap.json
+/*.lock
+*.rbxm
+*.rbxmx
+*.rbxl
+*.rbxlx
+
+# wally.lock pins the resolved dependency set — CI reproducibility depends on it
+!/wally.lock

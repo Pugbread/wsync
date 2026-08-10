@@ -1,0 +1,15 @@
+{
+  "name": "where",
+  "title": "wsync where",
+  "category": "Path tools",
+  "description": "Finds live Studio instances by name substring and, when possible, resolves a target path to disk.",
+  "usage": "wsync where [--project <path>] [--port <port>] [--under <studio-path>] [--raw] <target>",
+  "examples": [
+    "wsync where UIController --project .",
+    "wsync where Controller --under ReplicatedStorage/Client"
+  ],
+  "notes": [
+    "Combines a live name search with middleware path translation when `--project` is supplied.",
+    "Matches that the project does not project to disk are still listed, marked Studio-only."
+  ]
+}

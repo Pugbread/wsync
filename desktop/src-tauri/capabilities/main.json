@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-capability",
+  "description": "The entire webview privilege surface for the WSync window. The webview gets no shell, no filesystem, and no HTTP plugin: every privileged operation goes through a named host command in src/commands.rs (Design 8.1). Window dragging is granted only because the titlebar is an overlay.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging"
+  ]
+}

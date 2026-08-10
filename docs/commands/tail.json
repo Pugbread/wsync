@@ -1,0 +1,14 @@
+{
+  "name": "tail",
+  "title": "wsync tail",
+  "category": "Live diagnostics",
+  "description": "Streams Studio output, warning, and error messages until interrupted.",
+  "usage": "wsync tail [--project <path>] [--port <port>] [--since <duration>] [--level info|warn|error] [--limit <n>] [--raw]",
+  "examples": [
+    "wsync tail",
+    "wsync tail --level warn --since 5m"
+  ],
+  "notes": [
+    "Equivalent to `wsync logs --tail`."
+  ]
+}

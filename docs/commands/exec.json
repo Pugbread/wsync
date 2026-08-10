@@ -1,0 +1,20 @@
+{
+  "name": "exec",
+  "title": "wsync exec",
+  "category": "Studio control",
+  "description": "Broadcasts Luau source to every connected Studio client and returns immediately.",
+  "usage": "wsync exec [--project <path>] [--port <port>] <luau-or-file> [-f|--focus] [--raw]",
+  "examples": [
+    "wsync exec --project . 'print(#workspace:GetChildren())'",
+    "wsync exec --project . ./scripts/bootstrap.luau --focus",
+    "wsync exec --project . 'game:GetService(\"Selection\"):Set({})' --raw"
+  ],
+  "notes": [
+    "Requires the daemon and at least one connected Studio plugin. Safety: mutates Studio — the source runs at the plugin's trust level, exactly like `wsync eval`.",
+    "The argument is Luau source, or a path to a `.luau`/`.lua` file whose contents are sent.",
+    "`exec` is fire-and-forget: the daemon delivers one `execute` frame to every connected client and no value comes back. `wsync eval` is the request/response form and is what to use when the result matters.",
+    "Because it broadcasts, every connected place runs the code. Scope work with `wsync eval` when only one session should be touched.",
+    "`--focus` raises the Roblox Studio window before the code runs.",
+    "The broadcast is recorded in `writes.log` like other Studio mutations. Inspect the source first and confirm user intent before running it."
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "name": "doc",
+  "title": "wsync doc",
+  "category": "Tool management",
+  "description": "Opens the WSync documentation site in the default browser.",
+  "usage": "wsync doc [--raw]",
+  "examples": [
+    "wsync doc",
+    "wsync doc --raw"
+  ],
+  "notes": [
+    "Prints the documentation URL and hands it to the system handler; `--raw` prints the URL as JSON and opens nothing.",
+    "For the command surface itself, `wsync commands` serves the same generated registry offline and is the right tool for agents and for machines without a browser."
+  ]
+}

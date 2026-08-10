@@ -1,0 +1,15 @@
+{
+  "name": "meta",
+  "title": "wsync meta",
+  "category": "Path tools",
+  "description": "Shows the Studio path, class, filesystem path, and existence status for a syncable path.",
+  "usage": "wsync meta [--project <path>] [--port <port>] [--from auto|studio|fs] [--raw] <target>",
+  "examples": [
+    "wsync meta --project . ReplicatedStorage/Client/UIController",
+    "wsync meta --project . --from fs src/Client/UIController.client.luau"
+  ],
+  "notes": [
+    "Uses the live Studio tree; start `wsync serve --project .` and connect the Studio plugin first.",
+    "Resolves through the same middleware as `path`, so a sidecar-backed or model-backed instance reports every file that backs it, not just a script path."
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "name": "transmit",
+  "title": "wsync transmit",
+  "category": "Studio control",
+  "description": "Runs an optional Studio render script, reads EditableImage/ImageLabel/ImageButton/MeshPart texture pixels from Studio, and writes local PNG files for editing or upload.",
+  "usage": "wsync transmit [--project <path>] [--port <port>] [--source <luau> | --source-file <file>] [--from <studio-path>] [--path <studio-path>]... --output <file-or-dir> [--timeout <seconds>] [--raw]",
+  "examples": [
+    "wsync transmit --project . --source-file render.luau --from Workspace/Exports --output renders",
+    "wsync transmit --project . --path StarterGui/Example --output ./example.png",
+    "wsync transmit --project . --source 'return game:GetService(\"AssetService\"):CreateEditableImage({Size = Vector2.new(64, 64)})' --output ./renders/blank.png"
+  ],
+  "notes": [
+    "The plugin accepts EditableImage objects directly and can also read ImageLabel/ImageButton content through AssetService.",
+    "Use `wsync capture ui`, `capture model`, or `capture viewport` to create permission-free PNGs through WSync's internal RGBA renderer.",
+    "MeshParts with object-backed TextureContent are supported. WSync reads Content.Object directly when it is already an EditableImage, otherwise it falls back to CreateEditableImageAsync for TextureContent or TextureID.",
+    "`--source` and `--source-file` execute with loadstring in the plugin's real Studio environment, so normal globals like game, workspace, require, Rect, and Vector2 are available without a custom sandbox.",
+    "Large batches are prepared once, then downloaded one image per request so full 768x768 render sets do not have to fit in one WebSocket response.",
+    "If `--source` or `--source-file` returns images, those are captured. If `--from` is supplied, WSync also walks that Studio subtree after the source runs and captures any image-like instances found there.",
+    "The command writes PNG files locally. Use `wsync upload` afterwards when you want to publish the edited images to Roblox Open Cloud.",
+    "This executes Luau in Studio, so treat it like `wsync eval`: inspect render scripts first and avoid destructive code."
+  ]
+}

@@ -1,0 +1,46 @@
+{
+  "name": "plugin",
+  "title": "wsync plugin",
+  "category": "Project setup",
+  "description": "Installs, removes, or verifies the WSync Roblox Studio plugin in the local Studio plugins directory.",
+  "subcommands": [
+    "install",
+    "uninstall",
+    "status"
+  ],
+  "subcommandMetadata": {
+    "install": {
+      "safety": "writes-local-files",
+      "requires": [
+        "bundled-plugin",
+        "roblox-plugin-directory"
+      ]
+    },
+    "uninstall": {
+      "safety": "writes-local-files",
+      "requires": [
+        "roblox-plugin-directory"
+      ]
+    },
+    "status": {
+      "safety": "read-only",
+      "requires": [
+        "bundled-plugin",
+        "roblox-plugin-directory"
+      ]
+    }
+  },
+  "usage": "wsync plugin <install|uninstall|status> [--source <WSync.rbxm>] [--plugin-dir <path>] [--raw]",
+  "examples": [
+    "wsync plugin install",
+    "wsync plugin status --raw",
+    "wsync plugin uninstall --raw",
+    "wsync plugin install --source ./plugin/WSync.rbxm --plugin-dir ./scratch-plugins --raw"
+  ],
+  "notes": [
+    "`install` atomically writes `WSync.rbxm`; `status` compares the installed copy with the bundle by SHA-256 and reports whether the installed plugin's protocol matches this CLI's.",
+    "The default destination is ~/Documents/Roblox/Plugins on macOS and LocalAppData/Roblox/Plugins on Windows.",
+    "Install candidates are resolved next to the binary first, then in the desktop app resources; with no bundled copy available, `install` falls back to downloading the matching published release asset.",
+    "Installation removes stale `WSync.lua` and `WSync.luau` copies and reports that Studio must be restarted."
+  ]
+}

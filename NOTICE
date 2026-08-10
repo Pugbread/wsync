@@ -1,0 +1,14 @@
+WSync
+Copyright 2026 Pugbread
+
+This product includes software developed as part of the Argon project
+(https://github.com/argon-rbx/argon), Copyright Dervex and contributors,
+licensed under the Apache License, Version 2.0.
+
+WSync's sync engine (vfs, middleware, tree/snapshot/changes core, project
+format, CLI tooling) is a fork of Argon 2.0.29. The vendored crates under
+crates/ (config-derive, json-formatter, profiling, notify-debouncer-full,
+self_update) retain their original licenses as noted in each crate.
+
+WSync's product layer (desktop app, wire protocol, conflict engine, command
+surface) is a clean-slate remake of Ro-Sync by Ro-Sync's own author.

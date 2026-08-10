@@ -1,0 +1,17 @@
+{
+  "name": "snapshot",
+  "title": "wsync snapshot",
+  "category": "Live inspection",
+  "description": "Exports the live Studio tree plus inspectable properties, attributes, and tags to deterministic JSON.",
+  "usage": "wsync snapshot [--project <path>] [--port <port>] [--ref <hex>] [--output <file-or-dir>] [--raw]",
+  "examples": [
+    "wsync snapshot --project .",
+    "wsync snapshot --project . --output snapshots/"
+  ],
+  "notes": [
+    "Defaults to `wsync-snapshot-<unix-seconds>.json` under the project or current directory.",
+    "The export covers the whole DataModel projection, not only script-backed instances, and uses the same tagged-value encoding as the sync protocol.",
+    "Backed by the daemon `/snapshot` route, which also serves subtree exports by ref.",
+    "This is a backup and debugging tool. It is the most expensive read in the CLI; reach for `tree`, `ls`, or `query` first."
+  ]
+}

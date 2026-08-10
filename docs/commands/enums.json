@@ -1,0 +1,13 @@
+{
+  "name": "enums",
+  "title": "wsync enums",
+  "category": "Live inspection",
+  "description": "Lists every Enum type name exposed by the connected Studio session.",
+  "usage": "wsync enums [--project <path>] [--port <port>] [--raw]",
+  "examples": [
+    "wsync enums --project ."
+  ],
+  "notes": [
+    "Use `wsync enum --name <EnumName>` to inspect one enum's items."
+  ]
+}

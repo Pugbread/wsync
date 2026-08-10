@@ -1,0 +1,16 @@
+{
+  "name": "tree",
+  "title": "wsync tree",
+  "category": "Live inspection",
+  "description": "Prints a class and name tree below a live Studio instance.",
+  "usage": "wsync tree [--project <path>] [--port <port>] [--path <studio-path>] [--depth <n>] [--raw]",
+  "examples": [
+    "wsync tree --project . --path Workspace --depth 3",
+    "wsync tree --project . --path ReplicatedStorage --depth 8 --raw"
+  ],
+  "notes": [
+    "Depth defaults to 3; use 0 for only the root instance.",
+    "Covers the whole live DataModel. That is a superset of the project's disk projection, because instances outside the project tree, under `ignoreGlobs`, or inside an `AvoidSync` subtree exist in Studio only.",
+    "The live tree is authoritative. Prefer a bounded `--depth` over a wide dump; wide trees are a higher-token read."
+  ]
+}

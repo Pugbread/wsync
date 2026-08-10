@@ -1,0 +1,16 @@
+{
+  "name": "source",
+  "title": "wsync source",
+  "category": "Live inspection",
+  "description": "Prints an instance's script source from live Studio, or the content of the file backing it on disk.",
+  "usage": "wsync source --path <path> [--project <path>] [--port <port>] [--disk] [--raw]",
+  "examples": [
+    "wsync source --path ReplicatedStorage/Client/UIController",
+    "wsync source --project . --path ReplicatedStorage/Client/UIController --disk"
+  ],
+  "notes": [
+    "Without `--disk`, reads the live `Source` through the plugin's `ScriptEditorService` path. Live source is unreliable while an editor draft is open for that script, so a mismatch is not by itself proof of divergence.",
+    "`--disk` resolves the target through the sync middleware, so `.model.json`, `.rbxm`, and `.data.json`-backed instances answer as well as plain script files.",
+    "This is a loose divergence diagnostic, not a verification step. To verify an edit, use the narrowest `wsync lint --path` plus a local file read."
+  ]
+}

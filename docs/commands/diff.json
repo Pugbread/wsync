@@ -1,0 +1,18 @@
+{
+  "name": "diff",
+  "title": "wsync diff",
+  "category": "Live inspection",
+  "description": "Lists the pending Studio-first disk review — the disk entries that survived the connect-time apply.",
+  "usage": "wsync diff [--project <path>] [--port <port>] [--depth <n>] [--raw]",
+  "examples": [
+    "wsync diff --project .",
+    "wsync diff --project . --raw"
+  ],
+  "notes": [
+    "On connect WSync applies Studio to disk automatically (Studio-first, code scope): `differs` files get Studio's content with the disk original preserved, Studio-only instances are written out as `.luau` files and directories, and disk-only files stay untouched on the live disk. This command lists what stayed disk-side: `+` disk-only entries and `~` differs entries whose preserved original can still be pushed back.",
+    "The listing is the same review set `wsync decision` acts on, so entries carry the `reviewId` they belong to. Results are paged; `--raw` emits NDJSON.",
+    "A clean connect leaves nothing behind, so an empty listing is the normal, healthy state. A new connect or comparison replaces the pending review, and a daemon restart keeps it answerable.",
+    "On a `\"scope\": \"full\"` project the connect-time comparison freezes a divergence choice instead of auto-applying; that surface is answered from the desktop app, not here.",
+    "This is a review tool for what the connect kept disk-side, not a post-edit verification step and not a startup ritual."
+  ]
+}

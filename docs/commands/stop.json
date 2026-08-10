@@ -1,0 +1,20 @@
+{
+  "name": "stop",
+  "title": "wsync stop",
+  "category": "Daemon",
+  "description": "Stops running WSync sessions recorded in the global sessions file.",
+  "usage": "wsync stop [<session-id>]... [-a|--all] [-l|--list] [-H|--host <host>] [-P|--port <port>]",
+  "examples": [
+    "wsync stop --list",
+    "wsync stop",
+    "wsync stop --all",
+    "wsync stop --port 7978"
+  ],
+  "notes": [
+    "Sessions are the `serve` and daemon entries registered in `~/.wsync/sessions.toml` as id to pid, host, and port.",
+    "With no arguments the last started session is stopped. `--all` stops every session, `--list` prints them and stops nothing, and `-H`/`-P` select sessions by address.",
+    "Mutates local daemon processes only. It never writes to the project, never touches Studio, and never resolves a pending conflict or divergence choice.",
+    "Shutdown goes through the daemon's authenticated `/stop` route. A PID read from a stale session or runtime record is never authority to kill a process; unreachable entries are pruned and reported instead.",
+    "`wsync daemon stop --project <path>` is the per-project form and matches the exact canonical project plus boot ID."
+  ]
+}

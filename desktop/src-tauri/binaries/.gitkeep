@@ -1,0 +1,2 @@
+# The wsync sidecar binary is copied in at build time, never committed.
+# See ../README.md ("Sidecar").

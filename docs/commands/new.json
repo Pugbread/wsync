@@ -1,0 +1,17 @@
+{
+  "name": "new",
+  "title": "wsync new",
+  "category": "Live writes",
+  "description": "Creates a new live Studio instance under a parent path.",
+  "usage": "wsync new [--project <path>] [--port <port>] --path <parent-path> --class <ClassName> [--name <Name>] [--props <json-object>] [--raw]",
+  "examples": [
+    "wsync new --project . --path Workspace --class Part --name Box --props '{\"Anchored\":true}'",
+    "wsync new --project . --path ReplicatedStorage --class RemoteEvent --name DamageEvent"
+  ],
+  "notes": [
+    "`--props` uses the same value codec as `wsync set --value`.",
+    "`--name` (and a `Name` in `--props`) must not be empty or contain `/`: paths are `/`-separated with no escaping, so such a name could never be addressed by a path-based command. The refusal happens before any request is made, and the plugin refuses the same write again.",
+    "The created instance is written to `writes.log`.",
+    "If the parent is inside the project's projection, the new instance syncs back to disk through the write middleware; a leaf class with no dedicated middleware becomes a folder plus `.data.json`, or a `<Name>.model.json` when `syncback_model_json` is enabled."
+  ]
+}

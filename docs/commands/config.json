@@ -1,0 +1,23 @@
+{
+  "name": "config",
+  "title": "wsync config",
+  "category": "Tool management",
+  "description": "Reads, writes, lists, or restores WSync configuration values across the global and workspace layers.",
+  "usage": "wsync config [<setting>] [<value>] [-l|--list] [-d|--default] [-e|--export <path>] [-c|--config global|workspace] [--raw]",
+  "examples": [
+    "wsync config --list",
+    "wsync config port",
+    "wsync config auto_update true",
+    "wsync config changes_threshold 10 --config workspace",
+    "wsync config port --default"
+  ],
+  "notes": [
+    "The global config is `~/.wsync/config.toml`; the workspace config is `wsync.toml` beside the project. Workspace beats global beats built-in defaults, and unset keys inherit rather than reset.",
+    "`--list` prints every setting with its current value, its default, and the doc comment that describes it. This is the authoritative option reference.",
+    "`-c global|workspace` selects the layer written; without it a set writes the global config.",
+    "`--default` restores the named setting to its built-in value, or every setting when no name is given.",
+    "`--export <path>` writes the fully resolved configuration (defaults merged with global and workspace overrides) to the given file instead of reading or writing a single key.",
+    "Unknown setting names and values that fail the setting's type are rejected before anything is written.",
+    "WSync-specific settings beyond the inherited set are `syncback_model_json` (false), `conflict_engine` (true), `compat_argon` (false), `port_scan_max` (7990), and `auto_open_app_modal` (true). `port` defaults to 7978 and `share_stats` defaults to false — telemetry is strictly opt-in."
+  ]
+}

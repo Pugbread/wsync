@@ -1,0 +1,14 @@
+{
+  "name": "waypoint",
+  "title": "wsync waypoint",
+  "category": "Live writes",
+  "description": "Creates a named Studio change-history waypoint.",
+  "usage": "wsync waypoint [--project <path>] [--port <port>] --name <label> [--raw]",
+  "examples": [
+    "wsync waypoint --project . --name \"before refactor\""
+  ],
+  "notes": [
+    "Use waypoints before and after multi-step edits so Studio undo has a clear boundary.",
+    "Every applied sync batch already creates its own named waypoint, so a manual waypoint marks agent-driven work specifically."
+  ]
+}

@@ -1,0 +1,274 @@
+local WSync = script:FindFirstAncestor("WSync")
+
+local Dom = require(WSync.Lib.Dom)
+
+local Log = require(WSync.Log)
+local Util = require(WSync.Util)
+local Types = require(WSync.Types)
+local Config = require(WSync.Config)
+local SyncScope = require(WSync.SyncScope)
+local equals = require(WSync.Helpers.equals)
+
+local Error = require(script.Parent.Error)
+local Changes = require(script.Parent.Changes)
+
+local ReadProcessor = require(script.Read)
+local WriteProcessor = require(script.Write)
+
+local function isPackageDescendant(instance: Instance): boolean
+	repeat
+		if instance:FindFirstChildWhichIsA("PackageLink") then
+			return true
+		end
+
+		instance = instance.Parent or game
+	until instance == game
+
+	return false
+end
+
+local Processor = {}
+Processor.__index = Processor
+
+function Processor.new(tree, transport)
+	local self = {
+		tree = tree,
+		read = ReadProcessor.new(tree),
+		write = WriteProcessor.new(tree, transport),
+	}
+
+	return setmetatable(self, Processor)
+end
+
+function Processor:init(snapshot: Types.Snapshot, initialSyncPriority: string): Types.Changes
+	Log.trace("Hydrating initial snapshot..")
+
+	self:hydrate(snapshot, game)
+
+	if initialSyncPriority == "None" then
+		return Changes.new()
+	end
+
+	Log.trace("Diffing initial snapshot..")
+
+	local changes = Changes.new()
+
+	for _, child in snapshot.children do
+		changes:join(self:diff(child, snapshot.id, initialSyncPriority == "Client"))
+	end
+
+	if initialSyncPriority == "Server" and not Config:get("OverridePackages") then
+		local temp = {}
+
+		for _, snapshot in changes.additions do
+			local instance = self.tree:getInstance(snapshot.parent)
+
+			if instance and isPackageDescendant(instance) then
+				table.insert(temp, snapshot)
+			end
+		end
+
+		for i, snapshot in temp do
+			table.remove(changes.additions, table.find(changes.additions, snapshot))
+			temp[i] = nil
+		end
+
+		for _, snapshot in changes.updates do
+			local instance = self.tree:getInstance(snapshot.id)
+
+			if instance and isPackageDescendant(instance) then
+				table.insert(temp, snapshot)
+			end
+		end
+
+		for i, snapshot in temp do
+			table.remove(changes.updates, table.find(changes.updates, snapshot))
+			temp[i] = nil
+		end
+
+		for _, instance in changes.removals do
+			if isPackageDescendant(instance) then
+				table.insert(temp, instance)
+			end
+		end
+
+		for i, instance in temp do
+			table.remove(changes.removals, table.find(changes.removals, instance))
+			temp[i] = nil
+		end
+	end
+
+	return changes
+end
+
+function Processor:hydrate(snapshot: Types.Snapshot, instance: Instance)
+	self.tree:insertInstance(instance, snapshot.id, snapshot.meta)
+
+	local children = instance:GetChildren()
+	local hydrated = table.create(#children, false)
+
+	for _, snapshotChild in snapshot.children do
+		for index, child in children do
+			if hydrated[index] then
+				continue
+			end
+
+			if child.Name == snapshotChild.name and child.ClassName == snapshotChild.class then
+				self:hydrate(snapshotChild, child)
+				hydrated[index] = true
+				break
+			end
+		end
+	end
+end
+
+function Processor:diff(snapshot: Types.Snapshot, parent: Types.Ref, clientPriority: boolean): Types.Changes
+	local changes = Changes.new()
+
+	-- Code scope (Design §7.0): only the four allowlisted classes enter the
+	-- connect diff. A code-scope daemon never serves anything else, so this
+	-- is defensive on the snapshot side; the removal side below is the load-
+	-- bearing half.
+	local codeScope = SyncScope.isCode()
+
+	local instance = self.tree:getInstance(snapshot.id)
+
+	-- Check if snapshot is new
+	if not instance then
+		if not codeScope or SyncScope.isCodeClass(snapshot.class) then
+			changes:add(snapshot, parent)
+		end
+
+		return changes
+	end
+
+	-- Diff properties, find updated ones. On code scope only allowlisted
+	-- classes carry properties into the diff — the tracked exceptions are the
+	-- service roots, which map as plain directories and must never produce
+	-- reset-to-default update entries (Design §7.0).
+	if
+		(not codeScope or SyncScope.isCodeClass(instance.ClassName))
+		and (not clientPriority or ReadProcessor.shouldSyncProperties(instance))
+	then
+		local updatedProperties = {}
+
+		for property, default in Dom.getDefaultProperties(instance.ClassName) do
+			local value = snapshot.properties[property]
+
+			if value then
+				local readSuccess, instanceValue = Dom.readProperty(instance, property)
+
+				if not readSuccess then
+					local err = Error.new(Error.ReadFailed, property, instance, instanceValue.kind)
+					Log.warn(err)
+
+					continue
+				end
+
+				local decodeSuccess, snapshotValue = Dom.EncodedValue.decode(value)
+
+				if not decodeSuccess then
+					local err = Error.new(Error.DecodeFailed, property, value)
+					Log.warn(err)
+
+					continue
+				end
+
+				if not equals(instanceValue, snapshotValue) then
+					updatedProperties[property] = value
+				end
+
+				-- If snapshot does not have the property we want it to be default
+			else
+				local readSuccess, instanceValue = Dom.readProperty(instance, property)
+
+				if not readSuccess then
+					local err = Error.new(Error.ReadFailed, property, instance, instanceValue.kind)
+					Log.warn(err)
+
+					continue
+				end
+
+				local _, defaultValue = Dom.EncodedValue.decode(default)
+
+				if not equals(instanceValue, defaultValue) then
+					updatedProperties[property] = default
+				end
+			end
+		end
+
+		if next(updatedProperties) then
+			changes:update({
+				id = snapshot.id,
+				properties = updatedProperties,
+				meta = snapshot.meta.meshSource and snapshot.meta or nil,
+			})
+		end
+	end
+
+	-- Diff snapshot children, find new ones
+	for _, child in snapshot.children do
+		local childInstance = self.tree:getInstance(child.id)
+
+		if not childInstance and (not codeScope or SyncScope.isCodeClass(child.class)) then
+			changes:add(child, snapshot.id)
+		end
+	end
+
+	-- Diff instance children, find removed ones. On code scope the allowlist
+	-- alone decides (Design §7.0): unknown code-class children always enter
+	-- the diff as Studio-only entries — the daemon writes them to disk, never
+	-- the reverse — while every other class stays out structurally (the
+	-- KeepUnknowns guarantee).
+	for _, child in instance:GetChildren() do
+		local childId = self.tree:getId(child)
+
+		if childId then
+			local childSnapshot = Util.find(snapshot.children, function(child)
+				return equals(child.id, childId)
+			end)
+
+			changes:join(self:diff(childSnapshot, snapshot.id, clientPriority))
+		elseif
+			(
+				if codeScope
+					then SyncScope.isCodeClass(child.ClassName)
+					else (clientPriority or not (snapshot.meta.keepUnknowns or Config:get("KeepUnknowns")))
+			) and Dom.isCreatable(child.ClassName)
+		then
+			changes:remove(child)
+		end
+	end
+
+	return changes
+end
+
+function Processor:reverseChanges(changes: Types.Changes): Types.Changes
+	Log.trace("Reversing changes..")
+
+	local reversed = Changes.new()
+
+	for _, snapshot in changes.additions do
+		reversed:remove(snapshot.id)
+	end
+
+	for _, snapshot in changes.updates do
+		snapshot = self.read:onChange(self.tree:getInstance(snapshot.id))
+
+		if snapshot then
+			reversed:update(snapshot)
+		end
+	end
+
+	for _, instance in changes.removals do
+		local snapshot = self.read:onAdd(instance)
+
+		if snapshot then
+			reversed:add(snapshot)
+		end
+	end
+
+	return reversed
+end
+
+return Processor

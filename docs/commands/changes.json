@@ -1,0 +1,15 @@
+{
+  "name": "changes",
+  "title": "wsync changes",
+  "category": "Live inspection",
+  "description": "Alias for `wsync diff`, intended for reviewing what stayed disk-side after connect.",
+  "usage": "wsync changes [--project <path>] [--port <port>] [--depth <n>] [--raw]",
+  "examples": [
+    "wsync changes --project .",
+    "wsync changes --project . --raw"
+  ],
+  "notes": [
+    "Lists the pending Studio-first disk review: disk-only entries the connect-time apply left untouched and `differs` entries whose disk original was preserved. Only what the project's tree and scope map is ever compared, so out-of-projection files are ignored, never deleted.",
+    "Identical output contract to `wsync diff`; the two names exist so both a review question and a resync question read naturally."
+  ]
+}

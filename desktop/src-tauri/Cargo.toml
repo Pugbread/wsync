@@ -1,0 +1,55 @@
+[package]
+name = "wsync-desktop"
+version = "0.1.0"
+description = "WSync Desktop — native host for the WSync Studio bridge"
+authors = ["WSync contributors"]
+edition = "2021"
+rust-version = "1.82"
+publish = false
+
+[lib]
+name = "wsync_desktop"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+serde_json = "1"
+tauri-build = { version = "2.6", features = [] }
+
+[dependencies]
+# 32 CSPRNG bytes per project serve, for the daemon owner token (Design 11).
+getrandom = "0.3"
+# Design 7.0's experience-name lookup (`games.roblox.com`) is the only outbound
+# HTTPS call this host makes, and `loopback.rs` deliberately cannot make it: it
+# is a plain-HTTP client pinned to 127.0.0.1 with no TLS.
+#
+# Both crates below are **already compiled into this binary** as dependencies of
+# `tauri-plugin-updater`; naming them here adds no crate to the tree, and the
+# feature set is exactly the one the updater already unifies (`rustls-no-provider`
+# + `json`), so nothing else changes shape either. `default-features = false`
+# matters: reqwest's default `rustls` feature would pull an aws-lc-rs build in
+# beside the ring provider already here.
+#
+# `rustls` is a direct dependency for one reason — installing the process-wide
+# ring provider before the first request. With `rustls-no-provider` there is no
+# compiled-in default, and the updater installs one only when *it* runs first
+# (tauri-plugin-updater 2.10 `updater.rs`); a project creation must not depend on
+# whether an update check happened to come earlier. This is the panic
+# `loopback.rs`'s header warns about, defused rather than re-introduced.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+# Verifies the Studio plugin artifact against the sha256 its build manifest
+# publishes, before a byte of it is written into Roblox's plugins folder.
+sha2 = "0.10"
+tauri = { version = "2.11", features = [] }
+tauri-plugin-dialog = "2.7"
+tauri-plugin-updater = "2.10"
+# `process` + `signal`: the daemons are long-lived children this host owns and
+# must reap. `net` is both halves of the loopback surface — the client in
+# `loopback.rs` and the broker's own listener. `time` bounds every wait;
+# nothing here blocks forever.
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "signal", "sync", "time"] }
+
+[dev-dependencies]
+tempfile = "3"

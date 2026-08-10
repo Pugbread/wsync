@@ -1,0 +1,8 @@
+#!/bin/bash
+# Thin wrapper so `scripts/build` keeps working from inside plugin/. The build
+# itself lives in build.mjs — toolchain resolution, wally packages, the rojo
+# build and the WSync.build.json manifest are more than a shell script should
+# be carrying. Every flag is passed through: --check, --skip-wally, --help.
+set -euo pipefail
+
+exec node "$(dirname "$0")/build.mjs" "$@"

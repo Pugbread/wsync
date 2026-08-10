@@ -1,0 +1,20 @@
+{
+  "name": "set",
+  "title": "wsync set",
+  "category": "Live writes",
+  "description": "Sets one property or applies a batch of property writes in the live Studio session.",
+  "usage": "wsync set [--project <path>] [--port <port>] (--path <studio-path> --prop <property> --value <json> | --batch <file>) [--keep-going] [--waypoint <name>] [--force-parent] [--raw]",
+  "examples": [
+    "wsync set --project . --path Workspace/Camera --prop FieldOfView --value 90",
+    "wsync set --project . --batch writes.json --waypoint \"refactor camera\""
+  ],
+  "notes": [
+    "Every successful write is appended to `writes.log`.",
+    "`set Parent` is refused by default; use `wsync mv`, or pass `--force-parent` only when raw parent assignment is intentional.",
+    "A `--batch` entry setting `Parent` rejects the whole batch before any request is made, with no escape — batches have no `--force-parent`; reparent with `wsync mv` or a single forced `set`.",
+    "A `Name` write whose value is empty or contains `/` is refused (single writes pre-network, a `--batch` entry rejects the whole file): paths are `/`-separated with no escaping, so such a name could never be addressed by a path-based command again.",
+    "`--waypoint` brackets the write so one Studio undo can reverse the batch.",
+    "`--batch` rejects the whole batch before any network call when any entry trips a guardrail; `--keep-going` only relaxes per-entry runtime failures, never the pre-flight guards.",
+    "Live mutating commands are user-initiated escape hatches. Inspect the exact live target with read-only commands and confirm intent before running one."
+  ]
+}

@@ -1,0 +1,16 @@
+#!/bin/bash
+set -e
+
+cd "$(dirname "$0")/.."
+
+if command -v wsync > /dev/null 2>&1; then
+	SOURCEMAP_TOOL=wsync
+elif command -v argon > /dev/null 2>&1; then
+	SOURCEMAP_TOOL=argon
+else
+	SOURCEMAP_TOOL=rojo
+fi
+
+wally install
+"$SOURCEMAP_TOOL" sourcemap --output sourcemap.json
+wally-package-types --sourcemap sourcemap.json Packages

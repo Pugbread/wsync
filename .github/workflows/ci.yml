@@ -1,0 +1,320 @@
+name: CI
+
+# Design 15 Phase 7, brought forward as a skeleton.
+#
+# Ground rule for this file: every step runs today, against the tree as it
+# stands, and means something. No `continue-on-error`, no steps parked behind an
+# `if: false`, no placeholder that reports success without checking anything.
+# Where a check needs something the repo does not have yet (a released binary, a
+# signing key, a Studio matrix) it is written down as a TODO here rather than
+# added in a disabled form — a pipeline nobody trusts is worse than a small one.
+#
+# Jobs are independent on purpose: engine, desktop shell, plugin and docs each
+# belong to a different tree and a different phase, and a failure should point
+# at one of them rather than at "CI".
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Node is pinned because the frontend syntax check depends on how a given
+  # major treats ESM (see the desktop job).
+  NODE_VERSION: "22"
+  # luau-compile is pinned so that a plugin regression can never be masked by,
+  # or blamed on, a compiler release. Re-pin with:
+  #   gh api repos/luau-lang/luau/releases/tags/<tag> \
+  #     --jq '.assets[] | "\(.name) \(.digest)"'
+  # and copy the sha256 digest for luau-ubuntu.zip below.
+  LUAU_VERSION: "0.733"
+  LUAU_UBUNTU_SHA256: "2f37bbe79a6389ea2304531e2b4bba333bd0c2076bdc90256dfe30ace16f3c03"
+  # aftman downloads and runs other binaries, so it is pinned by tag *and*
+  # checksum — "latest" would mean CI executes whatever was released this
+  # morning. v0.3.0 predates GitHub's asset-digest API (`.digest` is null on
+  # its assets), so the hash was taken from the artifact itself. Re-pin with:
+  #   curl -sSL https://github.com/LPGhatguy/aftman/releases/download/\
+  #     v<ver>/aftman-<ver>-linux-x86_64.zip | sha256sum
+  AFTMAN_VERSION: "0.3.0"
+  AFTMAN_LINUX_SHA256: "194fe81e24ae7cc1f3141fd1d42db6cb60f03d42735d12ae865fe2db11ea6f0e"
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Engine (root crate) — Design 15 phases 1-5.
+  # --------------------------------------------------------------------------
+  rust:
+    name: Engine
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # dtolnay/rust-toolchain versions its refs by *toolchain*, not by release
+      # tag — `@stable` is the pin, and the repo publishes no version tags to
+      # pin instead. TODO: move to a dated toolchain (`@1.8x.0`) if a clippy
+      # release starts turning unrelated PRs red.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+      # TODO (unlocks the rest of the command-validation contract, Design 10.5):
+      #   - name: Build the binary
+      #     run: cargo build --release
+      #   - uses: actions/upload-artifact@v4
+      #     with: { name: wsync-linux, path: target/release/wsync }
+      # The docs job then downloads it and adds `--bin`, and a release-identity
+      # job asserts binary version == plugin version == protocol number ==
+      # the generated docs, all from one commit.
+
+  # --------------------------------------------------------------------------
+  # Desktop shell — Design 15 phase 6. macOS because that is the only platform
+  # the shell is developed and packaged on today; add the other runners when
+  # the release matrix does.
+  # --------------------------------------------------------------------------
+  desktop:
+    name: Desktop shell
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # `cargo check` runs build.rs, which stages an empty placeholder for the
+      # `wsync` sidecar on debug profiles (a release build refuses). So this
+      # compiles the shell without needing the engine binary — which is exactly
+      # why it is a `check` and not a `tauri build`.
+      - name: Check the Tauri shell
+        working-directory: desktop/src-tauri
+        run: cargo check --all-targets
+
+      # `node --check <file>` is NOT usable here: when a .js file contains
+      # `import`/`export`, Node's CommonJS-then-ESM detection retry swallows
+      # real syntax errors and exits 0. Every file under desktop/src is an ES
+      # module, so the whole step would be fake-green. Feeding the source on
+      # stdin with an explicit `--input-type=module` parses it as a module and
+      # reports errors properly.
+      - name: Syntax-check the frontend
+        shell: bash
+        run: |
+          set -uo pipefail
+          status=0
+          count=0
+          while IFS= read -r file; do
+            count=$((count + 1))
+            if ! node --input-type=module --check < "$file"; then
+              echo "::error file=$file::JavaScript syntax error"
+              status=1
+            fi
+          done < <(find desktop/src -type f -name '*.js' | sort)
+          if [ "$count" -eq 0 ]; then
+            echo "::error::no *.js found under desktop/src — the tree moved and this check stopped checking"
+            exit 1
+          fi
+          echo "syntax-checked $count JavaScript file(s) as ES modules"
+          exit $status
+
+      - name: Desktop script tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tests=(desktop/scripts/*.test.mjs)
+          if [ ${#tests[@]} -eq 0 ]; then
+            echo "no desktop/scripts/*.test.mjs in the tree yet — nothing to run"
+            exit 0
+          fi
+          for test in "${tests[@]}"; do
+            echo "--- $test"
+            node "$test"
+          done
+
+  # --------------------------------------------------------------------------
+  # Studio plugin — Design 15 phase 3. Bytecode compilation is the one thing
+  # about the plugin that can be proven outside Studio.
+  # --------------------------------------------------------------------------
+  plugin:
+    name: Studio plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Fetch pinned luau-compile
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/luau-ubuntu.zip"
+          curl --fail --location --silent --show-error --retry 3 \
+            --output "$archive" \
+            "https://github.com/luau-lang/luau/releases/download/${LUAU_VERSION}/luau-ubuntu.zip"
+          echo "${LUAU_UBUNTU_SHA256}  ${archive}" | sha256sum --check --strict
+          unzip -o -j "$archive" luau-compile -d "${RUNNER_TEMP}/luau"
+          chmod +x "${RUNNER_TEMP}/luau/luau-compile"
+
+      # --require-compiler turns the local-developer SKIP into a failure: having
+      # just downloaded and checksummed a compiler, "no compiler found" can only
+      # mean the step above lied.
+      - name: Compile every plugin source at -O0, -O1 and -O2
+        run: >
+          node scripts/check-luau-bytecode.mjs
+          --luau-compile "${RUNNER_TEMP}/luau/luau-compile"
+          --require-compiler
+
+      # TODO (needs tooling this job does not install): selene lint and
+      # stylua --check, both already pinned in plugin/aftman.toml. The
+      # plugin-artifact job below now shows the shape — install aftman by
+      # checksum, take the versions from plugin/aftman.toml — so adding them
+      # is a matter of extending the pins it extracts.
+
+  # --------------------------------------------------------------------------
+  # Studio plugin artifact — Design 15 phase 3. The job above proves the plugin
+  # sources compile; this one proves they still package into something Studio
+  # can load, and publishes it.
+  #
+  # The contract this job enforces: plugin/WSync.build.json is committed and
+  # plugin/WSync.rbxm is not (it is git-ignored — a binary that can be rebuilt
+  # from source in two seconds does not belong in history). The manifest names
+  # the sha256 of the artifact those sources produce, so a manifest that no
+  # longer matches a fresh build is a manifest describing a plugin nobody has.
+  # --------------------------------------------------------------------------
+  plugin-artifact:
+    name: Studio plugin artifact
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Fetch pinned aftman
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/aftman.zip"
+          curl --fail --location --silent --show-error --retry 3 \
+            --output "$archive" \
+            "https://github.com/LPGhatguy/aftman/releases/download/v${AFTMAN_VERSION}/aftman-${AFTMAN_VERSION}-linux-x86_64.zip"
+          echo "${AFTMAN_LINUX_SHA256}  ${archive}" | sha256sum --check --strict
+          unzip -o -j "$archive" aftman -d "${RUNNER_TEMP}/aftman"
+          chmod +x "${RUNNER_TEMP}/aftman/aftman"
+
+      # `aftman install` installs every tool the nearest manifest lists, and
+      # plugin/aftman.toml lists six: argon, selene, stylua and
+      # wally-package-types are for *editing* the plugin, not for packaging it.
+      # Extracting the two lines the build needs keeps this to two downloads
+      # while the versions still come from plugin/aftman.toml — CI cannot drift
+      # from a contributor's machine without that file changing.
+      - name: Install rojo and wally at plugin/aftman.toml's pins
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pins=$(grep -E '^(rojo|wally)[[:space:]]*=' plugin/aftman.toml || true)
+          count=$(printf '%s' "$pins" | grep -c '=' || true)
+          if [ "$count" -ne 2 ]; then
+            echo "::error file=plugin/aftman.toml::expected a rojo pin and a wally pin, found $count"
+            exit 1
+          fi
+          mkdir -p "${RUNNER_TEMP}/toolchain"
+          printf '[tools]\n%s\n' "$pins" | tee "${RUNNER_TEMP}/toolchain/aftman.toml"
+
+          # aftman reads GitHub credentials from auth.toml; without them every
+          # release download comes out of the runner's shared unauthenticated
+          # API budget, which is how this kind of job fails at 09:00 UTC only.
+          mkdir -p "${HOME}/.aftman"
+          printf 'github = "%s"\n' "$GH_TOKEN" > "${HOME}/.aftman/auth.toml"
+          chmod 600 "${HOME}/.aftman/auth.toml"
+
+          cd "${RUNNER_TEMP}/toolchain"
+          "${RUNNER_TEMP}/aftman/aftman" install --no-trust-check
+          echo "${HOME}/.aftman/bin" >> "$GITHUB_PATH"
+
+      # The installed binaries are aftman trampolines: they resolve a version
+      # from the nearest manifest at the moment they run, so "installed" and
+      # "runnable from plugin/" are different claims and only the second one
+      # builds anything.
+      - name: Toolchain resolves inside the plugin project
+        working-directory: plugin
+        run: |
+          rojo --version
+          wally --version
+
+      # --check runs *before* the build, against the manifest exactly as
+      # committed — run afterwards it would only compare the build to itself.
+      # If this fails: `node plugin/scripts/build.mjs` and commit the manifest.
+      # A failure right after a wally dependency published a new patch release
+      # is the same story with a different cause (plugin/wally.lock is
+      # git-ignored, so CI re-resolves the ranges); the resolved versions are
+      # printed above the diff.
+      - name: Committed manifest matches a fresh build
+        run: node plugin/scripts/build.mjs --check
+
+      - name: Build the plugin
+        run: node plugin/scripts/build.mjs
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wsync-plugin
+          path: |
+            plugin/WSync.rbxm
+            plugin/WSync.build.json
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # Command registry and cross-tree policy — Design 10.5.
+  # --------------------------------------------------------------------------
+  docs:
+    name: Command registry & policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Generated docs match the registry
+        run: node scripts/check-docs-drift.mjs
+
+      # Classify mode only: it is static, so it runs on a checkout with no
+      # compiled binary. TODO: once the rust job uploads target/release/wsync,
+      # download it here and add `--bin <path>` — that turns the manifest from
+      # a hand-maintained list into a claim the binary has to back up.
+      - name: Registry, manifest and implementation agree
+        run: node scripts/check-command-validation.mjs
+
+      - name: No heritage leaks in the shipped surface
+        run: node scripts/check-heritage.mjs
