@@ -174,7 +174,20 @@ impl AuthStatus {
 				self.raw,
 				"A credential is stored",
 			),
-			None => report(&path, false, None, self.raw, "No credential stored"),
+			// The CLI file is empty — the desktop app's keychain entry still
+			// counts (it is what `stored_credential` will hand the cloud
+			// client), and saying "no credential" while uploads work would be
+			// the same confusion this tier exists to end
+			None => match app_keychain_credential() {
+				Some(credential) => report(
+					&path,
+					true,
+					Some(masked_tail(&credential)),
+					self.raw,
+					"A credential is stored in the desktop app's keychain entry",
+				),
+				None => report(&path, false, None, self.raw, "No credential stored"),
+			},
 		}
 	}
 }
@@ -272,18 +285,85 @@ fn read_store(path: &Path) -> Result<Map<String, Value>> {
 	}
 }
 
+/// The JSON key the **desktop app** writes an Open Cloud key under in this same
+/// `secrets.json` (its file-store tier). Pinned to `secrets.rs` `SECRET_NAMES`
+/// and `settings.js` `SECRET_NAME`. A long key (a real Open Cloud key is ~600
+/// bytes) lands here rather than the keychain, whose prompt truncates at 128 —
+/// so the CLI must read this name or `wsync upload` sees "no credential" while
+/// the app shows the key as set.
+const APP_FILE_STORE_KEY: &str = "openCloudApiKey";
+
+/// The stored credential from `secrets.json`: the CLI's own key
+/// (`wsync auth set`) wins, then the desktop app's file-store key. Both tools
+/// share this one file.
 fn read_credential(path: &Path) -> Result<Option<String>> {
-	Ok(read_store(path)?
+	let store = read_store(path)?;
+	let value = store
 		.get(CREDENTIAL_KEY)
 		.and_then(Value::as_str)
-		.map(str::to_owned))
+		.or_else(|| store.get(APP_FILE_STORE_KEY).and_then(Value::as_str));
+	Ok(value.map(str::to_owned))
 }
 
 /// The stored Open Cloud credential, if any — the first tier of the cloud
 /// credential chain (upload.json, monetization.json). The value is handed to
-/// the cloud client and never printed
+/// the cloud client and never printed.
+///
+/// Two stores are consulted, in order:
+///
+/// 1. the CLI's own `secrets.json` — an explicit `wsync auth set` always wins;
+/// 2. the **desktop app's keychain entry** — the Settings → Secrets panel
+///    stores the key in the macOS keychain, and a key the user already gave
+///    the app must not read as "no credential" here. That asymmetry is exactly
+///    how an agent ends up improvising a browser-upload fallback while the app
+///    truthfully shows the key as Set.
 pub(crate) fn stored_credential() -> Result<Option<String>> {
-	read_credential(&store_path(None)?)
+	if let Some(credential) = read_credential(&store_path(None)?)? {
+		return Ok(Some(credential));
+	}
+
+	Ok(app_keychain_credential())
+}
+
+/// The keychain identity the desktop app writes under — pinned to
+/// `desktop/src-tauri/src/secrets.rs` (`KEYCHAIN_SERVICE`) and the Settings
+/// panel's secret name (`settings.js` `SECRET_NAME`). Change them together.
+const APP_KEYCHAIN_SERVICE: &str = "com.wsync.desktop";
+const APP_KEYCHAIN_ACCOUNT: &str = "openCloudApiKey";
+
+/// Read the app-stored credential from the macOS keychain via
+/// `/usr/bin/security` — the same binary the app writes through, so the item's
+/// ACL already trusts it and no GUI prompt appears. Absent item, non-macOS, or
+/// any failure is simply `None`: this is a fallback tier, never an error.
+fn app_keychain_credential() -> Option<String> {
+	if !cfg!(target_os = "macos") {
+		return None;
+	}
+
+	let output = std::process::Command::new("/usr/bin/security")
+		.args([
+			"find-generic-password",
+			"-s",
+			APP_KEYCHAIN_SERVICE,
+			"-a",
+			APP_KEYCHAIN_ACCOUNT,
+			"-w",
+		])
+		.output()
+		.ok()?;
+
+	if !output.status.success() {
+		return None;
+	}
+
+	let credential = String::from_utf8(output.stdout).ok()?;
+	let credential = credential.trim_end_matches('\n');
+
+	if credential.is_empty() {
+		None
+	} else {
+		Some(credential.to_owned())
+	}
 }
 
 fn write_credential(path: &Path, credential: &str) -> Result<()> {
@@ -373,5 +453,29 @@ mod tests {
 		assert_eq!(masked_tail("abcdefgh"), "…efgh");
 		assert_eq!(masked_tail("abc"), "…abc");
 		assert_eq!(masked_tail("k"), "…k");
+	}
+
+	#[test]
+	fn read_credential_finds_the_app_file_store_key_and_prefers_the_cli_own() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join(SECRETS_FILE);
+
+		// Nothing stored yet.
+		assert_eq!(read_credential(&path).unwrap(), None);
+
+		// The desktop app's file-store tier writes `openCloudApiKey` — a long
+		// Open Cloud key lands here because the keychain prompt truncates it.
+		// The CLI must find it or `wsync upload` reports "no credential" while
+		// the app shows the key as set.
+		fs::write(&path, br#"{"openCloudApiKey":"app-written-key"}"#).unwrap();
+		assert_eq!(read_credential(&path).unwrap().as_deref(), Some("app-written-key"));
+
+		// An explicit `wsync auth set` (its own key) wins over the app's.
+		fs::write(
+			&path,
+			br#"{"openCloudApiKey":"app-written-key","robloxCloudApiKey":"cli-set-key"}"#,
+		)
+		.unwrap();
+		assert_eq!(read_credential(&path).unwrap().as_deref(), Some("cli-set-key"));
 	}
 }

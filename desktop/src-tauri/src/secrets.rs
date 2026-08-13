@@ -36,9 +36,14 @@
 //! the argv/stdin contract against a stub binary rather than by pointing the
 //! real one at a throwaway keychain it cannot use in prompt mode.
 //!
-//! The one shape this cannot carry is a value containing a newline: the prompt
-//! is line-based, so such a value would be silently truncated. Rather than
-//! mangle it, a multi-line value goes to the file store and says so.
+//! The prompt cannot carry two shapes, and both would be *silently* truncated
+//! rather than refused, so WSync detects them and routes to the file store
+//! instead (see `keychain_can_carry`): a value containing a newline (the prompt
+//! is line-based), and a value longer than 128 bytes (the prompt's read buffer
+//! — measured, not documented). The second one is why this matters: a Roblox
+//! Open Cloud API key is ~600 bytes, so the keychain path would store its first
+//! 128 bytes and the server would reject the fragment with `401 Invalid API
+//! Key`. A key that big goes to the 0600 file store, intact, and says so.
 //!
 //! ## What crosses to the webview
 //!
@@ -201,9 +206,21 @@ pub(crate) fn mask(value: &str) -> String {
     format!("…{shown}")
 }
 
-/// A value that is safe to hand the keychain prompt: single-line, non-empty.
+/// The macOS `security` password *prompt* reads at most 128 bytes and silently
+/// drops the rest — measured, not documented (127/128 store intact, 129+ come
+/// back truncated to 128). A Roblox Open Cloud API key is ~600 bytes, so the
+/// keychain path would store a fragment the server rejects with 401. Values
+/// over this go to the 0600 file store intact instead.
+const KEYCHAIN_PROMPT_MAX_BYTES: usize = 128;
+
+/// A value that is safe to hand the keychain prompt: single-line, non-empty,
+/// and within the prompt's 128-byte read. Anything else is stored in the file
+/// tier, where none of these limits apply.
 fn keychain_can_carry(value: &str) -> bool {
-    !value.contains('\n') && !value.contains('\r') && !value.contains('\0')
+    !value.contains('\n')
+        && !value.contains('\r')
+        && !value.contains('\0')
+        && value.len() <= KEYCHAIN_PROMPT_MAX_BYTES
 }
 
 // ------------------------------------------------------------------ the API --
@@ -250,10 +267,20 @@ fn set_in(
         if !keychain_can_carry(value) {
             file_set(secrets_file, name, value)?;
             let _ = keychain_delete(keychain, name);
-            return Ok(SecretStatus::found(name, value, Store::File).with_note(
+            let reason = if value.len() > KEYCHAIN_PROMPT_MAX_BYTES {
+                format!(
+                    "This key is {} bytes; the macOS keychain prompt reads only \
+                     {KEYCHAIN_PROMPT_MAX_BYTES} and silently truncates the rest (which is why a \
+                     long Open Cloud key would come back rejected).",
+                    value.len()
+                )
+            } else {
                 "This value spans more than one line, which the keychain prompt cannot carry \
-                 without truncating it. It was written to the 0600 file store instead.",
-            ));
+                 without truncating it."
+                    .to_string()
+            };
+            return Ok(SecretStatus::found(name, value, Store::File)
+                .with_note(format!("{reason} It was written to the 0600 file store instead.")));
         }
         match keychain_set(keychain, name, value) {
             Ok(()) => {
@@ -733,6 +760,32 @@ mod tests {
             file_get(&path, "openCloudApiKey").unwrap().as_deref(),
             Some("line-one\nline-two"),
             "the file store keeps the value whole",
+        );
+    }
+
+    #[test]
+    fn an_over_128_byte_key_takes_the_file_store_intact_not_a_truncated_keychain() {
+        // The bug this guards: a ~600-byte Roblox Open Cloud key handed to the
+        // macOS keychain prompt comes back as its first 128 bytes, and the
+        // server rejects the fragment with 401. A single-line key that long has
+        // to reach the file store whole — so it must be diverted *before*
+        // `security` runs, which the failing stub backend below proves.
+        assert!(keychain_can_carry(&"k".repeat(KEYCHAIN_PROMPT_MAX_BYTES)));
+        assert!(!keychain_can_carry(&"k".repeat(KEYCHAIN_PROMPT_MAX_BYTES + 1)));
+
+        let long_key: String = std::iter::repeat(['a', 'b', 'c', 'd']).flatten().take(600).collect();
+        assert!(long_key.len() > KEYCHAIN_PROMPT_MAX_BYTES);
+
+        let (_directory, path) = store();
+        let keychain = Keychain::Stub(PathBuf::from("/nonexistent/security"));
+        let status = set_in(&path, "openCloudApiKey", &long_key, &keychain).unwrap();
+        assert_eq!(status.store, Some(Store::File));
+        let note = status.note.expect("a diverted long key must explain itself");
+        assert!(note.contains("128") && note.contains("truncat"), "{note}");
+        assert_eq!(
+            file_get(&path, "openCloudApiKey").unwrap().as_deref(),
+            Some(long_key.as_str()),
+            "the file store keeps every byte of the key",
         );
     }
 
