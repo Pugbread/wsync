@@ -302,6 +302,17 @@ function PlaytestOps.ops.playtest_capture(args: Args, _ctx)
 	return Capture.adopt(pulled.pixels, pulled.width, pulled.height)
 end
 
+--- `playtest_screenshot {context}` → `{ok, contentId}`: trigger one
+--- CaptureScreenshot in the PlayClient. No pixels are pulled — the engine
+--- writes the frame to Roblox's tmp-capture-storage directory and the local
+--- wsync CLI reads the PNG off disk. This is the only capture path that works
+--- in a running playtest (CreateEditableImageAsync is blocked there).
+function PlaytestOps.ops.playtest_screenshot(args: Args, _ctx)
+	local context = validateContext(args.context)
+
+	return Playtest.screenshot(context)
+end
+
 --- `playtest_run_start {script, clientScript?, context, mode, players, args,
 --- timeoutSec, identity, logs, keepOpen?}` → `{jobId}`: the playscript-owned
 --- run. Completion ordering, first-completion-wins, deadlines and the exit

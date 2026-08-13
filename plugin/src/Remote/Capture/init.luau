@@ -1726,7 +1726,14 @@ end
 local function renderViewport(request: RenderRequest, deadline: number, register: CleanupRegistrar): Result
 	local opts = request.options
 
-	if not opts.skybox then
+	-- A `plain` capture takes exactly one opaque screenshot: no black/white
+	-- backdrop alpha recovery, so a live — often animated — scene cannot shift
+	-- between passes and fail the capture. It keeps the real sky too, since
+	-- there is nothing to recover behind an opaque game frame. `skybox`
+	-- already asks for the same single opaque pass, so the two share a branch.
+	local opaque = opts.skybox or opts.plain
+
+	if not opaque then
 		evacuateSkyEffects(register)
 	end
 
@@ -1734,7 +1741,7 @@ local function renderViewport(request: RenderRequest, deadline: number, register
 		hideScreenGuis(register)
 	end
 
-	local raw = captureCurrentView(opts.skybox, deadline, register)
+	local raw = captureCurrentView(opaque, deadline, register)
 
 	local selected: Region = if opts.region ~= nil
 		then Options.boundRegion(opts.region :: Region, raw.width, raw.height)

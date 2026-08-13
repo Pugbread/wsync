@@ -528,6 +528,179 @@ fn verify_png(encoded: &[u8], width: u32, height: u32, pixels: &[u8]) -> Result<
 }
 
 // ---------------------------------------------------------------------------
+// Screenshot-file capture (the only path that works during a playtest)
+// ---------------------------------------------------------------------------
+//
+// `CaptureService:CaptureScreenshot` cannot be read back into pixels in a
+// running DataModel (`CreateEditableImageAsync` refuses a temp texture id), but
+// the engine still writes the frame to Roblox's `tmp-capture-storage` directory
+// as a plain PNG. The plugin op just triggers the screenshot and acks; because
+// the wsync CLI runs on the same machine as Studio, it reads that PNG straight
+// off disk — no pixels over the socket, no permission wall. The trigger goes to
+// the Studio this connection targets, so with several Studios open the right
+// one shoots; the file is correlated by the trigger→ack window.
+
+/// Where Roblox writes CaptureService screenshots (`wob-<N>` PNGs). Overridable
+/// with `WSYNC_TMP_CAPTURE_DIR` for tests and non-standard installs.
+fn roblox_tmp_capture_dir() -> Option<PathBuf> {
+	if let Some(dir) = std::env::var_os("WSYNC_TMP_CAPTURE_DIR") {
+		return Some(PathBuf::from(dir));
+	}
+
+	let base = directories::BaseDirs::new()?;
+
+	if cfg!(target_os = "windows") {
+		Some(base.data_local_dir().join("Roblox").join("tmp-capture-storage"))
+	} else if cfg!(target_os = "macos") {
+		Some(base.home_dir().join("Library").join("Roblox").join("tmp-capture-storage"))
+	} else {
+		None
+	}
+}
+
+/// Every `wob-*` entry in `dir` paired with its modified time.
+fn wob_files(dir: &std::path::Path) -> Vec<(std::ffi::OsString, std::time::SystemTime)> {
+	let mut out = Vec::new();
+
+	if let Ok(entries) = fs::read_dir(dir) {
+		for entry in entries.flatten() {
+			let name = entry.file_name();
+
+			if name.to_string_lossy().starts_with("wob-") {
+				let mtime = entry
+					.metadata()
+					.and_then(|meta| meta.modified())
+					.unwrap_or(std::time::UNIX_EPOCH);
+
+				out.push((name, mtime));
+			}
+		}
+	}
+
+	out
+}
+
+/// Decode a PNG's header and return its dimensions (proves it is a real PNG).
+fn png_dimensions(bytes: &[u8]) -> Result<(u32, u32)> {
+	let reader = png::Decoder::new(bytes).read_info().context("the capture is not a readable PNG")?;
+	let info = reader.info();
+
+	Ok((info.width, info.height))
+}
+
+/// Write PNG `bytes` to `output` atomically, proving they decode to `width`×
+/// `height` before and after the write — the artifact on disk is never partial
+/// or unreadable.
+fn write_verified_png_bytes(output: &std::path::Path, bytes: &[u8], width: u32, height: u32) -> Result<String> {
+	let name = output.get_name();
+	let temp = output.with_file_name(format!(".{name}.tmp-{}", process::id()));
+
+	let written = fs::write(&temp, bytes)
+		.with_context(|| format!("Failed to write {}", temp.to_string()))
+		.and_then(|()| {
+			let back = fs::read(&temp).with_context(|| format!("Failed to read back {}", temp.to_string()))?;
+			let (w, h) = png_dimensions(&back).context("The written capture does not decode")?;
+
+			if w != width || h != height {
+				bail!("The written capture decodes to {w}x{h}, not the captured {width}x{height}");
+			}
+
+			fs::rename(&temp, output)
+				.with_context(|| format!("Failed to move the verified PNG into place at {}", output.to_string()))?;
+
+			Ok(sha256_hex(&back))
+		});
+
+	if written.is_err() {
+		fs::remove_file(&temp).ok();
+	}
+
+	written
+}
+
+/// Trigger a CaptureService screenshot through `trigger_op` and return the PNG
+/// the engine wrote to Roblox's `tmp-capture-storage`, as a locally verified
+/// artifact. Shared by `playtest capture` and `capture viewport` (their trigger
+/// ops answer with `{ok, contentId}`); the pixels never touch the socket.
+pub(crate) fn capture_via_screenshot_file(
+	client: &Client,
+	trigger_op: &str,
+	trigger_args: Value,
+	output: &std::path::Path,
+	timeout_ms: u64,
+	raw: bool,
+) -> Result<Value> {
+	let output = output.resolve()?;
+
+	if let Some(parent) = output.parent() {
+		fs::create_dir_all(parent)
+			.with_context(|| format!("Failed to create the output directory {}", parent.to_string()))?;
+	}
+
+	let dir = roblox_tmp_capture_dir()
+		.context("Could not locate Roblox's capture directory on this platform")?;
+
+	if !dir.is_dir() {
+		bail!(
+			"Roblox's capture directory does not exist at {} — open a place in Studio (it is created on first capture)",
+			dir.to_string()
+		);
+	}
+
+	// Snapshot existing frames so we can tell which one this capture writes
+	let before: std::collections::HashSet<std::ffi::OsString> =
+		wob_files(&dir).into_iter().map(|(name, _)| name).collect();
+
+	// The plugin acks only once the CaptureScreenshot callback has fired, i.e.
+	// once the engine has produced (and written) the frame
+	let ack = client.request_with_timeout(trigger_op, trigger_args, timeout_ms)?.into_value(raw)?;
+
+	// Usually already on disk by the ack; poll briefly in case the flush lags
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+
+	let file = loop {
+		let mut fresh: Vec<(std::ffi::OsString, std::time::SystemTime)> =
+			wob_files(&dir).into_iter().filter(|(name, _)| !before.contains(name)).collect();
+
+		if !fresh.is_empty() {
+			// If more than one appeared (another Studio shot at the same
+			// instant), the newest is ours — we just triggered it
+			fresh.sort_by_key(|(_, mtime)| *mtime);
+
+			break dir.join(&fresh.last().expect("non-empty").0);
+		}
+
+		if std::time::Instant::now() >= deadline {
+			bail!(
+				"Studio acked the screenshot but no new PNG appeared in {} — Roblox's capture directory or `wob-` naming may have changed in this Studio version",
+				dir.to_string()
+			);
+		}
+
+		std::thread::sleep(std::time::Duration::from_millis(50));
+	};
+
+	let bytes = fs::read(&file).with_context(|| format!("Failed to read the capture file {}", file.to_string()))?;
+	let (width, height) =
+		png_dimensions(&bytes).with_context(|| format!("The capture file {} is not a readable PNG", file.to_string()))?;
+
+	let sha = write_verified_png_bytes(&output, &bytes, width, height)?;
+
+	// The frame is ours and now safely copied out — drop the engine's temp file
+	fs::remove_file(&file).ok();
+
+	Ok(json!({
+		"path": output.to_string(),
+		"mime": "image/png",
+		"bytes": bytes.len() as u64,
+		"width": width,
+		"height": height,
+		"sha256": sha,
+		"capture": ack,
+	}))
+}
+
+// ---------------------------------------------------------------------------
 // Option parsing — all pre-network
 // ---------------------------------------------------------------------------
 

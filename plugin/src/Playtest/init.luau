@@ -58,6 +58,15 @@ Playtest.LIMITS = {
 	cancelDeadlineSec = 20,
 	captureDeadlineSec = 120,
 	requestDefaultTimeoutSec = 15,
+	-- How long a start waits for the previous playtest's DataModels to go away,
+	-- and how long a stop waits to confirm they did (see awaitQuietStudio).
+	-- The start gate must stay comfortably inside the CLI's 15 s start budget,
+	-- or its CONFLICT is masked by a transport timeout that says nothing useful.
+	quietStudioSec = 8,
+	stopDrainSec = 10,
+	-- How long a stop waits for a still-booting PlayServer to connect before
+	-- concluding it has nothing to talk to (see the rung-1 comment in stopJob)
+	stopBootWaitSec = 10,
 }
 
 local function sha256Hex(value: string): string
@@ -165,6 +174,44 @@ local function pruneDeadContexts()
 			Jobs.dropContext(registry, runtimeId)
 		end
 	end
+end
+
+--- Whether any runtime context is still connected (any generation).
+local function anyLiveContext(): boolean
+	pruneDeadContexts()
+
+	for _, context in registry.contextsById do
+		if context.alive then
+			return true
+		end
+	end
+
+	return false
+end
+
+--- Wait until the previous generation's runtime DataModels have actually gone.
+---
+--- Studio tears a playtest down asynchronously: the job record goes terminal as
+--- soon as `ExecutePlayModeAsync` returns, but the PlayServer/PlayClient
+--- connections can outlive it by a beat. Launching the next test inside that
+--- window wedges Studio's play-control — the new `ExecutePlayModeAsync` never
+--- returns (the job sticks active with no contexts), and the half-launched test
+--- leaves Studio's internal "a test is in progress" flag set, which nothing
+--- reachable from a plugin can clear (`LeaveTest` needs a running test's client
+--- DataModel, `EndTest` its server one). Only restarting Studio recovers that,
+--- so a new generation always waits for a quiet DataModel first.
+local function awaitQuietStudio(timeoutSec: number): boolean
+	local deadline = os.clock() + timeoutSec
+
+	while anyLiveContext() do
+		if os.clock() >= deadline then
+			return false
+		end
+
+		task.wait(0.1)
+	end
+
+	return true
 end
 
 --- Resolve a live context of the active generation or raise NOT_FOUND.
@@ -964,7 +1011,22 @@ local function stopJob(job: Jobs.Job, opts: { reason: string?, result: Any? }, f
 
 	-- Rung 1: ask the PlayServer to end the test from inside (cleanest — the
 	-- server DataModel tears everything down itself).
+	--
+	-- It is also the *only* rung that can ever work: rungs 2 and 3 call
+	-- LeaveTest/EndTest, which Roblox permits solely from inside a running
+	-- test's own DataModel, never from the edit session running this code. So a
+	-- stop issued while the playtest is still booting must wait for the
+	-- PlayServer to connect rather than declare itself impossible — giving up
+	-- there strands a half-booted test that wedges Studio's play control until
+	-- the user restarts it.
 	pruneDeadContexts()
+
+	local bootDeadline = os.clock() + Playtest.LIMITS.stopBootWaitSec
+
+	while Jobs.liveContext(registry, "server") == nil and job.status == "stopping" and os.clock() < bootDeadline do
+		task.wait(0.1)
+		pruneDeadContexts()
+	end
 
 	local serverContext = Jobs.liveContext(registry, "server")
 
@@ -977,7 +1039,14 @@ local function stopJob(job: Jobs.Job, opts: { reason: string?, result: Any? }, f
 			waitForEnd(if force then 3 else 10)
 
 			if job.status ~= "stopping" then
-				return { ok = true, via = "PlayServer.EndTest" }
+				-- The job record goes terminal when the launch call returns, but
+				-- Studio keeps tearing the DataModels down for a beat after that.
+				-- Reporting "stopped" while they are still up invites the caller
+				-- to start the next test into a busy Studio, which wedges its
+				-- play control for good — so confirm the drain before answering.
+				local drained = awaitQuietStudio(Playtest.LIMITS.stopDrainSec)
+
+				return { ok = true, via = "PlayServer.EndTest", drained = drained }
 			end
 		end
 	end
@@ -987,7 +1056,11 @@ local function stopJob(job: Jobs.Job, opts: { reason: string?, result: Any? }, f
 
 	if left then
 		if waitForEnd(3) then
-			return { ok = true, via = "StudioTestService.LeaveTest" }
+			return {
+				ok = true,
+				via = "StudioTestService.LeaveTest",
+				drained = awaitQuietStudio(Playtest.LIMITS.stopDrainSec),
+			}
 		end
 
 		leaveError = "Studio accepted LeaveTest but the playtest remained active"
@@ -997,7 +1070,11 @@ local function stopJob(job: Jobs.Job, opts: { reason: string?, result: Any? }, f
 	local ended, endError = endTestFallback(leaveError)
 
 	if ended then
-		return { ok = true, via = "StudioTestService.EndTest" }
+		return {
+			ok = true,
+			via = "StudioTestService.EndTest",
+			drained = awaitQuietStudio(Playtest.LIMITS.stopDrainSec),
+		}
 	end
 
 	failStop(tostring(endError))
@@ -1207,6 +1284,27 @@ end
 function Playtest.startJob(mode: string, players: number): { [string]: Any }
 	requireAvailable()
 
+	-- Order matters: an already-active generation is refused immediately, so a
+	-- second start never sits in the drain wait below for a teardown that is
+	-- not coming (that wait would outlive the caller's timeout and report a
+	-- meaningless transport error instead of "already active").
+	local activeJob = Jobs.activeJob(registry)
+
+	if activeJob ~= nil then
+		error(Error.new(Error.CONFLICT, `a playtest job is already active: {activeJob.id}`), 0)
+	end
+
+	if not awaitQuietStudio(Playtest.LIMITS.quietStudioSec) then
+		error(
+			Error.new(
+				Error.CONFLICT,
+				"the previous playtest is still shutting down — retry in a moment "
+					.. "(launching now would wedge Studio's play control and force a restart)"
+			),
+			0
+		)
+	end
+
 	local jobId = HttpService:GenerateGUID(false)
 	local token = HttpService:GenerateGUID(false) .. HttpService:GenerateGUID(false)
 
@@ -1232,6 +1330,27 @@ end
 --- the run state, launch, and supervise. Returns `{jobId, run, audit}`.
 function Playtest.startRun(args: { [string]: Any }): { [string]: Any }
 	requireAvailable()
+
+	-- Order matters: an already-active generation is refused immediately, so a
+	-- second start never sits in the drain wait below for a teardown that is
+	-- not coming (that wait would outlive the caller's timeout and report a
+	-- meaningless transport error instead of "already active").
+	local activeJob = Jobs.activeJob(registry)
+
+	if activeJob ~= nil then
+		error(Error.new(Error.CONFLICT, `a playtest job is already active: {activeJob.id}`), 0)
+	end
+
+	if not awaitQuietStudio(Playtest.LIMITS.quietStudioSec) then
+		error(
+			Error.new(
+				Error.CONFLICT,
+				"the previous playtest is still shutting down — retry in a moment "
+					.. "(launching now would wedge Studio's play control and force a restart)"
+			),
+			0
+		)
+	end
 
 	local config = RunState.validate(args)
 
@@ -1480,6 +1599,34 @@ end
 --- `playtest_request`: the raw escape hatch.
 function Playtest.rawRequest(contextName: string, op: string, args: { [string]: Any }, timeoutSec: number): Any
 	return request(contextName, op, args, timeoutSec)
+end
+
+--- `playtest_screenshot`: trigger one CaptureScreenshot in the PlayClient and
+--- return its ack. No pixels cross the wire — the engine writes the frame to
+--- Roblox's tmp-capture-storage directory and the LOCAL wsync CLI reads that
+--- PNG off disk. This is what makes playtest capture work at all:
+--- CreateEditableImageAsync cannot decode a temp texture id in a running
+--- DataModel, so the render/readback path is a dead end there.
+function Playtest.screenshot(contextName: string): { [string]: Any }
+	local context = (requireContext(contextName))
+
+	if context.role ~= "client" then
+		error(
+			Error.new(
+				Error.INVALID_ARGUMENT,
+				"playtest screenshot requires a PlayClient context — the PlayServer renders no viewport"
+			),
+			0
+		)
+	end
+
+	local result = request(contextName, "screenshot", {}, 30)
+
+	if type(result) ~= "table" then
+		error(Error.new(Error.PLUGIN_ERROR, "the runtime returned an invalid screenshot ack"), 0)
+	end
+
+	return result :: { [string]: Any }
 end
 
 --- `playtest_capture`: render in the PlayClient, then pull the RGBA bytes

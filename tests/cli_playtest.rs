@@ -14,7 +14,7 @@ use std::{
 };
 
 use common::{
-	chunk_answer, cli_stderr, cli_stdout, journal_args, journal_ops, spawn_cli_plugin, start_daemon, CliAnswer,
+	cli_stderr, cli_stdout, journal_args, journal_ops, spawn_cli_plugin, start_daemon, CliAnswer,
 	CliJournal, CliSandbox, TestDaemon,
 };
 
@@ -532,35 +532,46 @@ fn input_screens_the_action_array_before_the_network() {
 }
 
 #[test]
-fn playtest_capture_reuses_the_verified_png_pipeline() {
-	const WIDTH: u32 = 64;
-	const HEIGHT: u32 = 48;
+fn playtest_capture_reads_the_engine_screenshot_file() {
+	// A running playtest can't read a screenshot back into pixels, so
+	// `playtest capture` triggers a CaptureScreenshot and reads the PNG the
+	// engine drops in Roblox's tmp-capture-storage. Here the fake plugin plays
+	// the engine: on `playtest_screenshot` it writes a wob-* PNG into the
+	// directory we point the CLI at with WSYNC_TMP_CAPTURE_DIR.
+	const WIDTH: u32 = 8;
+	const HEIGHT: u32 = 6;
 
-	let pixels: Vec<u8> = (0..(WIDTH * HEIGHT * 4) as usize)
-		.map(|index| ((index * 13 + 3) % 251) as u8)
-		.collect();
+	let png_bytes = {
+		let mut buf = Vec::new();
+		let mut encoder = png::Encoder::new(&mut buf, WIDTH, HEIGHT);
 
-	let sha = {
-		use sha2::{Digest, Sha256};
+		encoder.set_color(png::ColorType::Rgba);
+		encoder.set_depth(png::BitDepth::Eight);
 
-		format!("{:x}", Sha256::digest(&pixels))
+		let mut writer = encoder.write_header().unwrap();
+
+		writer.write_image_data(&vec![0x7fu8; (WIDTH * HEIGHT * 4) as usize]).unwrap();
+		writer.finish().unwrap();
+
+		buf
 	};
 
+	let wob = tempfile::tempdir().expect("temp wob dir");
+	let wob_path = wob.path().to_path_buf();
+
 	let daemon = start_daemon(None);
-	let capture_pixels = pixels.clone();
+	let plugin_png = png_bytes.clone();
+	let plugin_dir = wob_path.clone();
 	let journal = spawn_cli_plugin(
 		&daemon,
-		"playtest-capture",
-		Arc::new(move |op, args| match op {
-			"playtest_capture" => CliAnswer::Value(json!({
-				"captureId": "pt-cap-1",
-				"width": WIDTH,
-				"height": HEIGHT,
-				"bytes": capture_pixels.len(),
-				"sha256": sha,
-			})),
-			"capture_read" => CliAnswer::Value(chunk_answer(&capture_pixels, args)),
-			"capture_close" => CliAnswer::Value(json!({})),
+		"playtest-screenshot",
+		Arc::new(move |op, _args| match op {
+			"playtest_screenshot" => {
+				// The engine's side effect: a fresh frame lands on disk
+				fs::write(plugin_dir.join("wob-1"), &plugin_png).unwrap();
+
+				CliAnswer::Value(json!({ "ok": true, "contentId": "rbxtemp://1" }))
+			}
 			_ => CliAnswer::Failure("UNKNOWN_OP", "the fake plugin does not implement this op"),
 		}),
 	);
@@ -570,56 +581,39 @@ fn playtest_capture_reuses_the_verified_png_pipeline() {
 	let project = daemon.root.to_string_lossy().into_owned();
 	let port = daemon.port.to_string();
 
-	let output = sandbox.run(&[
-		"playtest",
-		"capture",
-		"--context",
-		"client:1",
-		"--size",
-		"64x48",
-		"--skybox",
-		"--ui",
-		"overlay",
-		"-o",
-		&output_path.to_string_lossy(),
-		"--project",
-		&project,
-		"--port",
-		&port,
-		"--raw",
-	]);
-
-	assert!(
-		output.status.success(),
-		"playtest capture failed: {}",
-		cli_stderr(&output)
+	let output = sandbox.run_with_envs(
+		&[
+			"playtest",
+			"capture",
+			"--context",
+			"client:1",
+			"-o",
+			&output_path.to_string_lossy(),
+			"--project",
+			&project,
+			"--port",
+			&port,
+			"--raw",
+		],
+		&[("WSYNC_TMP_CAPTURE_DIR", wob_path.to_str().unwrap())],
 	);
 
-	// The prepare op carried the PlayClient context and validated options
-	let prepare = journal_args(&journal, "playtest_capture");
+	assert!(output.status.success(), "playtest capture failed: {}", cli_stderr(&output));
 
-	assert_eq!(prepare["context"], "client:1");
-	assert_eq!(prepare["options"]["size"], json!({ "width": 64, "height": 48 }));
-	assert_eq!(prepare["options"]["skybox"], true);
-	assert_eq!(prepare["options"]["ui"], "overlay");
-
-	// The same read/close family as edit capture pumped the pixels
+	// It triggered a screenshot — not the old render/pull pipeline
 	let ops = journal_ops(&journal);
 
-	assert!(ops.contains(&"capture_read".to_owned()));
-	assert_eq!(ops.last().map(String::as_str), Some("capture_close"));
+	assert!(ops.contains(&"playtest_screenshot".to_owned()), "ops: {ops:?}");
+	assert!(!ops.iter().any(|op| op == "capture_read" || op == "playtest_capture"));
 
-	// The PNG on disk decodes back to the captured pixels
+	// The output is the PNG the engine wrote, verified and copied out
 	let encoded = fs::read(&output_path).expect("the capture PNG exists");
-	let decoder = png::Decoder::new(encoded.as_slice());
-	let mut reader = decoder.read_info().expect("the written PNG decodes");
-	let mut decoded = vec![0u8; reader.output_buffer_size()];
-	let info = reader.next_frame(&mut decoded).unwrap();
+	let reader = png::Decoder::new(encoded.as_slice()).read_info().expect("the written PNG decodes");
 
-	assert_eq!((info.width, info.height), (WIDTH, HEIGHT));
+	assert_eq!((reader.info().width, reader.info().height), (WIDTH, HEIGHT));
 
-	decoded.truncate(info.buffer_size());
-	assert_eq!(decoded, pixels, "the PNG must reproduce the captured pixels exactly");
+	// The engine's temp file is removed once we've consumed it
+	assert!(!wob_path.join("wob-1").exists(), "the wob temp file should be cleaned up after read");
 
 	// A non-PlayClient context is refused before any network work
 	let output = sandbox.run(&["playtest", "capture", "--context", "server"]);

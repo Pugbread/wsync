@@ -59,6 +59,11 @@ export type Normalized = {
 	framed: boolean,
 	uiOverlay: boolean,
 	tightCrop: boolean,
+	-- Internal, not a wire key: the playtest runtime sets it after
+	-- normalization to force a single opaque screenshot (no black/white
+	-- backdrop alpha recovery). A live gameplay frame has no transparency to
+	-- recover, and photographing an animated scene twice fails the capture.
+	plain: boolean,
 }
 
 local function invalid(message: string): never
@@ -265,6 +270,7 @@ function Options.normalize(kind: any, options: any): Normalized
 		framed = false,
 		uiOverlay = false,
 		tightCrop = false,
+		plain = false,
 	}
 
 	if options.size ~= nil then

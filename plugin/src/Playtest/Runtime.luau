@@ -25,6 +25,7 @@
 -- daemon, so runtime changes cannot sync (the edit copy's watcher only ever
 -- observes edit-DataModel instances).
 
+local CaptureService = game:GetService("CaptureService")
 local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
 local LogService = game:GetService("LogService")
@@ -1661,6 +1662,11 @@ local function buildHandlers(agent: Agent): { [string]: (args: { [string]: Any }
 
 		local options = Renderer.Options.normalize("viewport", args.options)
 
+		-- A playtest capture is a screenshot of a live game, not an asset
+		-- render: force the single opaque pass and skip the alpha-recovery
+		-- backdrop, which fails whenever the scene moves between its passes.
+		options.plain = true
+
 		agent.rendering = true
 
 		local okRender, rendered = pcall(function()
@@ -1736,6 +1742,52 @@ local function buildHandlers(agent: Agent): { [string]: (args: { [string]: Any }
 		agent.captures[tostring(args.captureId or "")] = nil
 
 		return { ok = true }
+	end
+
+	--- `screenshot {}` — take one raw viewport screenshot via CaptureService
+	--- and ack with the temp content id. The pixels are deliberately NOT
+	--- decoded here: `CreateEditableImageAsync` refuses a temp texture id in a
+	--- running DataModel (the whole reason `playtest_capture`'s render path
+	--- fails). Instead the engine writes the frame to Roblox's
+	--- tmp-capture-storage directory, and the LOCAL wsync CLI reads that PNG off
+	--- disk. PlayClient only — the PlayServer has no viewport to photograph.
+	function handlers.screenshot(_args)
+		if agent.role ~= "client" then
+			error("screenshot requires a PlayClient context", 0)
+		end
+
+		local content: string? = nil
+		local failed: string? = nil
+
+		local ok, err = pcall(function()
+			CaptureService:CaptureScreenshot(function(result)
+				if type(result) == "string" and result ~= "" then
+					content = result
+				else
+					failed = "the screenshot returned no content id"
+				end
+			end)
+		end)
+
+		if not ok then
+			error(`unable to request a screenshot: {tostring(err)}`, 0)
+		end
+
+		local deadline = os.clock() + 15
+
+		while content == nil and failed == nil do
+			if os.clock() >= deadline then
+				error("the screenshot request timed out", 0)
+			end
+
+			RunService.Heartbeat:Wait()
+		end
+
+		if failed ~= nil then
+			error(failed, 0)
+		end
+
+		return { ok = true, contentId = content }
 	end
 
 	--- `result_read {id, offset?, maxLen?}` — one bounded base64 part of a

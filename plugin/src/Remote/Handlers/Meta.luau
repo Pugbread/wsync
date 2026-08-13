@@ -92,6 +92,7 @@ local CATALOG = {
 	"playtest_input",
 	"playtest_request",
 	"playtest_capture",
+	"playtest_screenshot",
 	"playtest_stop",
 	"playtest_run_cancel",
 	"open_in_editor",

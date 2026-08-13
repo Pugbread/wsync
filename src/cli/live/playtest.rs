@@ -31,7 +31,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use colored::Colorize;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use std::{
 	fs,
 	path::PathBuf,
@@ -58,6 +58,13 @@ const RUN_DEADLINE_GRACE: Duration = Duration::from_secs(10);
 /// `playtest_run_start` boots a Studio playtest, so it gets head-room over
 /// the 5 s op default
 const RUN_START_TIMEOUT_MS: u64 = 15_000;
+
+/// A stop walks the whole teardown ladder — wait for a booting PlayServer, ask
+/// it to end the test, then confirm Studio's DataModels drained — so it needs
+/// far more than the 5 s surface default. Must stay above the plugin's own
+/// `stopBootWaitSec` + `stopDrainSec` budget, or the client gives up while the
+/// plugin is still tearing down.
+const STOP_TIMEOUT_MS: u64 = 45_000;
 
 /// The input contract's action cap (playtest.json)
 const INPUT_MAX_ACTIONS: usize = 200;
@@ -765,11 +772,76 @@ struct PlaytestStart {
 	/// Seconds to wait for contexts with --wait
 	#[arg(long, value_name = "SECONDS", default_value = "45", value_parser = clap::value_parser!(u64).range(1..=600))]
 	timeout: u64,
+
+	/// Force-clear any active generation first (recovers a wedged playtest).
+	///
+	/// If a previous test left the job stuck active — start reports one is
+	/// already running when none is — this force-stops it before starting, so
+	/// you no longer need to restart Studio. It also aborts a genuinely running
+	/// playtest, so only pass it when you mean to replace whatever is active.
+	#[arg(long)]
+	force: bool,
+}
+
+/// Studio's own refusal when its internal test state is wedged. The engine
+/// keeps a "test in progress" flag that nothing reachable from the plugin can
+/// clear: `LeaveTest` only works from a running test's *client* DataModel and
+/// `EndTest` only from its *server* one, and by the time the flag is stuck both
+/// DataModels are gone. Restarting Studio is the only recovery.
+const STUDIO_WEDGE_MARKER: &str = "previous one is still in progress";
+
+const STUDIO_WEDGE_HELP: &str = "Studio's own test state is wedged — it still believes a test is running when none is. \
+WSync cannot clear this (LeaveTest/EndTest only work from inside a running test's DataModel, and it is already gone), \
+and `playtest stop --force` only clears WSync's own job record. Restart Roblox Studio to recover.";
+
+/// Attach the wedge explanation when a failure carries Studio's marker, so the
+/// opaque engine refusal always arrives with its only real remedy.
+fn explain_studio_wedge(detail: &str) -> Option<String> {
+	detail
+		.contains(STUDIO_WEDGE_MARKER)
+		.then(|| format!("{detail}\n\n{STUDIO_WEDGE_HELP}"))
 }
 
 impl PlaytestStart {
+	/// `playtest_start` answers as soon as the launch is dispatched, but the
+	/// launch itself can die moments later — most often Studio refusing outright
+	/// because its test state is wedged. Without this check `start` cheerfully
+	/// reports success for a generation that is already dead.
+	fn settle_check(client: &Client, raw: bool) -> Result<()> {
+		std::thread::sleep(std::time::Duration::from_millis(1200));
+
+		let Ok(status) = client.request("playtest_status", json!({})) else {
+			return Ok(());
+		};
+
+		let Ok(status) = status.into_value(raw) else {
+			return Ok(());
+		};
+
+		if status.get("jobStatus").and_then(Value::as_str) != Some("failed") {
+			return Ok(());
+		}
+
+		let detail = status.get("error").and_then(Value::as_str).unwrap_or_default();
+
+		match explain_studio_wedge(detail) {
+			Some(explained) => bail!("{explained}"),
+			None if !detail.is_empty() => bail!("the playtest failed to start: {detail}"),
+			None => Ok(()),
+		}
+	}
+
 	fn main(self) -> Result<()> {
 		let client = Client::connect(&self.common.targeting)?;
+
+		if self.force {
+			// A forced stop always drives the active job terminal (even one
+			// Studio can't confirm leaving), so this unblocks the start below.
+			// Ignore its outcome — "nothing to stop" and "stopped but Studio
+			// couldn't confirm" both leave the registry clear, which is all we
+			// need here.
+			let _ = client.request_with_timeout("playtest_stop", json!({ "force": true }), RUN_START_TIMEOUT_MS);
+		}
 
 		let started = client
 			.request_with_timeout(
@@ -777,7 +849,21 @@ impl PlaytestStart {
 				json!({ "mode": self.mode.as_str(), "players": self.players }),
 				RUN_START_TIMEOUT_MS,
 			)?
-			.into_value(self.common.raw)?;
+			.into_value(self.common.raw)
+			.map_err(|error| {
+				if error.to_string().contains("already active") {
+					// Both readings are possible here and they want opposite
+					// actions, so name them rather than pushing --force at
+					// someone whose playtest is simply still running
+					error.context(
+						"stop the running playtest first (`wsync playtest stop`); \
+						 if nothing is actually running, that generation is wedged — \
+						 `wsync playtest stop --force` clears it without restarting Studio",
+					)
+				} else {
+					error
+				}
+			})?;
 
 		let waited = if self.wait {
 			// Multiplayer waits for the server plus every client; play for
@@ -788,16 +874,28 @@ impl PlaytestStart {
 				Mode::Run => 1,
 			};
 
-			let value = client
+			let outcome = client
 				.request_with_timeout(
 					"playtest_wait",
 					json!({ "minimum": minimum, "timeoutMs": self.timeout * 1000 }),
 					self.timeout * 1000,
-				)?
-				.into_value(self.common.raw)?;
+				)
+				.and_then(|envelope| envelope.into_value(self.common.raw));
 
-			Some(value)
+			match outcome {
+				Ok(value) => Some(value),
+				Err(error) => {
+					// "contexts never connected" is the symptom; the launch's own
+					// failure is the cause, so report that (and the wedge remedy)
+					// in preference to the timeout wording
+					Self::settle_check(&client, self.common.raw)?;
+
+					return Err(error);
+				}
+			}
 		} else {
+			Self::settle_check(&client, self.common.raw)?;
+
 			None
 		};
 
@@ -1269,71 +1367,30 @@ struct PlaytestCapture {
 	#[arg(long, value_name = "CTX")]
 	context: String,
 
-	/// Exact output dimensions as WIDTHxHEIGHT
-	#[arg(long, value_name = "WxH")]
-	size: Option<String>,
-
-	/// Keep the rendered sky and world background (opaque capture)
-	#[arg(long)]
-	skybox: bool,
-
-	/// Include visible ScreenGui layers over the scene
-	#[arg(long, value_enum, value_name = "MODE", default_value = "none")]
-	ui: CaptureUiMode,
-
 	/// Output file
 	#[arg(short, long, value_name = "FILE", default_value = "wsync-playtest-capture.png")]
 	output: PathBuf,
 
-	/// Seconds to wait for the render to prepare
+	/// Seconds to wait for the screenshot
 	#[arg(long, value_name = "SECONDS", default_value = "60", value_parser = clap::value_parser!(u64).range(1..=600))]
 	timeout: u64,
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
-enum CaptureUiMode {
-	None,
-	Overlay,
-}
-
-impl CaptureUiMode {
-	fn as_str(self) -> &'static str {
-		match self {
-			CaptureUiMode::None => "none",
-			CaptureUiMode::Overlay => "overlay",
-		}
-	}
 }
 
 impl PlaytestCapture {
 	fn main(self) -> Result<()> {
 		check_client_context(&self.context)?;
 
-		let mut options = Map::new();
-
-		capture::insert_size(&mut options, self.size.as_deref())?;
-
-		if self.skybox {
-			options.insert("skybox".to_owned(), json!(true));
-		}
-
-		options.insert("ui".to_owned(), json!(self.ui.as_str()));
-
-		let mut args = json!({ "context": self.context });
-
-		if !options.is_empty() {
-			args["options"] = Value::Object(options);
-		}
-
 		let client = Client::connect(&self.common.targeting)?;
 
-		// Same prepare → pump → verify → encode → close pipeline as edit
-		// capture, with `playtest_capture` as the prepare op — the prepared
-		// value carries the identical `{captureId, …, sha256}` shape
-		let summary = capture::perform_prepared(
+		// A running playtest cannot read a screenshot back into pixels
+		// (`CreateEditableImageAsync` is blocked there), so we trigger a
+		// CaptureScreenshot in the PlayClient and read the PNG the engine writes
+		// to Roblox's tmp-capture-storage straight off disk — the only capture
+		// path that works in play mode
+		let summary = capture::capture_via_screenshot_file(
 			&client,
-			"playtest_capture",
-			args,
+			"playtest_screenshot",
+			json!({ "context": self.context }),
 			&self.output,
 			self.timeout * 1000,
 			self.common.raw,
@@ -1364,14 +1421,39 @@ impl PlaytestCapture {
 struct PlaytestStop {
 	#[command(flatten)]
 	common: Common,
+
+	/// Force the stop even when Studio cannot confirm the test ended.
+	///
+	/// Recovers a wedged generation: a plain stop restores a job Studio won't
+	/// leave back to `running`, but a forced stop drives it terminal so
+	/// `playtest start` is no longer blocked — use this instead of restarting
+	/// Studio when start reports a playtest is already active but none is.
+	#[arg(long)]
+	force: bool,
 }
 
 impl PlaytestStop {
 	fn main(self) -> Result<()> {
-		let value = self.common.run_op("playtest_stop", json!({}), None)?;
+		// Well above the 5 s surface default: a stop legitimately waits for a
+		// still-booting PlayServer to connect, for the test to end, and then for
+		// Studio's DataModels to drain. Timing out mid-ladder would abandon the
+		// teardown halfway, which is exactly what wedges Studio's play control.
+		let value = self
+			.common
+			.run_op("playtest_stop", json!({ "force": self.force }), Some(STOP_TIMEOUT_MS))?;
 
 		if self.common.raw {
 			print_json(&value);
+
+			return Ok(());
+		}
+
+		// `alreadyEnded` means WSync's job record was already terminal, so
+		// nothing was asked of Studio at all. Saying "Playtest stopped" there
+		// reads as "Studio is clear now", which is exactly the false comfort
+		// that hides a wedged engine — so report what actually happened.
+		if value.get("alreadyEnded").and_then(Value::as_bool) == Some(true) {
+			wsync_info!("No active playtest to stop — WSync's job record was already closed");
 
 			return Ok(());
 		}
