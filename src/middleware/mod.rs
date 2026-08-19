@@ -322,10 +322,34 @@ fn new_snapshot_file_child(path: &Path, context: &Context, vfs: &Vfs) -> Result<
 
 /// Create snapshot of a directory,
 /// example: `foo/bar`
+/// The class a directory takes from its own name, for the containers Studio
+/// already provides inside a service — `StarterPlayerScripts` and its
+/// character twin under `StarterPlayer`.
+///
+/// Such a directory *is* that container, not a Folder that happens to share
+/// its name: syncing it as a Folder puts a second instance beside the real one,
+/// and everything inside lands in the copy Roblox never runs. Only these
+/// containers are inferred — an ordinary directory is still a Folder, and true
+/// services are not, since a `Lighting` folder nested in code is a folder and
+/// could not be parented there as a service anyway.
+fn dir_container_class(name: &str) -> Option<&'static str> {
+	match name {
+		"StarterPlayerScripts" => Some("StarterPlayerScripts"),
+		"StarterCharacterScripts" => Some("StarterCharacterScripts"),
+		_ => None,
+	}
+}
+
 fn new_snapshot_dir(path: &Path, context: &Context, vfs: &Vfs) -> Result<Option<Snapshot>> {
 	let mut snapshot = dir::read_dir(path, context, vfs)?;
 
-	if let Some(instance_data) = get_instance_data(&snapshot.name, None, path, context, vfs)? {
+	if let Some(class) = dir_container_class(&snapshot.name) {
+		snapshot.set_class(class);
+	}
+
+	// A data sidecar still wins: it is the explicit statement of what the
+	// instance is, and this inference is only a default
+	if let Some(instance_data) = get_instance_data(&snapshot.name, Some(&snapshot.class), path, context, vfs)? {
 		snapshot.apply_data(instance_data);
 	}
 

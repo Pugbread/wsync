@@ -35,8 +35,21 @@ pub enum Scope {
 }
 
 impl Scope {
-	/// The classes code scope syncs, in every direction
-	pub const CODE_CLASSES: [&'static str; 4] = ["Folder", "Script", "LocalScript", "ModuleScript"];
+	/// The classes code scope syncs, in every direction.
+	///
+	/// The `StarterPlayerScripts` / `StarterCharacterScripts` containers count
+	/// for the same reason `Folder` does: they are the path a script lives
+	/// behind, not content of their own. Excluding them dropped every entry
+	/// under `StarterPlayer` from the divergence set, so that subtree looked
+	/// already in sync and its scripts were never written to disk.
+	pub const CODE_CLASSES: [&'static str; 6] = [
+		"Folder",
+		"Script",
+		"LocalScript",
+		"ModuleScript",
+		"StarterPlayerScripts",
+		"StarterCharacterScripts",
+	];
 
 	/// `"full"` opts out; anything else (including absence) is code scope
 	pub fn parse(value: Option<&str>) -> Self {

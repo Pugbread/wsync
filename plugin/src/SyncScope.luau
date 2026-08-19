@@ -26,11 +26,21 @@ export type Scope = "code" | "full"
 --- the daemon declares `scope: "code"`. `Folder` is unconditional — empty
 --- folders sync too, which is exactly what the old `isScriptRelated` gate got
 --- wrong for this mode.
+---
+--- The `StarterPlayerScripts` / `StarterCharacterScripts` containers are here
+--- for the same reason `Folder` is: they are the path a script lives behind,
+--- not content of their own. Leaving them out dropped every diff entry under
+--- `StarterPlayer` from the upload, so the daemon saw that subtree as already
+--- in sync and never wrote those scripts to disk. They are structural only —
+--- Studio always provides them, so they are created as plain directories and
+--- never deleted from Studio.
 SyncScope.CODE_CLASSES = {
 	Folder = true,
 	Script = true,
 	LocalScript = true,
 	ModuleScript = true,
+	StarterPlayerScripts = true,
+	StarterCharacterScripts = true,
 } :: { [string]: boolean }
 
 local current: Scope = "full"

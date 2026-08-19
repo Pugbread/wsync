@@ -590,7 +590,10 @@ fn a_batch_containing_a_slashed_name_write_is_rejected_whole() {
 		"--keep-going",
 	]);
 
-	assert!(!output.status.success(), "a batch with a slashed Name write was accepted");
+	assert!(
+		!output.status.success(),
+		"a batch with a slashed Name write was accepted"
+	);
 
 	let message = stderr(&output);
 

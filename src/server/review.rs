@@ -208,6 +208,54 @@ impl ReviewStore {
 		fs::remove_dir_all(self.review_root().join(review_id)).ok();
 	}
 
+	/// Removes the disk-only entries of `review` from the workspace, moving
+	/// each into `<backups>/dismissed-<reviewId>/` so the choice is
+	/// recoverable. Returns how many were moved.
+	///
+	/// This is what makes "keep Studio's versions everywhere" true for
+	/// disk-only files: they exist nowhere in Studio, so leaving them behind
+	/// would keep disk permanently ahead of the place with nothing left to
+	/// reconcile it.
+	pub fn discard_disk_only(&self, review: &PendingReview) -> usize {
+		let graveyard = self
+			.workspace_dir
+			.join(BACKUPS_DIR)
+			.join(format!("dismissed-{}", review.review_id));
+		let mut moved = 0;
+
+		for item in &review.items {
+			if item.state != ReviewState::DiskOnly || !safe_rel_path(&item.path) {
+				continue;
+			}
+
+			let live = self.workspace_dir.join(&item.path);
+
+			if !live.exists() {
+				continue;
+			}
+
+			let target = graveyard.join(&item.path);
+
+			if let Some(parent) = target.parent() {
+				if let Err(err) = fs::create_dir_all(parent) {
+					warn!("Failed to prepare the dismissed-file backup for {}: {err}", item.path);
+					continue;
+				}
+			}
+
+			match fs::rename(&live, &target) {
+				Ok(()) => moved += 1,
+				Err(err) => warn!("Failed to discard the disk-only file {}: {err}", item.path),
+			}
+		}
+
+		if moved > 0 {
+			debug!("Discarded {moved} disk-only file(s) for review {}", review.review_id);
+		}
+
+		moved
+	}
+
 	pub fn pending(&self) -> Option<PendingReview> {
 		lock!(self.inner).clone()
 	}
@@ -645,12 +693,35 @@ pub async fn dismiss(State(state): State<AppState>, body: Bytes) -> Response {
 		return error(StatusCode::NOT_FOUND, "Unknown or stale reviewId");
 	}
 
+	// Skip means what the prompt offers: keep Studio's versions everywhere.
+	// The Studio-first apply deliberately carries disk-only files forward so
+	// this choice can still go either way, so dropping the review without
+	// removing them stranded them on disk — present, absent from Studio, and
+	// with no review left to reconcile them. `differs` entries already hold
+	// Studio's content on disk (the apply wrote it) and need nothing here.
+	//
+	// They move under the backups directory rather than being unlinked, so a
+	// mis-click is recoverable.
+	// The VFS is paused across the move for the same reason the fenced apply
+	// pauses it: these files leaving disk is not an edit to broadcast. They are
+	// disk-only by definition — Studio never had them — so letting the watcher
+	// turn each removal into a sync message only asks Studio to delete
+	// instances it does not have, which it answers with a `NoInstanceRemove`
+	// warning apiece.
+	let vfs = state.core.vfs();
+
+	vfs.pause();
+
+	let discarded = state.review.discard_disk_only(&review);
+
+	vfs.resume();
+
 	state.review.clear();
 
 	// Same reason as the push emit: Studio's indicator must hear the clear
 	emit_review_total(&state, &review.review_id);
 
-	Json(json!({ "ok": true })).into_response()
+	Json(json!({ "ok": true, "discarded": discarded })).into_response()
 }
 
 /// Broadcast the review's current totals after a mutation, so the plugin's

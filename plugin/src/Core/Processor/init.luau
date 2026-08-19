@@ -229,14 +229,23 @@ function Processor:diff(snapshot: Types.Snapshot, parent: Types.Ref, clientPrior
 			end)
 
 			changes:join(self:diff(childSnapshot, snapshot.id, clientPriority))
-		elseif
-			(
-				if codeScope
-					then SyncScope.isCodeClass(child.ClassName)
-					else (clientPriority or not (snapshot.meta.keepUnknowns or Config:get("KeepUnknowns")))
-			) and Dom.isCreatable(child.ClassName)
-		then
-			changes:remove(child)
+		else
+			-- A Studio-only child. On code scope that means "the daemon writes
+			-- it to disk", never "delete it from Studio", so whether Roblox
+			-- could recreate the class is beside the point — and demanding it
+			-- silently skipped the `StarterPlayerScripts` /
+			-- `StarterCharacterScripts` containers, which are NotCreatable
+			-- singletons, taking every script beneath them out of the diff with
+			-- them. Full scope can still reverse a removal back into Studio, so
+			-- there the class must stay creatable.
+			local studioOnly = if codeScope
+				then SyncScope.isCodeClass(child.ClassName)
+				else (clientPriority or not (snapshot.meta.keepUnknowns or Config:get("KeepUnknowns")))
+					and Dom.isCreatable(child.ClassName)
+
+			if studioOnly then
+				changes:remove(child)
+			end
 		end
 	end
 

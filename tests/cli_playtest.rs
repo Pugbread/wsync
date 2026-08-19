@@ -14,8 +14,8 @@ use std::{
 };
 
 use common::{
-	cli_stderr, cli_stdout, journal_args, journal_ops, spawn_cli_plugin, start_daemon, CliAnswer,
-	CliJournal, CliSandbox, TestDaemon,
+	cli_stderr, cli_stdout, journal_args, journal_ops, spawn_cli_plugin, start_daemon, CliAnswer, CliJournal,
+	CliSandbox, TestDaemon,
 };
 
 /// A scripted run: `playtest_run_start` answers with a job id, each
@@ -550,7 +550,9 @@ fn playtest_capture_reads_the_engine_screenshot_file() {
 
 		let mut writer = encoder.write_header().unwrap();
 
-		writer.write_image_data(&vec![0x7fu8; (WIDTH * HEIGHT * 4) as usize]).unwrap();
+		writer
+			.write_image_data(&vec![0x7fu8; (WIDTH * HEIGHT * 4) as usize])
+			.unwrap();
 		writer.finish().unwrap();
 
 		buf
@@ -598,7 +600,11 @@ fn playtest_capture_reads_the_engine_screenshot_file() {
 		&[("WSYNC_TMP_CAPTURE_DIR", wob_path.to_str().unwrap())],
 	);
 
-	assert!(output.status.success(), "playtest capture failed: {}", cli_stderr(&output));
+	assert!(
+		output.status.success(),
+		"playtest capture failed: {}",
+		cli_stderr(&output)
+	);
 
 	// It triggered a screenshot — not the old render/pull pipeline
 	let ops = journal_ops(&journal);
@@ -608,12 +614,17 @@ fn playtest_capture_reads_the_engine_screenshot_file() {
 
 	// The output is the PNG the engine wrote, verified and copied out
 	let encoded = fs::read(&output_path).expect("the capture PNG exists");
-	let reader = png::Decoder::new(encoded.as_slice()).read_info().expect("the written PNG decodes");
+	let reader = png::Decoder::new(encoded.as_slice())
+		.read_info()
+		.expect("the written PNG decodes");
 
 	assert_eq!((reader.info().width, reader.info().height), (WIDTH, HEIGHT));
 
 	// The engine's temp file is removed once we've consumed it
-	assert!(!wob_path.join("wob-1").exists(), "the wob temp file should be cleaned up after read");
+	assert!(
+		!wob_path.join("wob-1").exists(),
+		"the wob temp file should be cleaned up after read"
+	);
 
 	// A non-PlayClient context is refused before any network work
 	let output = sandbox.run(&["playtest", "capture", "--context", "server"]);

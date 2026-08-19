@@ -627,11 +627,19 @@ async fn apply_root(
 ) -> Result<String, String> {
 	let target = resolve_root(state, root_name)?;
 
+	// A missing live directory is not a failure: the root is mapped but has
+	// nothing on disk yet (a fresh clone, or the folder was deleted precisely
+	// so Studio could repopulate it). Refusing here would leave the only path
+	// that rebuilds it — pulling Studio down — permanently blocked, so create
+	// it and let the apply fill it. An empty directory fences and swaps like
+	// any other.
 	if !target.live_dir.is_dir() {
-		return Err(format!(
-			"the live directory {} for {root_name} does not exist",
-			target.live_dir.display()
-		));
+		fs::create_dir_all(&target.live_dir).map_err(|err| {
+			format!(
+				"could not create the live directory {} for {root_name}: {err}",
+				target.live_dir.display()
+			)
+		})?;
 	}
 
 	// The fence generation: captured before anything is pulled, verified

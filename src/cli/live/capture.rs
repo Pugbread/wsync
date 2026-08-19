@@ -552,7 +552,12 @@ fn roblox_tmp_capture_dir() -> Option<PathBuf> {
 	if cfg!(target_os = "windows") {
 		Some(base.data_local_dir().join("Roblox").join("tmp-capture-storage"))
 	} else if cfg!(target_os = "macos") {
-		Some(base.home_dir().join("Library").join("Roblox").join("tmp-capture-storage"))
+		Some(
+			base.home_dir()
+				.join("Library")
+				.join("Roblox")
+				.join("tmp-capture-storage"),
+		)
 	} else {
 		None
 	}
@@ -582,7 +587,9 @@ fn wob_files(dir: &std::path::Path) -> Vec<(std::ffi::OsString, std::time::Syste
 
 /// Decode a PNG's header and return its dimensions (proves it is a real PNG).
 fn png_dimensions(bytes: &[u8]) -> Result<(u32, u32)> {
-	let reader = png::Decoder::new(bytes).read_info().context("the capture is not a readable PNG")?;
+	let reader = png::Decoder::new(bytes)
+		.read_info()
+		.context("the capture is not a readable PNG")?;
 	let info = reader.info();
 
 	Ok((info.width, info.height))
@@ -637,8 +644,7 @@ pub(crate) fn capture_via_screenshot_file(
 			.with_context(|| format!("Failed to create the output directory {}", parent.to_string()))?;
 	}
 
-	let dir = roblox_tmp_capture_dir()
-		.context("Could not locate Roblox's capture directory on this platform")?;
+	let dir = roblox_tmp_capture_dir().context("Could not locate Roblox's capture directory on this platform")?;
 
 	if !dir.is_dir() {
 		bail!(
@@ -653,14 +659,18 @@ pub(crate) fn capture_via_screenshot_file(
 
 	// The plugin acks only once the CaptureScreenshot callback has fired, i.e.
 	// once the engine has produced (and written) the frame
-	let ack = client.request_with_timeout(trigger_op, trigger_args, timeout_ms)?.into_value(raw)?;
+	let ack = client
+		.request_with_timeout(trigger_op, trigger_args, timeout_ms)?
+		.into_value(raw)?;
 
 	// Usually already on disk by the ack; poll briefly in case the flush lags
 	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
 
 	let file = loop {
-		let mut fresh: Vec<(std::ffi::OsString, std::time::SystemTime)> =
-			wob_files(&dir).into_iter().filter(|(name, _)| !before.contains(name)).collect();
+		let mut fresh: Vec<(std::ffi::OsString, std::time::SystemTime)> = wob_files(&dir)
+			.into_iter()
+			.filter(|(name, _)| !before.contains(name))
+			.collect();
 
 		if !fresh.is_empty() {
 			// If more than one appeared (another Studio shot at the same
@@ -681,8 +691,8 @@ pub(crate) fn capture_via_screenshot_file(
 	};
 
 	let bytes = fs::read(&file).with_context(|| format!("Failed to read the capture file {}", file.to_string()))?;
-	let (width, height) =
-		png_dimensions(&bytes).with_context(|| format!("The capture file {} is not a readable PNG", file.to_string()))?;
+	let (width, height) = png_dimensions(&bytes)
+		.with_context(|| format!("The capture file {} is not a readable PNG", file.to_string()))?;
 
 	let sha = write_verified_png_bytes(&output, &bytes, width, height)?;
 
@@ -745,8 +755,7 @@ pub(crate) fn capture_video_file(
 			// Per-file last seen length: a file is worth reading once its length
 			// holds steady, which is the only externally visible sign that the
 			// encoder has finished with it
-			let mut sizes: std::collections::HashMap<std::ffi::OsString, (u64, u32)> =
-				std::collections::HashMap::new();
+			let mut sizes: std::collections::HashMap<std::ffi::OsString, (u64, u32)> = std::collections::HashMap::new();
 
 			while !stop.load(std::sync::atomic::Ordering::Relaxed) {
 				for (name, _) in wob_files(&dir) {
@@ -755,7 +764,9 @@ pub(crate) fn capture_video_file(
 					}
 
 					let path = dir.join(&name);
-					let Ok(length) = fs::metadata(&path).map(|meta| meta.len()) else { continue };
+					let Ok(length) = fs::metadata(&path).map(|meta| meta.len()) else {
+						continue;
+					};
 					let entry = sizes.entry(name).or_insert((0, 0));
 
 					if entry.0 == length {
@@ -782,7 +793,9 @@ pub(crate) fn capture_video_file(
 	};
 
 	// The runtime records and waits for the encoder, so this is a long request
-	let ack = client.request_with_timeout(trigger_op, trigger_args, timeout_ms).and_then(|envelope| envelope.into_value(raw));
+	let ack = client
+		.request_with_timeout(trigger_op, trigger_args, timeout_ms)
+		.and_then(|envelope| envelope.into_value(raw));
 
 	// Give the encoder a moment to flush after the ack, then stop polling
 	std::thread::sleep(std::time::Duration::from_millis(1500));

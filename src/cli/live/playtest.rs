@@ -793,7 +793,8 @@ struct PlaytestStart {
 /// DataModels are gone. Restarting Studio is the only recovery.
 const STUDIO_WEDGE_MARKER: &str = "previous one is still in progress";
 
-const STUDIO_WEDGE_HELP: &str = "Studio's own test state is wedged — it still believes a test is running when none is. \
+const STUDIO_WEDGE_HELP: &str =
+	"Studio's own test state is wedged — it still believes a test is running when none is. \
 WSync cannot clear this (LeaveTest/EndTest only work from inside a running test's DataModel, and it is already gone), \
 and `playtest stop --force` only clears WSync's own job record. Restart Roblox Studio to recover.";
 
