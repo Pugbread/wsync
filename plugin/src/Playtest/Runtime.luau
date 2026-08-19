@@ -64,6 +64,13 @@ local MAX_SEEN_REQUEST_IDS = 512
 local MAX_PENDING_IMPORTANT = 32
 local CAPTURE_TTL_SECONDS = 120
 local CAPTURE_MAX_SESSIONS = 2
+-- Roblox caps a single video capture (~30 s, reported as
+-- `VideoCaptureResult.TimeLimitReached`); shorter clips are the common case
+local VIDEO_DEFAULT_SECONDS = 10
+local VIDEO_MAX_SECONDS = 30
+local VIDEO_FINALIZE_SECONDS = 25
+-- The first start after a playtest boots answers OtherError; a retry succeeds
+local VIDEO_START_ATTEMPTS = 5
 
 local function sha256Hex(value: string): string
 	return BufferHash.hex(buffer.fromstring(value))
@@ -142,6 +149,7 @@ type Agent = {
 	captures: { [string]: CaptureSession },
 	captureCounter: number,
 	rendering: boolean,
+	recordingVideo: boolean,
 	signalBacklog: { { name: string, payload: Any, seq: number, createdAt: number } },
 	signalSequence: number,
 	clientCount: number,
@@ -1790,6 +1798,142 @@ local function buildHandlers(agent: Agent): { [string]: (args: { [string]: Any }
 		return { ok = true, contentId = content }
 	end
 
+	--- `video_capture {seconds}` — record the PlayClient viewport for `seconds`
+	--- and return once the engine has finalized the clip.
+	---
+	--- Same disk hand-off as `screenshot`: the engine writes the MP4 into
+	--- Roblox's tmp-capture-storage directory and the local wsync CLI copies it
+	--- out, because nothing here can hand the bytes back (`GetCaptureFilePathAsync`
+	--- is RobloxScriptSecurity, and the VideoCapture object is opaque). The file
+	--- is written progressively and deleted a few seconds after it finalizes, so
+	--- the CLI polls for it while this runs — which is why this only returns
+	--- after the completion callback has fired.
+	---
+	--- Must run on the agent's own thread: the same call from an injected runner
+	--- script answers `VideoCaptureStartedResult.OtherError`, at game *and*
+	--- plugin identity.
+	function handlers.video_capture(args)
+		if agent.role ~= "client" then
+			error("video capture requires a PlayClient context", 0)
+		end
+
+		if agent.recordingVideo then
+			error("another video capture is already recording", 0)
+		end
+
+		local seconds = math.clamp(finiteNumber(args.seconds, VIDEO_DEFAULT_SECONDS), 1, VIDEO_MAX_SECONDS)
+
+		agent.recordingVideo = true
+
+		-- Runs through a temporary runner rather than being called here: the
+		-- capture is driven from a script context, the way the Studio command
+		-- bar does it.
+		--
+		-- The retry is the important part. The first `StartVideoCaptureAsync`
+		-- after a playtest boots reliably answers `OtherError` — the capture
+		-- subsystem is not ready yet — and an attempt a few seconds later
+		-- succeeds. Retrying is what makes this dependable rather than a coin
+		-- flip on how soon the caller asked.
+		local source = string.format(
+			[[
+local CS = game:GetService("CaptureService")
+local finished, outcome = false, nil
+
+local function tryStart()
+	local started, failure = nil, nil
+
+	task.spawn(function()
+		local ok, result = pcall(function()
+			return CS:StartVideoCaptureAsync(function(value)
+				outcome = tostring(value)
+				finished = true
+			end)
+		end)
+
+		if ok then started = tostring(result) else failure = tostring(result) end
+	end)
+
+	local startDeadline = os.clock() + 15
+
+	while started == nil and failure == nil and os.clock() < startDeadline do
+		task.wait()
+	end
+
+	return started, failure
+end
+
+local started, failure
+
+for _ = 1, %d do
+	finished, outcome = false, nil
+	started, failure = tryStart()
+
+	if started ~= nil and string.find(started, "Success", 1, true) then break end
+
+	pcall(function() CS:StopVideoCapture() end)
+	task.wait(2.5)
+end
+
+if started == nil or not string.find(started, "Success", 1, true) then
+	error("the video capture did not start: " .. tostring(started or failure), 0)
+end
+
+local recordUntil = os.clock() + %d
+
+while os.clock() < recordUntil and not finished do
+	task.wait()
+end
+
+if not finished then
+	pcall(function() CS:StopVideoCapture() end)
+end
+
+local finalizeDeadline = os.clock() + %d
+
+while not finished and os.clock() < finalizeDeadline do
+	task.wait()
+end
+
+if not finished then error("the video capture did not finish encoding in time", 0) end
+
+return started .. "|" .. tostring(outcome)
+]],
+			VIDEO_START_ATTEMPTS,
+			seconds,
+			VIDEO_FINALIZE_SECONDS
+		)
+
+		local okRun, packed = pcall(function()
+			return executeSource(agent, source, seconds + VIDEO_FINALIZE_SECONDS + 20, "plugin")
+		end)
+
+		agent.recordingVideo = false
+
+		if not okRun then
+			error(`the video capture runner failed: {tostring(packed)}`, 0)
+		end
+
+		local result = packed :: { n: number, [number]: Any }
+
+		if result[1] ~= true then
+			-- The runner reports failures as `{message, traceback}`; surfacing
+			-- the table itself would reach the CLI as "table: 0x…"
+			local failure = result[2]
+
+			if type(failure) == "table" and (failure :: Any).message ~= nil then
+				error(tostring((failure :: Any).message), 0)
+			end
+
+			error(tostring(failure), 0)
+		end
+
+		return {
+			ok = true,
+			result = tostring(result[2]),
+			seconds = seconds,
+		}
+	end
+
 	--- `result_read {id, offset?, maxLen?}` — one bounded base64 part of a
 	--- pinned result envelope (exec or playscript completion).
 	function handlers.result_read(args)
@@ -2151,6 +2295,7 @@ function Runtime.start()
 		captures = {},
 		captureCounter = 0,
 		rendering = false,
+		recordingVideo = false,
 		signalBacklog = {},
 		signalSequence = 0,
 		clientCount = 0,

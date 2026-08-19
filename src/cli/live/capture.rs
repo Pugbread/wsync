@@ -700,6 +700,119 @@ pub(crate) fn capture_via_screenshot_file(
 	}))
 }
 
+/// Record a clip through `trigger_op` and copy the MP4 the engine writes to
+/// Roblox's `tmp-capture-storage`.
+///
+/// Video is not screenshots: the file is created ~empty when recording starts,
+/// grows while it records, is finalized when the encoder finishes, and is then
+/// deleted by the engine a few seconds later. So this polls throughout — taking
+/// a fresh copy whenever the file stops growing — rather than looking once at
+/// the end, which would find either a truncated file or nothing at all.
+pub(crate) fn capture_video_file(
+	client: &Client,
+	trigger_op: &str,
+	trigger_args: Value,
+	output: &std::path::Path,
+	timeout_ms: u64,
+	raw: bool,
+) -> Result<Value> {
+	let output = output.resolve()?;
+
+	if let Some(parent) = output.parent() {
+		fs::create_dir_all(parent)
+			.with_context(|| format!("Failed to create the output directory {}", parent.to_string()))?;
+	}
+
+	let dir = roblox_tmp_capture_dir().context("Could not locate Roblox's capture directory on this platform")?;
+
+	if !dir.is_dir() {
+		bail!(
+			"Roblox's capture directory does not exist at {} — open a place in Studio first",
+			dir.to_string()
+		);
+	}
+
+	let before: std::collections::HashSet<std::ffi::OsString> =
+		wob_files(&dir).into_iter().map(|(name, _)| name).collect();
+
+	let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+	let best: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>> = std::sync::Arc::new(std::sync::Mutex::new(None));
+
+	let poller = {
+		let (dir, before, stop, best) = (dir.clone(), before.clone(), stop.clone(), best.clone());
+
+		std::thread::spawn(move || {
+			// Per-file last seen length: a file is worth reading once its length
+			// holds steady, which is the only externally visible sign that the
+			// encoder has finished with it
+			let mut sizes: std::collections::HashMap<std::ffi::OsString, (u64, u32)> =
+				std::collections::HashMap::new();
+
+			while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+				for (name, _) in wob_files(&dir) {
+					if before.contains(&name) {
+						continue;
+					}
+
+					let path = dir.join(&name);
+					let Ok(length) = fs::metadata(&path).map(|meta| meta.len()) else { continue };
+					let entry = sizes.entry(name).or_insert((0, 0));
+
+					if entry.0 == length {
+						entry.1 += 1;
+					} else {
+						*entry = (length, 0);
+					}
+
+					// Stable for two ticks and big enough to be a real clip
+					if entry.1 == 2 && length > 1024 {
+						if let Ok(bytes) = fs::read(&path) {
+							let mut best = best.lock().expect("capture poller lock");
+
+							if best.as_ref().is_none_or(|current| current.len() < bytes.len()) {
+								*best = Some(bytes);
+							}
+						}
+					}
+				}
+
+				std::thread::sleep(std::time::Duration::from_millis(100));
+			}
+		})
+	};
+
+	// The runtime records and waits for the encoder, so this is a long request
+	let ack = client.request_with_timeout(trigger_op, trigger_args, timeout_ms).and_then(|envelope| envelope.into_value(raw));
+
+	// Give the encoder a moment to flush after the ack, then stop polling
+	std::thread::sleep(std::time::Duration::from_millis(1500));
+	stop.store(true, std::sync::atomic::Ordering::Relaxed);
+	poller.join().ok();
+
+	let ack = ack?;
+	let bytes = best
+		.lock()
+		.expect("capture poller lock")
+		.take()
+		.context("Studio recorded the clip but no video file appeared in Roblox's capture directory — the temp directory or `wob-` naming may have changed in this Studio version")?;
+
+	// `ftyp` at offset 4 is the MP4 signature; a clip that never got a video
+	// track (what recording from the edit DataModel produces) is far too small
+	if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
+		bail!("The captured file is not an MP4 — Studio may have written an unusable clip");
+	}
+
+	fs::write(&output, &bytes).with_context(|| format!("Failed to write {}", output.to_string()))?;
+
+	Ok(json!({
+		"path": output.to_string(),
+		"mime": "video/mp4",
+		"bytes": bytes.len() as u64,
+		"sha256": sha256_hex(&bytes),
+		"capture": ack,
+	}))
+}
+
 // ---------------------------------------------------------------------------
 // Option parsing — all pre-network
 // ---------------------------------------------------------------------------

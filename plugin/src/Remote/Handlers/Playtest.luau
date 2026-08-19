@@ -313,6 +313,16 @@ function PlaytestOps.ops.playtest_screenshot(args: Args, _ctx)
 	return Playtest.screenshot(context)
 end
 
+--- `playtest_video {context, seconds?}` → `{ok, started, result, seconds}`:
+--- record the PlayClient viewport and return once the clip is finalized. The
+--- MP4 itself is read off disk by the local CLI (see `Playtest.video`).
+function PlaytestOps.ops.playtest_video(args: Args, _ctx)
+	local context = validateContext(args.context)
+	local seconds = optionalInt(args.seconds, "seconds", 1, 30, 10)
+
+	return Playtest.video(context, seconds)
+end
+
 --- `playtest_run_start {script, clientScript?, context, mode, players, args,
 --- timeoutSec, identity, logs, keepOpen?}` → `{jobId}`: the playscript-owned
 --- run. Completion ordering, first-completion-wins, deadlines and the exit

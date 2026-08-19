@@ -99,6 +99,8 @@ enum PlaytestCommand {
 	Input(PlaytestInput),
 	/// Capture a PlayClient viewport as a locally verified PNG
 	Capture(PlaytestCapture),
+	/// Record a PlayClient viewport to an MP4 clip
+	Clip(PlaytestClip),
 	/// Stop the active playtest
 	Stop(PlaytestStop),
 	/// Send an advanced runtime operation directly to a playtest context
@@ -118,6 +120,7 @@ impl Playtest {
 			PlaytestCommand::Ui(command) => command.main(),
 			PlaytestCommand::Input(command) => command.main(),
 			PlaytestCommand::Capture(command) => command.main(),
+			PlaytestCommand::Clip(command) => command.main(),
 			PlaytestCommand::Stop(command) => command.main(),
 			PlaytestCommand::Request(command) => command.main(),
 		}
@@ -1411,6 +1414,66 @@ impl PlaytestCapture {
 			summary.get("width").and_then(Value::as_u64).unwrap_or(0),
 			summary.get("height").and_then(Value::as_u64).unwrap_or(0),
 			summary.get("path").and_then(Value::as_str).unwrap_or_default().bold(),
+		);
+
+		Ok(())
+	}
+}
+
+#[derive(Parser)]
+struct PlaytestClip {
+	#[command(flatten)]
+	common: Common,
+
+	/// PlayClient context to record
+	#[arg(long, value_name = "CTX")]
+	context: String,
+
+	/// Seconds to record (Roblox caps a single capture at 30)
+	#[arg(long, value_name = "SECONDS", default_value = "10", value_parser = clap::value_parser!(u64).range(1..=30))]
+	seconds: u64,
+
+	/// Output file
+	#[arg(short, long, value_name = "FILE", default_value = "wsync-playtest-clip.mp4")]
+	output: PathBuf,
+}
+
+impl PlaytestClip {
+	fn main(self) -> Result<()> {
+		check_client_context(&self.context)?;
+
+		let client = Client::connect(&self.common.targeting)?;
+
+		// Cold-start retries, then recording, then encoding: the plugin answers
+		// only once the clip is finalized, so this has to outlast all three
+		// (and stay above the plugin's own budget, or the client gives up while
+		// the recording is still running)
+		let timeout_ms = (self.seconds + 180) * 1000;
+
+		let summary = capture::capture_video_file(
+			&client,
+			"playtest_video",
+			json!({ "context": self.context, "seconds": self.seconds }),
+			&self.output,
+			timeout_ms,
+			self.common.raw,
+		)?;
+
+		if self.common.raw {
+			let mut record = json!({ "ok": true });
+
+			merge_into(&mut record, &summary);
+			print_json(&record);
+
+			return Ok(());
+		}
+
+		wsync_info!(
+			"Recorded {} for {}s → {} ({})",
+			self.context.bold(),
+			self.seconds,
+			summary.get("path").and_then(Value::as_str).unwrap_or_default().bold(),
+			crate::cli::live::transfer::human_size(summary.get("bytes").and_then(Value::as_u64).unwrap_or(0)),
 		);
 
 		Ok(())

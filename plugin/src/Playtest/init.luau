@@ -1629,6 +1629,37 @@ function Playtest.screenshot(contextName: string): { [string]: Any }
 	return result :: { [string]: Any }
 end
 
+--- `playtest_video`: record the PlayClient viewport for `seconds` and return
+--- once the engine has finalized the clip. No bytes cross the wire — the MP4
+--- lands in Roblox's tmp-capture-storage directory and the local wsync CLI
+--- copies it out before the engine deletes it (same hand-off as
+--- `playtest_screenshot`, which is the only way out: the file path API is
+--- RobloxScriptSecurity and the VideoCapture object is opaque).
+function Playtest.video(contextName: string, seconds: number): { [string]: Any }
+	local context = (requireContext(contextName))
+
+	if context.role ~= "client" then
+		error(
+			Error.new(
+				Error.INVALID_ARGUMENT,
+				"playtest video requires a PlayClient context — the PlayServer renders no viewport"
+			),
+			0
+		)
+	end
+
+	-- The runtime may retry a cold start several times, then records for
+	-- `seconds`, then waits for the encoder — so the reply legitimately arrives
+	-- long after the request. Budgeted for the worst case, not the common one.
+	local result = request(contextName, "video_capture", { seconds = seconds }, seconds + 150)
+
+	if type(result) ~= "table" then
+		error(Error.new(Error.PLUGIN_ERROR, "the runtime returned an invalid video ack"), 0)
+	end
+
+	return result :: { [string]: Any }
+end
+
 --- `playtest_capture`: render in the PlayClient, then pull the RGBA bytes
 --- over the connection in bounded parts and verify them. Returns the pixels
 --- plus dimensions for the handler to adopt into the capture session
