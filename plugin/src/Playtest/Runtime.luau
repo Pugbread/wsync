@@ -317,8 +317,16 @@ end
 --- (`{ok, valueOrFailure, ...}` from table.pack). Multi-value returns encode
 --- as an array with an explicit count so `return nil` stays distinguishable.
 local function buildEnvelope(packed: { n: number, [number]: Any }): { [string]: Any }
+	-- `table.pack` records the count in `n`, but a result that crossed a
+	-- BindableEvent arrives as a copy of the table with that key gone: Roblox
+	-- carries the array part and drops the string key. Recover the count here,
+	-- at the one place both the exec and playscript paths pass through, rather
+	-- than doing arithmetic on a nil — which is what made every `playtest exec`
+	-- fail with "attempt to perform arithmetic (sub) on nil and number".
+	local total = packed.n or #packed
+
 	if packed[1] == true then
-		local count = packed.n - 1
+		local count = total - 1
 		local envelope: { [string]: Any } = { ok = true, count = count }
 
 		if count == 1 then
@@ -924,6 +932,206 @@ local function awaitClients(agent: Agent, runner: Runner, minimum: Any, timeoutS
 	return if ready then count else nil
 end
 
+--- The source a video capture runs as, inside a temporary runner.
+---
+--- It runs there rather than inline because the retry below needs a script
+--- context: the first `StartVideoCaptureAsync` after a playtest boots always
+--- answers `OtherError` — the capture subsystem is not ready yet — and an
+--- attempt a few seconds later succeeds. Retrying is what makes this
+--- dependable instead of a coin flip on how soon the caller asked.
+local function videoCaptureSource(seconds: number): string
+	return string.format(
+		[[
+local CS = game:GetService("CaptureService")
+local finished, outcome = false, nil
+
+local function tryStart()
+	local started, failure = nil, nil
+
+	task.spawn(function()
+		local ok, result = pcall(function()
+			return CS:StartVideoCaptureAsync(function(value)
+				outcome = tostring(value)
+				finished = true
+			end)
+		end)
+
+		if ok then started = tostring(result) else failure = tostring(result) end
+	end)
+
+	local startDeadline = os.clock() + 15
+
+	while started == nil and failure == nil and os.clock() < startDeadline do
+		task.wait()
+	end
+
+	return started, failure
+end
+
+local started, failure
+
+for _ = 1, %d do
+	finished, outcome = false, nil
+	started, failure = tryStart()
+
+	if started ~= nil and string.find(started, "Success", 1, true) then break end
+
+	pcall(function() CS:StopVideoCapture() end)
+	task.wait(2.5)
+end
+
+if started == nil or not string.find(started, "Success", 1, true) then
+	error("the video capture did not start: " .. tostring(started or failure), 0)
+end
+
+local recordUntil = os.clock() + %d
+
+while os.clock() < recordUntil and not finished do
+	task.wait()
+end
+
+if not finished then
+	pcall(function() CS:StopVideoCapture() end)
+end
+
+local finalizeDeadline = os.clock() + %d
+
+while not finished and os.clock() < finalizeDeadline do
+	task.wait()
+end
+
+if not finished then error("the video capture did not finish encoding in time", 0) end
+
+return started .. "|" .. tostring(outcome)
+]],
+		VIDEO_START_ATTEMPTS,
+		seconds,
+		VIDEO_FINALIZE_SECONDS
+	)
+end
+
+--- Take one viewport screenshot and resolve its temp content id.
+---
+--- The pixels never come back through here: the engine writes the frame into
+--- Roblox's capture directory and the local CLI copies it out, because a
+--- running DataModel refuses to decode a temp texture id. Shared by the
+--- `screenshot` op and `playtest.capture`.
+local function captureScreenshotNow(): string
+	local content: string? = nil
+	local failed: string? = nil
+
+	local ok, err = pcall(function()
+		CaptureService:CaptureScreenshot(function(result)
+			if type(result) == "string" and result ~= "" then
+				content = result
+			else
+				failed = "the screenshot returned no content id"
+			end
+		end)
+	end)
+
+	if not ok then
+		error(`unable to request a screenshot: {tostring(err)}`, 0)
+	end
+
+	local deadline = os.clock() + 15
+
+	while content == nil and failed == nil do
+		if os.clock() >= deadline then
+			error("the screenshot request timed out", 0)
+		end
+
+		RunService.Heartbeat:Wait()
+	end
+
+	if failed ~= nil then
+		error(failed :: string, 0)
+	end
+
+	return content :: string
+end
+
+--- A media name a playscript chose: it becomes a file name on the caller's
+--- machine, so it may not reach outside the directory it is collected into.
+local function validateMediaName(value: Any, label: string): string
+	local name = if value == nil then "" else tostring(value)
+
+	if name == "" then
+		error(`{label} needs a name`, 0)
+	end
+
+	if #name > 64 then
+		error(`{label} name is limited to 64 characters`, 0)
+	end
+
+	if string.find(name, "[^%w%-_%.]") ~= nil or string.find(name, "%.%.") ~= nil then
+		error(`{label} name may only contain letters, digits, '-', '_' and '.'`, 0)
+	end
+
+	return name
+end
+
+--- `playtest.capture(name)` — one screenshot, announced as a `capture` record.
+---
+--- The record is the whole point: the bytes cannot come back through the
+--- bridge, so the CLI running the session watches Roblox's capture directory
+--- and saves the frame under this name when the record arrives.
+local function runnerCapture(agent: Agent, rawName: Any): Any
+	local name = validateMediaName(rawName, "playtest.capture")
+
+	if agent.role ~= "client" then
+		error("playtest.capture is only available in a PlayClient context", 0)
+	end
+
+	captureScreenshotNow()
+	send(agent, { type = "capture", name = name, media = "png" })
+
+	return { ok = true, name = name, media = "png" }
+end
+
+--- `playtest.clip(seconds, name)` — a video clip, announced the same way.
+local function runnerClip(agent: Agent, rawSeconds: Any, rawName: Any): Any
+	local name = validateMediaName(rawName, "playtest.clip")
+
+	if agent.role ~= "client" then
+		error("playtest.clip is only available in a PlayClient context", 0)
+	end
+
+	local seconds = math.clamp(finiteNumber(rawSeconds, VIDEO_DEFAULT_SECONDS), 1, VIDEO_MAX_SECONDS)
+
+	if agent.recordingVideo then
+		error("another clip is already recording", 0)
+	end
+
+	agent.recordingVideo = true
+
+	local okRun, packed = pcall(function()
+		return executeSource(agent, videoCaptureSource(seconds), seconds + VIDEO_FINALIZE_SECONDS + 20, "plugin")
+	end)
+
+	agent.recordingVideo = false
+
+	if not okRun then
+		error(`the clip runner failed: {tostring(packed)}`, 0)
+	end
+
+	local result = packed :: { n: number, [number]: Any }
+
+	if result[1] ~= true then
+		local failure = result[2]
+
+		if type(failure) == "table" and (failure :: Any).message ~= nil then
+			error(tostring((failure :: Any).message), 0)
+		end
+
+		error(tostring(failure), 0)
+	end
+
+	send(agent, { type = "capture", name = name, media = "mp4", seconds = seconds })
+
+	return { ok = true, name = name, media = "mp4", seconds = seconds }
+end
+
 --- The BindableFunction bridge behind the injected `playtest.*` namespace.
 local function bridgeCall(agent: Agent, runner: Runner, action: string, ...: Any): Any
 	if runner.finished or runner.destroyed then
@@ -986,6 +1194,10 @@ local function bridgeCall(agent: Agent, runner: Runner, action: string, ...: Any
 		end
 
 		return sent
+	elseif action == "capture" then
+		return runnerCapture(agent, arguments[1])
+	elseif action == "clip" then
+		return runnerClip(agent, arguments[1], arguments[2])
 	elseif action == "await" then
 		return awaitSignal(runner, arguments[1], arguments[2])
 	elseif action == "awaitClients" then
@@ -1048,6 +1260,10 @@ local PLAYSCRIPT_WRAPPER_HEAD = table.concat({
 	'function playtest.done(value) return __bridge:Invoke("done", value) end',
 	"function playtest.fail(message)",
 	'\treturn __bridge:Invoke("fail", tostring(message), debug.traceback(tostring(message), 2))',
+	"end",
+	'function playtest.capture(name) return __bridge:Invoke("capture", name) end',
+	"function playtest.clip(seconds, name)",
+	'\treturn __bridge:Invoke("clip", seconds, name)',
 	"end",
 	'function playtest.signal(name, payload) return __bridge:Invoke("signal", name, payload) end',
 	'function playtest.await(name, timeoutSeconds) return __bridge:Invoke("await", name, timeoutSeconds) end',
@@ -1764,38 +1980,7 @@ local function buildHandlers(agent: Agent): { [string]: (args: { [string]: Any }
 			error("screenshot requires a PlayClient context", 0)
 		end
 
-		local content: string? = nil
-		local failed: string? = nil
-
-		local ok, err = pcall(function()
-			CaptureService:CaptureScreenshot(function(result)
-				if type(result) == "string" and result ~= "" then
-					content = result
-				else
-					failed = "the screenshot returned no content id"
-				end
-			end)
-		end)
-
-		if not ok then
-			error(`unable to request a screenshot: {tostring(err)}`, 0)
-		end
-
-		local deadline = os.clock() + 15
-
-		while content == nil and failed == nil do
-			if os.clock() >= deadline then
-				error("the screenshot request timed out", 0)
-			end
-
-			RunService.Heartbeat:Wait()
-		end
-
-		if failed ~= nil then
-			error(failed, 0)
-		end
-
-		return { ok = true, contentId = content }
+		return { ok = true, contentId = captureScreenshotNow() }
 	end
 
 	--- `video_capture {seconds}` — record the PlayClient viewport for `seconds`
@@ -1834,74 +2019,7 @@ local function buildHandlers(agent: Agent): { [string]: (args: { [string]: Any }
 		-- subsystem is not ready yet — and an attempt a few seconds later
 		-- succeeds. Retrying is what makes this dependable rather than a coin
 		-- flip on how soon the caller asked.
-		local source = string.format(
-			[[
-local CS = game:GetService("CaptureService")
-local finished, outcome = false, nil
-
-local function tryStart()
-	local started, failure = nil, nil
-
-	task.spawn(function()
-		local ok, result = pcall(function()
-			return CS:StartVideoCaptureAsync(function(value)
-				outcome = tostring(value)
-				finished = true
-			end)
-		end)
-
-		if ok then started = tostring(result) else failure = tostring(result) end
-	end)
-
-	local startDeadline = os.clock() + 15
-
-	while started == nil and failure == nil and os.clock() < startDeadline do
-		task.wait()
-	end
-
-	return started, failure
-end
-
-local started, failure
-
-for _ = 1, %d do
-	finished, outcome = false, nil
-	started, failure = tryStart()
-
-	if started ~= nil and string.find(started, "Success", 1, true) then break end
-
-	pcall(function() CS:StopVideoCapture() end)
-	task.wait(2.5)
-end
-
-if started == nil or not string.find(started, "Success", 1, true) then
-	error("the video capture did not start: " .. tostring(started or failure), 0)
-end
-
-local recordUntil = os.clock() + %d
-
-while os.clock() < recordUntil and not finished do
-	task.wait()
-end
-
-if not finished then
-	pcall(function() CS:StopVideoCapture() end)
-end
-
-local finalizeDeadline = os.clock() + %d
-
-while not finished and os.clock() < finalizeDeadline do
-	task.wait()
-end
-
-if not finished then error("the video capture did not finish encoding in time", 0) end
-
-return started .. "|" .. tostring(outcome)
-]],
-			VIDEO_START_ATTEMPTS,
-			seconds,
-			VIDEO_FINALIZE_SECONDS
-		)
+		local source = videoCaptureSource(seconds)
 
 		local okRun, packed = pcall(function()
 			return executeSource(agent, source, seconds + VIDEO_FINALIZE_SECONDS + 20, "plugin")

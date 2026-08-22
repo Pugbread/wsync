@@ -549,7 +549,10 @@ async fn new_comparisons_replace_reviews_and_dismiss_deletes_preserved_copies() 
 
 	let (status, outcome) = post_json(&daemon, "/review/dismiss", &json!({ "reviewId": review_id })).await;
 	assert_eq!(status, 200);
-	assert_eq!(outcome, json!({ "ok": true }));
+	// Dismiss also reports how many disk-only files it discarded, so "keep
+	// Studio's versions everywhere" is not a silent deletion. This review holds
+	// a `differs` entry and no disk-only ones, so nothing is removed here
+	assert_eq!(outcome, json!({ "ok": true, "discarded": 0 }));
 
 	let (_, pending) = get_json(&daemon, "/review").await;
 	assert_eq!(pending["pending"], false);

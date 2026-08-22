@@ -264,6 +264,10 @@ struct PlaytestRun {
 	#[arg(long, value_enum, default_value = "off")]
 	logs: RunLogs,
 
+	/// Where `playtest.capture` / `playtest.clip` media is written
+	#[arg(long = "capture-dir", value_name = "DIR", default_value = "wsync-captures")]
+	capture_dir: PathBuf,
+
 	/// Skip the automatic stop and print the job id for later use
 	#[arg(long = "keep-open")]
 	keep_open: bool,
@@ -399,8 +403,17 @@ impl PlaytestRun {
 
 		let deadline = started + Duration::from_secs(self.timeout) + RUN_DEADLINE_GRACE;
 
+		// Media a playscript asks for lands in Roblox's capture directory and is
+		// deleted seconds later, so collection has to run for the whole session
+		// rather than be fetched afterwards
+		let collector = capture::MediaCollector::start();
+
 		let polled = poll_run(&client, &job_id, deadline, |record| {
 			self.print_progress(record);
+
+			if record.get("type").and_then(Value::as_str) == Some("capture") {
+				self.collect_media(collector.as_ref(), record);
+			}
 
 			Ok(())
 		});
@@ -469,6 +482,34 @@ impl PlaytestRun {
 		}
 	}
 
+	/// Saves the media one `capture` record announces.
+	///
+	/// A failure here is reported and never fails the run: the playscript's own
+	/// result is the outcome that matters, and losing a screenshot should not
+	/// turn a passing session into a failing one.
+	fn collect_media(&self, collector: Option<&capture::MediaCollector>, record: &Value) {
+		let name = record.get("name").and_then(Value::as_str).unwrap_or("capture");
+		let extension = match record.get("media").and_then(Value::as_str) {
+			Some("mp4") => "mp4",
+			_ => "png",
+		};
+
+		let Some(collector) = collector else {
+			wsync_warn!("`{name}` was captured but this platform has no known Roblox capture directory");
+
+			return;
+		};
+
+		match collector.save_next(&self.capture_dir, name, extension) {
+			Ok(path) => {
+				if !self.raw && self.quiet == 0 {
+					print_line(&format!("  saved {}", path.display().to_string().bold()));
+				}
+			}
+			Err(err) => wsync_warn!("Failed to save the capture `{name}`: {err}"),
+		}
+	}
+
 	/// One progress record: raw prints it verbatim, human renders it, quiet
 	/// suppresses it either way
 	fn print_progress(&self, record: &Value) {
@@ -508,6 +549,10 @@ impl PlaytestRun {
 				"client {} returned {}",
 				record.get("context").and_then(Value::as_str).unwrap_or("?"),
 				human_value(record.get("value").unwrap_or(&Value::Null)),
+			)),
+			"capture" => print_line(&format!(
+				"◈ captured {}",
+				record.get("name").and_then(Value::as_str).unwrap_or("?").bold()
 			)),
 			"dropped" => wsync_warn!(
 				"{} record(s) dropped by source rate limiting",

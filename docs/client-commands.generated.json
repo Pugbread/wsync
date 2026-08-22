@@ -303,7 +303,7 @@
       "name": "playtest",
       "title": "wsync playtest",
       "category": "Agent runtime",
-      "description": "Runs playscript-owned foreground sessions or controls lower-level asynchronous Studio playtests and isolated PlayServer and PlayClient runtime agents.",
+      "description": "Runs playscript-owned foreground sessions, records screenshots and video clips from a live playtest, and controls lower-level asynchronous Studio playtests and isolated PlayServer and PlayClient runtime agents.",
       "subcommands": [
         "run",
         "start",
@@ -315,6 +315,7 @@
         "ui",
         "input",
         "capture",
+        "clip",
         "stop",
         "request"
       ],
@@ -399,6 +400,14 @@
             "studio-plugin"
           ]
         },
+        "clip": {
+          "safety": "writes-local-artifact",
+          "requires": [
+            "project",
+            "daemon",
+            "studio-plugin"
+          ]
+        },
         "stop": {
           "safety": "controls-playtest",
           "requires": [
@@ -421,6 +430,7 @@
         "wsync playtest run --project . --script ./check.server.luau --raw",
         "wsync playtest run --project . --script ./bench.server.luau --client-script ./join.client.luau --mode multiplayer --players 2 --args '{\"map\":\"Lighthouse\",\"laps\":3}' --timeout 600 --raw",
         "wsync playtest run --project . --script ./repro.server.luau --keep-open --logs warn",
+        "wsync playtest run --project . --script ./tour.client.luau --context client:1 --capture-dir ./captures",
         "wsync playtest start --project . --mode play --wait --raw",
         "wsync playtest start --project . --mode multiplayer --players 2 --wait --timeout 60 --raw",
         "wsync playtest contexts --project . --raw",
@@ -428,22 +438,24 @@
         "wsync playtest logs --project . --context client:1 --since-seq 0 --limit 200 --raw",
         "wsync playtest ui --project . --context client:1 --class TextButton --limit 200 --raw",
         "wsync playtest input --project . --context client:1 --file ./input-actions.json --raw",
-        "wsync playtest capture --project . --context client:1 --skybox --ui overlay --size 1024x576 --output ./captures/client-1.png --raw",
+        "wsync playtest capture --project . --context client:1 --output ./captures/client-1.png --raw",
+        "wsync playtest clip --project . --context client:1 --seconds 8 --output ./captures/client-1.mp4 --raw",
         "wsync playtest stop --project . --raw"
       ],
       "notes": [
         "`run --script <file>` owns the complete foreground lifecycle: it starts a Studio playtest, waits for the selected `--context` (`server` by default), injects the playscript, streams progress, prints the return value, and stops the playtest without another WSync invocation.",
-        "Run flags are `--script`, `--context server|client:N`, optional `--client-script`, `--mode play|run|multiplayer`, `--players` (1-8), JSON `--args`, `--timeout` (600 seconds by default, maximum 3600), `--identity game|plugin`, `--logs off|info|warn|error`, `--keep-open`, `--quiet`, and `--raw`. Invalid JSON is rejected before a job starts.",
-        "The injected API exposes `playtest.args`, `mode`, `context`, and `jobId`; `emit(data)` and `log(msg)` stream progress; `done(value)` and `fail(msg)` complete from any task; and generation-scoped `signal`, `await`, and server-only `awaitClients` coordinate contexts.",
+        "Run flags are `--script`, `--context server|client:N`, optional `--client-script`, `--mode play|run|multiplayer`, `--players` (1-8), JSON `--args`, `--timeout` (600 seconds by default, maximum 3600), `--identity game|plugin`, `--logs off|info|warn|error`, `--capture-dir` (`wsync-captures` by default), `--keep-open`, `--quiet`, and `--raw`. Invalid JSON is rejected before a job starts.",
+        "The injected API exposes `playtest.args`, `mode`, `context`, and `jobId`; `emit(data)` and `log(msg)` stream progress; `done(value)` and `fail(msg)` complete from any task; `capture(name)` and `clip(seconds, name)` record the viewport from a client context; and generation-scoped `signal`, `await`, and server-only `awaitClients` coordinate contexts.",
         "The first completion wins. Main return or `done` exits 0; a main-script error or `fail` exits 2; hard timeout exits 3; an externally ended job exits 4 with its fetched `jobStatus`; and boot or required-context failure exits 5. Runs stop automatically except with `--keep-open`, which prints the job ID for later `exec`, `logs`, `capture`, and `stop` use.",
         "`--client-script` runs once in every client as it becomes ready. Each return is a `clientResult`; a client error is an event and never ends the main session. The main script decides whether missing or failed client work matters.",
-        "`--raw` is live NDJSON with `started`, `ready`, `event`, `log`, `clientResult`, `dropped`, `aborted`, and `result` records. Each physical line is independently valid JSON. Events are not deduplicated or sampled by the CLI; source rate limiting is visible through accurate `dropped` counts.",
+        "`--raw` is live NDJSON with `started`, `ready`, `event`, `log`, `clientResult`, `capture`, `dropped`, `aborted`, and `result` records. Each physical line is independently valid JSON. Events are not deduplicated or sampled by the CLI; source rate limiting is visible through accurate `dropped` counts.",
+        "Inside a playscript, `playtest.capture(name)` and `playtest.clip(seconds, name)` record the client viewport mid-session and return `{ok, name, media}`. The bytes never travel through the run: each call emits a `capture` record and `playtest run` saves the file as `<name>.png` or `<name>.mp4` under `--capture-dir`. Names may use letters, digits, `-`, `_`, and `.` only. Both are PlayClient-only, a clip is capped at 30 seconds by Roblox, and a capture that cannot be saved warns without failing the run.",
         "Runtime heartbeats distinguish quiet scripts from vanished jobs. Missing heartbeats cause a status confirmation before `aborted` is emitted, and every failure reports the final observed job status instead of an empty exec-style value.",
         "Encoded main/client results are capped at 1 MiB. An oversized value is replaced by `{\"truncated\":true,\"bytes\":N}` with its original byte count; stream bulk telemetry through `emit` instead.",
         "`--identity game` is the default and runs through a temporary Script/LocalScript in the disposable playtest clone. Plugin identity is an explicit escape hatch in the plugin sandbox and cannot require game modules.",
         "All runtime changes are temporary and never sync to disk or persist to edit mode. Play and Run DataModels are a separate environment and never reverse-sync. Run coordination is authenticated with the private job generation token. The start audit record includes script paths and SHA-256 hashes; the completion record includes the outcome and exit code.",
         "`start` returns a lower-level asynchronous job. Use `--wait`, `playtest wait`, `status`, and `contexts` to synchronize with `server` and `client:N`; the low-level commands remain supported and unchanged.",
-        "Runtime copies communicate only with the edit-mode plugin through PluginConnectionService. They do not connect to localhost. `playtest capture` accepts only a PlayClient context plus optional `--size`, `--skybox`, and `--ui none|overlay`. It returns bounded raw RGBA to the CLI for validated local PNG encoding and never requests screenshot permission or uploads a PNG artifact from Studio."
+        "Runtime copies communicate only with the edit-mode plugin through PluginConnectionService. They do not connect to localhost. `playtest capture --context client:N -o FILE` writes one PNG and `playtest clip --context client:N --seconds 1-30 -o FILE` writes one MP4; both take a PlayClient context only, because the PlayServer renders no viewport. A running experience cannot read a screenshot back into pixels, so the engine writes each frame into Roblox's capture directory and the local CLI copies it out and deletes it — no screenshot permission is requested and no artifact is uploaded from Studio."
       ]
     },
     {

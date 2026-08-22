@@ -821,6 +821,21 @@ local function handleEnvelope(connection: Any, message: { [string]: Any })
 				message = tostring(body.message or ""),
 			}, os.clock())
 		end
+	elseif frameType == "capture" then
+		-- The media itself never travels: the runtime only announces what it
+		-- captured, and the CLI running the session lifts the file out of
+		-- Roblox's capture directory under this name before the engine deletes
+		-- it. Without this record reaching the run stream there is nothing to
+		-- tell the CLI a file is waiting.
+		if run ~= nil then
+			RunState.enqueue(run, {
+				type = "capture",
+				context = context.name,
+				name = tostring(body.name or "capture"),
+				media = tostring(body.media or "png"),
+				seconds = tonumber(body.seconds),
+			}, os.clock())
+		end
 	elseif frameType == "dropped" then
 		if run ~= nil then
 			RunState.enqueue(run, {

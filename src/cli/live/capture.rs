@@ -18,7 +18,12 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 use serde_json::{json, Map, Value};
-use std::{fs, io::BufWriter, path::PathBuf, process};
+use std::{
+	fs,
+	io::BufWriter,
+	path::{Path, PathBuf},
+	process,
+};
 
 use crate::{
 	cli::client::{print_json, Client, Targeting},
@@ -824,6 +829,125 @@ pub(crate) fn capture_video_file(
 		"sha256": sha256_hex(&bytes),
 		"capture": ack,
 	}))
+}
+
+/// Collects the media a playscript asks for with `playtest.capture` /
+/// `playtest.clip` while a run is streaming.
+///
+/// The bytes cannot come back through the run's record stream, so the runtime
+/// only announces each one and the engine leaves the file in Roblox's capture
+/// directory — which it then deletes a few seconds later. This polls that
+/// directory for the whole run, taking a copy of each new file once it stops
+/// growing (the only visible sign the encoder finished), and hands them out in
+/// arrival order as the records name them. Captures are serialized runtime-side,
+/// so that order is the same order the playscript asked in.
+pub(crate) struct MediaCollector {
+	stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+	found: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>>,
+	handle: Option<std::thread::JoinHandle<()>>,
+	dir: PathBuf,
+}
+
+impl MediaCollector {
+	/// Starts polling. `None` when this platform has no known capture
+	/// directory — the run still works, the media is simply not collected.
+	pub(crate) fn start() -> Option<Self> {
+		let dir = roblox_tmp_capture_dir()?;
+
+		if !dir.is_dir() {
+			return None;
+		}
+
+		let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+		let found = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+		let before: std::collections::HashSet<std::ffi::OsString> =
+			wob_files(&dir).into_iter().map(|(name, _)| name).collect();
+
+		let handle = {
+			let (dir, stop, found) = (dir.clone(), stop.clone(), found.clone());
+
+			std::thread::spawn(move || {
+				let mut sizes: std::collections::HashMap<std::ffi::OsString, (u64, u32)> =
+					std::collections::HashMap::new();
+				let mut taken: std::collections::HashSet<std::ffi::OsString> = std::collections::HashSet::new();
+
+				while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+					for (name, _) in wob_files(&dir) {
+						if before.contains(&name) || taken.contains(&name) {
+							continue;
+						}
+
+						let path = dir.join(&name);
+						let Ok(length) = fs::metadata(&path).map(|meta| meta.len()) else { continue };
+						let entry = sizes.entry(name.clone()).or_insert((0, 0));
+
+						if entry.0 == length {
+							entry.1 += 1;
+						} else {
+							*entry = (length, 0);
+						}
+
+						if entry.1 == 2 && length > 512 {
+							if let Ok(bytes) = fs::read(&path) {
+								taken.insert(name);
+								found.lock().expect("media collector lock").push_back(bytes);
+							}
+						}
+					}
+
+					std::thread::sleep(std::time::Duration::from_millis(100));
+				}
+			})
+		};
+
+		Some(Self {
+			stop,
+			found,
+			handle: Some(handle),
+			dir,
+		})
+	}
+
+	pub(crate) fn directory(&self) -> &Path {
+		&self.dir
+	}
+
+	/// Writes the next collected file as `<name>.<extension>` under `dir`.
+	/// Waits briefly: the record can beat the encoder's last flush.
+	pub(crate) fn save_next(&self, dir: &Path, name: &str, extension: &str) -> Result<PathBuf> {
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+
+		let bytes = loop {
+			if let Some(bytes) = self.found.lock().expect("media collector lock").pop_front() {
+				break bytes;
+			}
+
+			if std::time::Instant::now() >= deadline {
+				bail!("no capture file appeared for `{name}` in {}", self.dir.to_string());
+			}
+
+			std::thread::sleep(std::time::Duration::from_millis(100));
+		};
+
+		fs::create_dir_all(dir)
+			.with_context(|| format!("Failed to create the capture directory {}", dir.to_string()))?;
+
+		let output = dir.join(format!("{name}.{extension}"));
+
+		fs::write(&output, &bytes).with_context(|| format!("Failed to write {}", output.to_string()))?;
+
+		Ok(output)
+	}
+}
+
+impl Drop for MediaCollector {
+	fn drop(&mut self) {
+		self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+
+		if let Some(handle) = self.handle.take() {
+			handle.join().ok();
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
