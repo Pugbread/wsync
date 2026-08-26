@@ -11,9 +11,9 @@
 //! (Design §10.6) that the read-only surface has no equivalent of; the
 //! artifact surfaces share `transfer`'s verified chunk pump.
 
+mod backlog;
 pub(crate) mod capture;
 mod clipboard;
-mod conflict;
 mod diagnostics;
 mod history;
 mod inspect;
@@ -28,9 +28,9 @@ mod transfer;
 mod transmit;
 mod write;
 
+pub use backlog::Backlog;
 pub use capture::Capture;
 pub use clipboard::{Copy, Paste};
-pub use conflict::{Changes, Conflicts, Decision, Diff, Resolve};
 pub use diagnostics::{Capabilities, Doctor, Ping, Status, Version};
 pub use history::{Redo, Save, Undo, Waypoint};
 pub use inspect::{Get, Ls, Props, Services, Tree};

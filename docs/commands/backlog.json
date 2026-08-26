@@ -1,0 +1,50 @@
+{
+  "name": "backlog",
+  "title": "wsync backlog",
+  "category": "Live inspection",
+  "description": "Reviews, restores, or drops the disk content that lost to Studio. WSync is Studio-first and never stops to ask: a connect applies Studio over the project and a mid-session clash resolves the same way, so the disk bytes that lost are moved to the backlog instead of being dropped or waiting behind a prompt.",
+  "subcommands": [
+    "list",
+    "restore",
+    "drop"
+  ],
+  "subcommandMetadata": {
+    "list": {
+      "safety": "read-only",
+      "requires": [
+        "project",
+        "daemon"
+      ]
+    },
+    "restore": {
+      "safety": "mutates-studio",
+      "requires": [
+        "project",
+        "daemon",
+        "studio-plugin"
+      ]
+    },
+    "drop": {
+      "safety": "mutates-disk",
+      "requires": [
+        "project",
+        "daemon"
+      ]
+    }
+  },
+  "usage": "wsync backlog [list|restore <id>|drop <id>|drop --all] [--project <path>] [--port <port>] [--raw]",
+  "examples": [
+    "wsync backlog --project . --raw",
+    "wsync backlog restore 5f1c1f6e-2f0e-4a1a-9a5b-7c1d2e3f4a5b --project .",
+    "wsync backlog drop 5f1c1f6e-2f0e-4a1a-9a5b-7c1d2e3f4a5b --project .",
+    "wsync backlog drop --all --project ."
+  ],
+  "notes": [
+    "Sync is Studio-first with no questions asked. A connect applies Studio over the project, and a change that clashes with Studio mid-session resolves toward Studio the moment it is detected. Neither stops to ask, because being interrupted by a decision you did not plan to make is worse than the loss it guards against.",
+    "The guard is this backlog. Whenever disk content would be overwritten or dropped, its bytes move to `.wsync-backups/backlog/` first, recorded with the path they came from and whether they lost to the initial sync or to a later conflict.",
+    "`restore <id>` writes an entry back to its project path and pushes it to Studio, which is the old Keep Disk answer, deferred until you actually want it. It needs a connected Studio plugin: a restore that never reaches Studio would be sent straight back to the backlog by the next connect.",
+    "Entries expire a day after capture and are swept on every read, so an expiry never depends on the app being open. The backlog is a safety net for the edit you did not notice losing, not a version history.",
+    "`drop` forgets an entry without restoring it; `drop --all` empties the backlog. Neither touches what is already synced.",
+    "There is no divergence prompt, no pending review, and no Keep Disk / Keep Studio decision anywhere in WSync. The commands that drove them — `diff`, `changes`, `decision`, `conflicts`, and `resolve` — no longer exist."
+  ]
+}

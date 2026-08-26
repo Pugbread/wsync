@@ -383,28 +383,6 @@ fn snapshot_exports_the_live_tree_to_a_file() {
 	);
 }
 
-#[test]
-fn changes_is_the_diff_alias() {
-	let daemon = start_daemon(None);
-	let sandbox = CliSandbox::new();
-	let project = daemon.root.to_string_lossy().into_owned();
-	let port = daemon.port.to_string();
-
-	// No plugin has connected, so no disk review is pending: the alias
-	// answers exactly like `diff` — cleanly, exit 0, and silently under --raw
-	for command in ["changes", "diff"] {
-		let output = sandbox.run(&[command, "--project", &project, "--port", &port, "--raw"]);
-
-		assert!(output.status.success(), "{command} failed: {}", cli_stderr(&output));
-		assert_eq!(cli_stdout(&output).trim(), "", "{command} --raw prints no entries");
-	}
-
-	// The human rendering names the missing review instead of failing
-	let output = sandbox.run(&["changes", "--project", &project, "--port", &port]);
-
-	assert!(output.status.success());
-	assert!(cli_stderr(&output).contains("No pending disk review"));
-}
 
 #[test]
 fn services_lists_roots_with_presence_on_both_sides() {

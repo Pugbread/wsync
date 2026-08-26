@@ -878,7 +878,9 @@ impl MediaCollector {
 						}
 
 						let path = dir.join(&name);
-						let Ok(length) = fs::metadata(&path).map(|meta| meta.len()) else { continue };
+						let Ok(length) = fs::metadata(&path).map(|meta| meta.len()) else {
+							continue;
+						};
 						let entry = sizes.entry(name.clone()).or_insert((0, 0));
 
 						if entry.0 == length {
@@ -906,10 +908,6 @@ impl MediaCollector {
 			handle: Some(handle),
 			dir,
 		})
-	}
-
-	pub(crate) fn directory(&self) -> &Path {
-		&self.dir
 	}
 
 	/// Writes the next collected file as `<name>.<extension>` under `dir`.

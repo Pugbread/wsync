@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::{fs, path::Path, time::Duration};
 use tokio_tungstenite::tungstenite::Message;
 
-use common::{connect_client, start_daemon, wait_for_frame, TestDaemon, WsClient};
+use common::{connect_client, get_json, post_json, start_daemon, wait_for_frame, TestDaemon, WsClient};
 
 /// Startup + debounce grace: writes before it can be swallowed by the
 /// watcher's self-write window (see tests/protocol.rs)
@@ -134,9 +134,8 @@ async fn park_both_edited(daemon: &TestDaemon, plugin: &mut WsClient, hello: &st
 }
 
 #[tokio::test]
-async fn concurrent_edit_parks_a_conflict_and_lists_it() {
+async fn a_concurrent_edit_resolves_toward_studio_and_backlogs_the_disk_side() {
 	let daemon = start_daemon(None);
-	let (mut watch, _) = connect_client(&daemon, "watch", "conflict-watch").await;
 	let (mut plugin, _) = connect_client(&daemon, "plugin", "conflict-plugin").await;
 
 	tokio::time::sleep(SETTLE).await;
@@ -144,262 +143,89 @@ async fn concurrent_edit_parks_a_conflict_and_lists_it() {
 
 	let result = park_both_edited(&daemon, &mut plugin, &hello).await;
 
-	// The batch reports the real parked count, not an error
+	// The batch still reports the clash honestly; what changed is that nothing
+	// waits on an answer afterwards
 	assert_eq!(result["ok"], true);
-	assert_eq!(result["applied"], 0);
-	assert_eq!(result["skipped"], 0);
 	assert_eq!(result["conflicts"], 1);
 
-	// The parked push must not have touched the disk
-	assert_eq!(
-		fs::read_to_string(daemon.src_dir().join("Hello.luau")).unwrap(),
-		"return \"disk-edit\"\n"
+	// Studio wins, without being asked: its content reaches disk on its own
+	assert!(
+		wait_for_file_content(
+			&daemon.src_dir().join("Hello.luau"),
+			"return \"studio-edit\"",
+			Duration::from_secs(15),
+		),
+		"Studio's version should land on disk without a decision"
 	);
 
-	// The conflict event reaches watch clients with the pinned flat shape
-	let event = wait_for_frame(&mut watch, Duration::from_secs(10), |frame| {
-		frame["type"] == "event" && frame["topic"] == "conflict"
-	})
-	.await
-	.expect("no conflict event");
+	// …and the disk edit that lost is recoverable rather than gone
+	let (_, backlog) = get_json(&daemon, "/backlog").await;
+	let entries = backlog["entries"].as_array().unwrap();
 
-	assert!(!event["id"].as_str().unwrap().is_empty());
-	assert_eq!(event["path"], "src/Hello.luau");
-	assert_eq!(event["instancePath"], "ReplicatedStorage/Hello");
-	assert_eq!(event["classification"], "both-edited");
+	assert_eq!(entries.len(), 1, "backlog: {backlog}");
+	assert_eq!(entries[0]["path"], "src/Hello.luau");
+	assert_eq!(entries[0]["reason"], "conflict");
+	assert!(entries[0]["secondsRemaining"].as_u64().unwrap() > 0);
 
-	// GET /resolve lists the parked conflict with both sides' content
-	let listed = conflicts(&daemon).await;
-	assert_eq!(listed.len(), 1);
+	// Nothing is left parked waiting for a decision that never comes
+	assert!(conflicts(&daemon).await.is_empty());
+}
 
-	let record = &listed[0];
-	assert_eq!(record["id"], event["id"]);
-	assert_eq!(record["path"], "src/Hello.luau");
-	assert_eq!(record["instancePath"], "ReplicatedStorage/Hello");
-	assert_eq!(record["class"], "ModuleScript");
-	assert_eq!(record["kind"], "script");
-	assert_eq!(record["classification"], "both-edited");
-	assert_eq!(record["fs"]["present"], true);
-	assert_eq!(record["fs"]["source"], "return \"disk-edit\"\n");
-	assert_eq!(record["studio"]["present"], true);
-	assert_eq!(record["studio"]["source"], "return \"studio-edit\"");
-	assert_eq!(record["fs"]["hash"].as_str().unwrap().len(), 64);
-	assert_eq!(record["studio"]["hash"].as_str().unwrap().len(), 64);
-	assert!(record["detectedAt"].as_str().unwrap().contains('T'));
+#[tokio::test]
+async fn a_backlog_entry_restores_to_disk() {
+	let daemon = start_daemon(None);
+	let (mut plugin, _) = connect_client(&daemon, "plugin", "conflict-plugin").await;
 
-	// Unknown id and missing direction are rejected cleanly
-	let (status, body) = resolve(&daemon, "c999", "local").await;
+	tokio::time::sleep(SETTLE).await;
+	let hello = instance_ref(&daemon, "Hello").await;
+
+	park_both_edited(&daemon, &mut plugin, &hello).await;
+
+	assert!(
+		wait_for_file_content(
+			&daemon.src_dir().join("Hello.luau"),
+			"return \"studio-edit\"",
+			Duration::from_secs(15),
+		),
+		"Studio's version should land on disk first"
+	);
+
+	let (_, backlog) = get_json(&daemon, "/backlog").await;
+	let id = backlog["entries"][0]["id"].as_str().unwrap().to_owned();
+
+	let (status, body) = post_json(&daemon, "/backlog/restore", &json!({ "id": id })).await;
+
+	assert_eq!(status, 200, "restore: {body}");
+	assert_eq!(body["ok"], true);
+
+	// The disk edit is back where it came from, and the entry is consumed
+	assert!(
+		wait_for_file_content(
+			&daemon.src_dir().join("Hello.luau"),
+			"return \"disk-edit\"\n",
+			Duration::from_secs(15),
+		),
+		"the restored content should be back on disk"
+	);
+
+	let (_, backlog) = get_json(&daemon, "/backlog").await;
+	assert!(backlog["entries"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_unknown_backlog_entry_is_refused() {
+	let daemon = start_daemon(None);
+	let (mut _plugin, _) = connect_client(&daemon, "plugin", "conflict-plugin").await;
+
+	tokio::time::sleep(SETTLE).await;
+
+	let (status, body) = post_json(&daemon, "/backlog/restore", &json!({ "id": "nope" })).await;
+
 	assert_eq!(status, 404);
 	assert_eq!(body["ok"], false);
 }
 
-#[tokio::test]
-async fn resolve_keep_local_pushes_disk_state_and_restamps() {
-	let daemon = start_daemon(None);
-	let (mut plugin, _) = connect_client(&daemon, "plugin", "keep-local-plugin").await;
 
-	tokio::time::sleep(SETTLE).await;
-	let hello = instance_ref(&daemon, "Hello").await;
 
-	park_both_edited(&daemon, &mut plugin, &hello).await;
 
-	let id = conflicts(&daemon).await[0]["id"].as_str().unwrap().to_owned();
 
-	let (status, body) = resolve(&daemon, &id, "local").await;
-	assert_eq!(status, 200);
-	assert_eq!(body["ok"], true);
-	assert_eq!(body["resolved"], id);
-
-	// Keep local emits the disk state over the sync channel
-	let sync = wait_for_frame(&mut plugin, Duration::from_secs(10), |frame| {
-		frame["type"] == "sync"
-			&& frame["updates"]
-				.as_array()
-				.unwrap()
-				.iter()
-				.any(|update| update["id"] == hello)
-	})
-	.await
-	.expect("no resolution sync frame");
-
-	let update = sync["updates"]
-		.as_array()
-		.unwrap()
-		.iter()
-		.find(|update| update["id"] == hello)
-		.unwrap();
-
-	assert_eq!(update["properties"]["Source"]["String"], "return \"disk-edit\"\n");
-
-	// The conflict is gone and the disk was never touched
-	assert!(conflicts(&daemon).await.is_empty());
-	assert_eq!(
-		fs::read_to_string(daemon.src_dir().join("Hello.luau")).unwrap(),
-		"return \"disk-edit\"\n"
-	);
-
-	// Baselines re-stamped: a follow-up Studio edit now applies cleanly
-	plugin
-		.send(Message::Text(push_update(&hello, "return \"studio-later\"")))
-		.await
-		.unwrap();
-
-	let result = push_result(&mut plugin).await;
-	assert_eq!(result["ok"], true);
-	assert_eq!(result["applied"], 1);
-	assert_eq!(result["conflicts"], 0);
-
-	assert!(wait_for_file_content(
-		&daemon.src_dir().join("Hello.luau"),
-		"return \"studio-later\"",
-		Duration::from_secs(5),
-	));
-}
-
-#[tokio::test]
-async fn resolve_keep_studio_writes_disk_and_restamps() {
-	let daemon = start_daemon(None);
-	let (mut plugin, _) = connect_client(&daemon, "plugin", "keep-studio-plugin").await;
-
-	tokio::time::sleep(SETTLE).await;
-	let hello = instance_ref(&daemon, "Hello").await;
-
-	park_both_edited(&daemon, &mut plugin, &hello).await;
-
-	let id = conflicts(&daemon).await[0]["id"].as_str().unwrap().to_owned();
-
-	let (status, body) = resolve(&daemon, &id, "studio").await;
-	assert_eq!(status, 200);
-	assert_eq!(body["ok"], true);
-
-	// Keep studio lands the parked Studio state on disk via the write path
-	assert!(wait_for_file_content(
-		&daemon.src_dir().join("Hello.luau"),
-		"return \"studio-edit\"",
-		Duration::from_secs(5),
-	));
-
-	assert!(conflicts(&daemon).await.is_empty());
-
-	// Baselines re-stamped: the next disk edit propagates normally
-	tokio::time::sleep(SETTLE).await;
-	fs::write(daemon.src_dir().join("Hello.luau"), "return \"after\"\n").unwrap();
-
-	let sync = wait_for_frame(&mut plugin, Duration::from_secs(15), |frame| {
-		frame["type"] == "sync" && !frame["updates"].as_array().unwrap().is_empty()
-	})
-	.await
-	.expect("no sync frame after resolution");
-
-	let update = &sync["updates"].as_array().unwrap()[0];
-	assert_eq!(update["properties"]["Source"]["String"], "return \"after\"\n");
-}
-
-#[tokio::test]
-async fn fs_delete_racing_studio_edit_parks_and_can_restore() {
-	let daemon = start_daemon(None);
-	let (mut plugin, _) = connect_client(&daemon, "plugin", "fs-delete-plugin").await;
-
-	tokio::time::sleep(SETTLE).await;
-	let hello = instance_ref(&daemon, "Hello").await;
-
-	// Disk deletes the script; the removal propagates cleanly
-	fs::remove_file(daemon.src_dir().join("Hello.luau")).unwrap();
-
-	wait_for_frame(&mut plugin, Duration::from_secs(15), |frame| {
-		frame["type"] == "sync"
-			&& frame["removals"]
-				.as_array()
-				.unwrap()
-				.iter()
-				.any(|id| id == &json!(hello))
-	})
-	.await
-	.expect("no removal sync frame");
-
-	// A Studio edit of the just-deleted instance races the removal
-	plugin
-		.send(Message::Text(push_update(&hello, "return \"studio-edit\"")))
-		.await
-		.unwrap();
-
-	let result = push_result(&mut plugin).await;
-	assert_eq!(result["ok"], true);
-	assert_eq!(result["conflicts"], 1);
-
-	let listed = conflicts(&daemon).await;
-	assert_eq!(listed.len(), 1);
-	assert_eq!(listed[0]["classification"], "fs-deleted-studio-edited");
-	assert_eq!(listed[0]["fs"]["present"], false);
-	assert_eq!(listed[0]["studio"]["present"], true);
-	assert_eq!(listed[0]["studio"]["source"], "return \"studio-edit\"");
-
-	// Keep studio restores the file from the parked Studio state
-	let id = listed[0]["id"].as_str().unwrap().to_owned();
-	let (status, body) = resolve(&daemon, &id, "studio").await;
-	assert_eq!(status, 200);
-	assert_eq!(body["ok"], true);
-
-	assert!(wait_for_file_content(
-		&daemon.src_dir().join("Hello.luau"),
-		"return \"studio-edit\"",
-		Duration::from_secs(5),
-	));
-	assert!(conflicts(&daemon).await.is_empty());
-}
-
-#[tokio::test]
-async fn studio_delete_racing_fs_edit_parks_and_keep_local_recreates() {
-	let daemon = start_daemon(None);
-	let (mut plugin, _) = connect_client(&daemon, "plugin", "studio-delete-plugin").await;
-
-	tokio::time::sleep(SETTLE).await;
-	let hello = instance_ref(&daemon, "Hello").await;
-
-	// Disk edit propagates, then Studio deletes the same instance while the
-	// edit is still in flight
-	fs::write(daemon.src_dir().join("Hello.luau"), "return \"disk-edit\"\n").unwrap();
-
-	wait_for_frame(&mut plugin, Duration::from_secs(15), |frame| {
-		frame["type"] == "sync" && !frame["updates"].as_array().unwrap().is_empty()
-	})
-	.await
-	.expect("no sync frame after the disk edit");
-
-	plugin.send(Message::Text(push_removal(&hello))).await.unwrap();
-
-	let result = push_result(&mut plugin).await;
-	assert_eq!(result["ok"], true);
-	assert_eq!(result["conflicts"], 1);
-
-	// The deletion was excluded: the edited file survives
-	assert_eq!(
-		fs::read_to_string(daemon.src_dir().join("Hello.luau")).unwrap(),
-		"return \"disk-edit\"\n"
-	);
-
-	let listed = conflicts(&daemon).await;
-	assert_eq!(listed.len(), 1);
-	assert_eq!(listed[0]["classification"], "studio-deleted-fs-edited");
-	assert_eq!(listed[0]["fs"]["present"], true);
-	assert_eq!(listed[0]["studio"]["present"], false);
-
-	// Keep local recreates the instance in Studio from the live tree
-	let id = listed[0]["id"].as_str().unwrap().to_owned();
-	let (status, body) = resolve(&daemon, &id, "local").await;
-	assert_eq!(status, 200);
-	assert_eq!(body["ok"], true);
-
-	let sync = wait_for_frame(&mut plugin, Duration::from_secs(10), |frame| {
-		frame["type"] == "sync" && !frame["additions"].as_array().unwrap().is_empty()
-	})
-	.await
-	.expect("no recreation sync frame");
-
-	let addition = &sync["additions"].as_array().unwrap()[0];
-	assert_eq!(addition["id"], hello);
-	assert_eq!(addition["name"], "Hello");
-	assert_eq!(addition["properties"]["Source"]["String"], "return \"disk-edit\"\n");
-
-	assert!(conflicts(&daemon).await.is_empty());
-}

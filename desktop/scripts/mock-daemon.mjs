@@ -764,6 +764,17 @@ export function createMockDaemon(options = {}) {
 
   /** Parked conflicts, by id, so `POST /resolve` can actually remove one. */
   const conflicts = new Map(buildConflicts(conflictCount).map((entry) => [entry.id, entry]));
+  // Two sample backlog entries, so the app's list and its expiry countdown
+  // have something to render without a real clash having happened.
+  const backlog = new Map(
+    [
+      { id: "bk_1", path: "src/ReplicatedStorage/Hello.luau", reason: "initial-sync", bytes: 214 },
+      { id: "bk_2", path: "src/ServerScriptService/Main.server.luau", reason: "conflict", bytes: 1042 },
+    ].map((entry) => [
+      entry.id,
+      { ...entry, capturedAt: Math.floor(Date.now() / 1000), secondsRemaining: 24 * 60 * 60 },
+    ]),
+  );
 
   /**
    * The frozen divergence set, or null. Only a full-scope project has one:
@@ -805,6 +816,44 @@ export function createMockDaemon(options = {}) {
 
     if (request.method === "GET" && route === "/hello") {
       return sendJson(response, 200, identity);
+    }
+
+    // The backlog: disk content that lost to Studio. Sync never asks a
+    // question, so these are recoverable losers rather than pending work.
+    if (request.method === "GET" && route === "/backlog") {
+      const entries = [...backlog.values()];
+      return sendJson(response, 200, {
+        total: entries.length,
+        ttlSeconds: 24 * 60 * 60,
+        entries,
+      });
+    }
+
+    if (request.method === "POST" && route === "/backlog/restore") {
+      return readJson(request, (body) => {
+        const id = typeof body?.id === "string" ? body.id : "";
+        const entry = backlog.get(id);
+        if (!entry) {
+          return sendJson(response, 404, { ok: false, error: "no such backlog entry" });
+        }
+        backlog.delete(id);
+        return sendJson(response, 200, { ok: true, path: entry.path, restoredTo: entry.path });
+      });
+    }
+
+    if (request.method === "POST" && route === "/backlog/drop") {
+      return readJson(request, (body) => {
+        if (body?.all === true) {
+          const dropped = backlog.size;
+          backlog.clear();
+          return sendJson(response, 200, { ok: true, dropped });
+        }
+        const id = typeof body?.id === "string" ? body.id : "";
+        if (!backlog.delete(id)) {
+          return sendJson(response, 404, { ok: false, error: "no such backlog entry" });
+        }
+        return sendJson(response, 200, { ok: true, dropped: 1 });
+      });
     }
 
     if (request.method === "GET" && route === "/resolve") {

@@ -180,6 +180,10 @@ pub enum Event {
 		disk_only: usize,
 		differs: usize,
 	},
+	/// Disk content lost to Studio and was moved to the backlog. Counts only:
+	/// the entries themselves are read from `GET /backlog`
+	#[serde(rename = "backlog")]
+	Backlog { total: usize, added: usize },
 }
 
 pub const EVENT_TOPICS: [&str; 7] = [
@@ -207,6 +211,7 @@ impl Event {
 			Self::ChoiceNeeded { .. } => "choice-needed",
 			Self::ChoiceMade { .. } => "choice-made",
 			Self::DiskReview { .. } => "disk-review",
+			Self::Backlog { .. } => "backlog",
 		}
 	}
 

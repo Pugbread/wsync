@@ -17,11 +17,9 @@ import {
 } from "./views/theme.js";
 import { mountProjects } from "./views/projects.js";
 import { mountActive } from "./views/active.js";
-import { mountConflicts } from "./views/conflicts.js";
+import { mountBacklog, openBacklogModal } from "./views/backlog.js";
 import { mountDocs } from "./views/docs.js";
 import { mountSettings } from "./views/settings.js";
-import { openOverwriteModal } from "./views/overwrite.js";
-import { openReviewModal } from "./views/review.js";
 import { createLastEditedStore } from "./views/last-edited.js";
 
 // ------------------------------------------------------------------ DOM ---
@@ -44,7 +42,7 @@ const $tabs = [...document.querySelectorAll(".rail-item")];
 const ROUTES = {
   projects: { label: "Projects", mount: mountProjects },
   active: { label: "Activity", mount: mountActive },
-  conflicts: { label: "Conflicts", mount: mountConflicts },
+  backlog: { label: "Backlog", mount: mountBacklog },
   docs: { label: "Docs", mount: mountDocs },
   settings: { label: "Settings", mount: mountSettings },
 };
@@ -74,36 +72,17 @@ const app = {
   unmountCurrent: null,
   /** Not persisted: why a serve attempt failed, per project id. */
   daemonFailures: new Map(),
-  /** Not persisted: last known conflict count, or null when unchecked. */
+  /** Not persisted: last known backlog count, or null when unchecked. */
   conflictCount: null,
   /**
-   * Not persisted: the divergence choice waiting for an answer, or null.
-   * It lives here rather than in the Conflicts view so the banner survives
-   * navigating away and back — a pending choice is app state, not view state.
+   * Not persisted: `{projectId, total}` for the disk content that lost to
+   * Studio, or null. The banner has to survive navigating away, and unlike the
+   * old review this is never a pending decision — just a count of what is
+   * recoverable until it expires.
    */
-  pendingDivergence: null,
-  /**
-   * Not persisted: the open divergence modal's handle, or null. The app holds
-   * it so a `choice-made` from anywhere — the CLI, another window, the plugin's
-   * fallback prompt — can close a modal that is now answering a dead question.
-   */
-  overwrite: null,
-  /**
-   * Not persisted: Design 7.0's pending disk review, or null. Same reasoning as
-   * `pendingDivergence` — the banner has to survive navigating away — but a
-   * very different thing: the sync already happened, and this is the optional
-   * list of disk items that did not survive it.
-   */
-  pendingReview: null,
-  /** Not persisted: the open disk-review modal's handle, or null. */
-  review: null,
-  /**
-   * Not persisted: reviewIds whose modal has already auto-opened once. The
-   * initial-sync popup opens itself exactly once per review — a reconnect that
-   * re-broadcasts the same set must not fight a user who closed it, while a
-   * *new* reviewId (a superseding connect) opens fresh.
-   */
-  reviewAutoShown: new Set(),
+  backlog: null,
+  /** Not persisted: the open backlog window's handle, or null. */
+  backlogWindow: null,
   persistence: "memory",
   /** Not persisted: the live WS link's last reported status (see ws.js). */
   link: { state: LINK_STATE.IDLE, detail: "No project is being served.", projectId: null },
@@ -132,8 +111,7 @@ function on(event, handler) {
 function emit(event, detail) {
   // The pending divergence choice is remembered centrally so a late-mounting
   // view can ask for it instead of having to have been listening.
-  if (event === "divergence") app.pendingDivergence = detail ?? null;
-  if (event === "review") app.pendingReview = detail ?? null;
+  if (event === "backlog") app.backlog = detail ?? null;
   for (const handler of listeners.get(event) ?? []) {
     try {
       handler(detail);
@@ -511,7 +489,7 @@ async function serveProject(projectId) {
     }
     emit("daemon", { projectId, ok: true, session });
     refreshLink();
-    void pollConflicts();
+    void pollBacklog();
     return true;
   } catch (error) {
     const hostError = recordFailure(projectId, error);
@@ -540,7 +518,7 @@ async function stopProject(projectId) {
     );
     emit("daemon", { projectId, ok: false, outcome });
     refreshLink();
-    void pollConflicts();
+    void pollBacklog();
     return true;
   } catch (error) {
     const hostError = recordFailure(projectId, error);
@@ -671,58 +649,9 @@ function onDaemonEvent(frame, projectId) {
         instancePath: typeof frame.instancePath === "string" ? frame.instancePath : null,
         classification: typeof frame.classification === "string" ? frame.classification : null,
       });
-      void pollConflicts();
+      void pollBacklog();
       break;
     }
-    case "choice-needed": {
-      const summary = divergenceSummary(frame, projectId);
-      // A daemon re-announces the pending choice to every client that
-      // connects, so a flapping link would otherwise toast on every reconnect.
-      // The set is identified by its choiceId; the same one is not news.
-      const known = app.pendingDivergence?.choiceId === summary.choiceId;
-      emit("divergence", summary);
-      // A modal open on a superseded set is worse than no modal: the staging
-      // ids it holds address a divergence set the daemon has already replaced.
-      app.overwrite?.supersede(summary);
-      if (!known) {
-        toast("Studio and disk are different", {
-          kind: "warn",
-          body: "Nothing changes until you choose a side. Open Conflicts to review.",
-        });
-      }
-      break;
-    }
-    case "disk-review": {
-      // The initial-sync review. Nothing about this blocks the sync: the
-      // daemon has already applied Studio → disk and live sync is running.
-      // But it *is* a decision the user should see, so the picker opens
-      // itself — once per reviewId — as a dismissible overlay; closing it
-      // leaves the banner to reopen from.
-      const summary = reviewSummary(frame, projectId);
-      const known = app.pendingReview?.reviewId === summary.reviewId;
-      emit("review", summary);
-      // A new connect replaces the pending review, so a modal holding the old
-      // one is holding ids the daemon has dropped. Supersede closes it, which
-      // is what lets the auto-open below show the new set.
-      app.review?.supersede(summary);
-      const opened = maybeAutoOpenReview(summary);
-      if (!known && summary.total > 0 && !opened) {
-        toast("Disk changes await review", {
-          kind: "",
-          body: `Studio is synced to disk. ${summary.total.toLocaleString()} disk ${summary.total === 1 ? "item" : "items"} can be pushed back if you want them.`,
-        });
-      }
-      break;
-    }
-    case "choice-made":
-      emit("divergence", null);
-      // Ours or someone else's: the modal decides, because only it knows
-      // whether it is mid-submission (see `resolvedElsewhere` in overwrite.js).
-      app.overwrite?.resolvedElsewhere(
-        typeof frame.choiceId === "string" ? frame.choiceId : null,
-        typeof frame.choice === "string" ? frame.choice : null,
-      );
-      break;
     case "project-init":
       // The daemon's own view of a project-init. The authoritative one is the
       // host's `project-init` event (the broker did the work and holds the
@@ -735,33 +664,7 @@ function onDaemonEvent(frame, projectId) {
   }
 }
 
-/** Design 7.0's `disk-review` event: aggregate counts, paged details. */
-function reviewSummary(frame, projectId) {
-  const count = (value) => (Number.isFinite(value) ? Number(value) : 0);
-  return {
-    projectId,
-    reviewId: typeof frame.reviewId === "string" ? frame.reviewId : null,
-    total: count(frame.total),
-    diskOnly: count(frame.diskOnly),
-    differs: count(frame.differs),
-  };
-}
 
-/** Aggregate counts only — the detail list is paged from the daemon (§7.3). */
-function divergenceSummary(frame, projectId) {
-  const count = (value) => (Number.isFinite(value) ? Number(value) : 0);
-  return {
-    projectId,
-    choiceId: typeof frame.choiceId === "string" ? frame.choiceId : null,
-    total: count(frame.total),
-    studioCount: count(frame.studioCount),
-    diskCount: count(frame.diskCount),
-    onlyOnDisk: count(frame.onlyOnDisk),
-    differs: count(frame.differs),
-    missingOnDisk: count(frame.missingOnDisk),
-    fixture: false,
-  };
-}
 
 // ------------------------------------------------------------- daemon HTTP --
 
@@ -769,6 +672,69 @@ function divergenceSummary(frame, projectId) {
  * Read an allowlisted daemon route (Design 5.2) through the host. Resolves for
  * any status: `{status, ok, body, text}`.
  */
+/** A daemon answer that is not ok, turned into the error a view can show. */
+function daemonRefusal(what, response) {
+  const detail =
+    (response?.body && (response.body.error ?? response.body.message)) ??
+    `HTTP ${response?.status ?? "?"}`;
+
+  return new HostError(response?.status === 503 ? "unavailable" : "daemon", `${what}: ${detail}`);
+}
+
+/**
+ * `GET /backlog` — the disk content that lost to Studio.
+ *
+ * Sync never asks a question, so this is a list of recoverable losers rather
+ * than anything pending: reading it changes nothing, and not reading it costs
+ * nothing but the entries' one-day life.
+ */
+async function fetchBacklog(projectId) {
+  const response = await daemonFetch(projectId, "/backlog");
+
+  if (response.status === 404) {
+    throw new HostError("unavailable", "This engine has no /backlog route.");
+  }
+  if (!response.ok) throw daemonRefusal("GET /backlog", response);
+
+  const body = response.body ?? {};
+  const entries = Array.isArray(body.entries) ? body.entries : [];
+
+  return {
+    projectId,
+    total: Number(body.total) || entries.length,
+    ttlSeconds: Number(body.ttlSeconds) || 0,
+    entries,
+  };
+}
+
+/**
+ * `POST /backlog/restore` — put one entry back on disk and push it to Studio.
+ *
+ * A 503 means Studio is not connected, which callers treat as a wait rather
+ * than a failure: restoring without a live channel would leave the file on disk
+ * for the next connect to send straight back here.
+ */
+async function restoreBacklogEntry(projectId, options = {}) {
+  const id = typeof options.id === "string" ? options.id.trim() : "";
+  if (!id) throw new HostError("invalid_argument", "a backlog id is required");
+
+  const response = await daemonPost(projectId, "/backlog/restore", { id });
+  if (!response.ok) throw daemonRefusal("POST /backlog/restore", response);
+
+  return response.body ?? {};
+}
+
+/** `POST /backlog/drop` — forget one entry, or all of them, without restoring. */
+async function dropBacklogEntries(projectId, options = {}) {
+  const payload = options.all === true ? { all: true } : { id: String(options.id ?? "").trim() };
+  if (payload.id === "") throw new HostError("invalid_argument", "a backlog id is required");
+
+  const response = await daemonPost(projectId, "/backlog/drop", payload);
+  if (!response.ok) throw daemonRefusal("POST /backlog/drop", response);
+
+  return response.body ?? {};
+}
+
 async function daemonFetch(projectId, route) {
   return host.daemonRequest(projectId, route);
 }
@@ -778,1154 +744,82 @@ async function daemonPost(projectId, route, body) {
   return host.daemonPost(projectId, route, body);
 }
 
-// ------------------------------------------------------ divergence (7.3) ----
-//
-// The client half of the choice contract. Everything here treats the daemon as
-// something to be *checked*, not trusted: Design 7.3 pages the divergence set
-// with dense sequential ids and answers every selection chunk with a receipt,
-// and both exist so a client can prove it received the set it acted on. A page
-// or a receipt that does not add up aborts loudly — a silently wrong selection
-// would overwrite the wrong instances in someone's place file.
-
-/** Contract: ≤1024 per page. Half that keeps one page's payload small. */
-const CHOICE_PAGE_LIMIT = 512;
-/** Design 7.3: ≤2048 ids and ≤64 KiB per selection chunk. */
-const SELECTION_CHUNK_IDS = 2048;
-const SELECTION_CHUNK_BYTES = 64 * 1024;
-/** Room for `{choiceId, submissionId, chunkIndex, finalChunk, restart}`. */
-const SELECTION_ENVELOPE_BYTES = 512;
-
-const DIVERGENCE_STATES = new Set(["only-on-disk", "differs", "missing-on-disk"]);
-
-function emptyChoiceStats() {
-  return { total: 0, studioCount: 0, diskCount: 0, onlyOnDisk: 0, differs: 0, missingOnDisk: 0 };
-}
-
-function countOf(value) {
-  return Number.isFinite(value) ? Number(value) : 0;
-}
-
-function normalizeChoiceStats(stats) {
-  const source = stats && typeof stats === "object" ? stats : {};
-  return {
-    total: countOf(source.total),
-    studioCount: countOf(source.studioCount),
-    diskCount: countOf(source.diskCount),
-    onlyOnDisk: countOf(source.onlyOnDisk),
-    differs: countOf(source.differs),
-    missingOnDisk: countOf(source.missingOnDisk),
-  };
-}
-
-function requireChoiceId(choiceId) {
-  if (typeof choiceId !== "string" || choiceId.trim() === "") {
-    throw new HostError("invalid_argument", "no choiceId was supplied");
-  }
-  return choiceId;
-}
-
-/** The daemon answered, and its answer was not usable. Never a silent retry. */
-function protocolError(message) {
-  return new HostError("protocol", message);
-}
-
-function daemonRefusal(route, response) {
-  const detail =
-    (typeof response.body?.error === "string" && response.body.error) ||
-    (typeof response.body?.message === "string" && response.body.message) ||
-    response.text ||
-    "";
-  const error = new HostError(
-    "daemon",
-    `${route} answered ${response.status}${detail ? `: ${detail}` : "."}`,
-  );
-  // The numeric status rides along for callers that can do better than a
-  // message — a 503 on a review push means "no Studio plugin yet", which is
-  // a wait-and-retry, not a failure.
-  error.status = response.status;
-  return error;
-}
-
-/**
- * `GET /choice` — is a divergence decision waiting, and how big is it?
- *
- * Aggregate stats only, by design (§7.2): the path list is never broadcast, it
- * is paged on demand by `fetchDivergenceDetails`.
- */
-async function fetchPendingChoice(projectId) {
-  const response = await daemonFetch(projectId, "/choice");
-  if (response.status === 404) {
-    throw new HostError("unavailable", "This engine has no /choice route.");
-  }
-  if (!response.ok) throw daemonRefusal("GET /choice", response);
-
-  const body = response.body ?? {};
-  if (body.pending !== true) {
-    return { projectId, pending: false, choiceId: null, stats: emptyChoiceStats() };
-  }
-  const choiceId = typeof body.choiceId === "string" ? body.choiceId.trim() : "";
-  if (!choiceId) {
-    throw protocolError("GET /choice reported a pending decision with no choiceId.");
-  }
-  return { projectId, pending: true, choiceId, stats: normalizeChoiceStats(body.stats) };
-}
-
-/**
- * `GET /choice/details` — one verified page of the frozen divergence set.
- *
- * One page per call, so the caller controls pacing and can render progressively
- * (Design 7.3: 25 000 entries must page, never arrive at once). The page is
- * checked before it is returned; see `verifyDetailPage` for what "checked"
- * means and why every rule is there.
- *
- * @param {string} projectId
- * @param {{choiceId: string, cursor?: number, limit?: number,
- *   expectedTotal?: number|null}} options
- */
-async function fetchDivergenceDetails(projectId, options = {}) {
-  const choiceId = requireChoiceId(options.choiceId);
-  const cursor = Number.isInteger(options.cursor) ? options.cursor : 0;
-  const limit = Math.min(Math.max(1, options.limit ?? CHOICE_PAGE_LIMIT), 1024);
-  if (cursor < 0) throw new HostError("invalid_argument", "cursor cannot be negative");
-
-  const route =
-    `/choice/details?choiceId=${encodeURIComponent(choiceId)}` +
-    `&cursor=${cursor}&limit=${limit}`;
-  const response = await daemonFetch(projectId, route);
-
-  if (response.status === 404 || response.status === 409) {
-    // The set is frozen and immutable: it can only vanish by being resolved or
-    // restarted, and either way anything already staged is stale.
-    throw new HostError(
-      "daemon",
-      "The divergence set is no longer available — it was resolved or restarted.",
-    );
-  }
-  if (!response.ok) throw daemonRefusal("GET /choice/details", response);
-
-  return verifyDetailPage(response.body ?? {}, {
-    choiceId,
-    cursor,
-    limit,
-    expectedTotal: Number.isInteger(options.expectedTotal) ? options.expectedTotal : null,
-  });
-}
-
-/**
- * Design 7.3's page-integrity contract, enforced client-side.
- *
- * The daemon promises dense sequential ids over an immutable set. That is a
- * checkable promise, and checking it is the point: ids are what a selection is
- * submitted as, so a page with a gap, a repeat, or a shifting `totalCount`
- * would submit ids that mean something different on the daemon's side than they
- * did in the list the user picked from.
- *
- * Refused, each with its own reason:
- * - a different `choiceId` (an answer about another set entirely)
- * - ids that are not exactly `cursor … cursor + n - 1` (gap, repeat, reorder)
- * - a `totalCount` that moved between pages, or is not a count
- * - more items than the requested limit, or than the set claims to hold
- * - a `nextCursor` that does not advance by exactly this page's length —
- *   including one that does not advance at all, which would page forever
- * - a last page that stops short of `totalCount`
- */
-function verifyDetailPage(body, expected) {
-  const fail = (why) => {
-    throw protocolError(
-      `GET /choice/details returned a page WSync cannot trust (${why}). ` +
-        "Nothing was staged; the list was abandoned rather than acted on.",
-    );
-  };
-
-  if (!body || typeof body !== "object") fail("the response was not a JSON object");
-  if (typeof body.choiceId !== "string" || body.choiceId !== expected.choiceId) {
-    fail(`it is about choiceId ${JSON.stringify(body.choiceId)}, not ${expected.choiceId}`);
-  }
-  if (!Array.isArray(body.items)) fail("items was not an array");
-  if (body.items.length > expected.limit) {
-    fail(`it holds ${body.items.length} items for a limit of ${expected.limit}`);
-  }
-  if (!Number.isInteger(body.totalCount) || body.totalCount < 0) {
-    fail(`totalCount was ${JSON.stringify(body.totalCount)}`);
-  }
-  if (expected.expectedTotal !== null && body.totalCount !== expected.expectedTotal) {
-    fail(`totalCount moved from ${expected.expectedTotal} to ${body.totalCount} mid-page`);
-  }
-
-  const items = body.items.map((item, index) => {
-    const at = expected.cursor + index;
-    if (!item || typeof item !== "object") fail(`entry ${at} was not an object`);
-    if (item.id !== at) {
-      // Dense and sequential from the cursor: this single check rules out gaps,
-      // repeats and reordering in one go.
-      fail(`entry ${index} carries id ${JSON.stringify(item.id)} where ${at} was due`);
-    }
-    if (!DIVERGENCE_STATES.has(item.state)) {
-      fail(`entry ${at} has state ${JSON.stringify(item.state)}`);
-    }
-    if (typeof item.instancePath !== "string" || item.instancePath === "") {
-      fail(`entry ${at} has no instancePath`);
-    }
-    if (item.path !== null && typeof item.path !== "string") {
-      fail(`entry ${at} has a path that is neither a string nor null`);
-    }
-    return {
-      id: item.id,
-      path: item.path ?? null,
-      instancePath: item.instancePath,
-      state: item.state,
-      class: typeof item.class === "string" ? item.class : null,
-    };
-  });
-
-  if (expected.cursor + items.length > body.totalCount) {
-    fail(`it runs past totalCount ${body.totalCount}`);
-  }
-
-  const hasNext = body.nextCursor !== undefined && body.nextCursor !== null;
-  if (hasNext) {
-    if (!Number.isInteger(body.nextCursor)) fail(`nextCursor was ${JSON.stringify(body.nextCursor)}`);
-    if (body.nextCursor !== expected.cursor + items.length) {
-      fail(
-        `nextCursor ${body.nextCursor} does not follow ${items.length} items from ${expected.cursor}`,
-      );
-    }
-    if (body.nextCursor >= body.totalCount) {
-      fail(`nextCursor ${body.nextCursor} is past the end of a ${body.totalCount}-entry set`);
-    }
-    if (items.length === 0) fail("it is empty but claims there is more");
-  } else if (expected.cursor + items.length !== body.totalCount) {
-    fail(
-      `it ends at ${expected.cursor + items.length} of ${body.totalCount} without a nextCursor`,
-    );
-  }
-
-  return {
-    choiceId: body.choiceId,
-    cursor: expected.cursor,
-    items,
-    nextCursor: hasNext ? body.nextCursor : null,
-    totalCount: body.totalCount,
-  };
-}
-
-/**
- * Contract: each side of `/choice/source` is at most 256 KiB. A UTF-8 payload
- * of that size cannot exceed this many JS string units, so anything longer is
- * a contract violation rather than a big file.
- */
-const SOURCE_MAX_CHARS = 256 * 1024;
-
-/**
- * `GET /choice/source` — one divergence row's two sides, for the inline diff.
- *
- * Lazily fetched per row and never as part of the set: Design 7.2 keeps the
- * divergence payload to classifications and paths, and shipping every script's
- * text with it would turn a 25 000-entry divergence into a gigabyte.
- *
- * The four documented answers are *outcomes*, not failures, because each one is
- * something the modal has to say in a row rather than a reason to blow up:
- *
- * - `ok` — both sides, either possibly `truncated`.
- * - `not-script` (400) — a property row. Staging decides these, not a differ.
- * - `no-plugin` (503) — Studio is not connected, so the Studio side does not
- *   exist to be read.
- * - `stale` (404) — the row or the whole set is gone. The caller takes the
- *   supersede path; every id on screen now addresses a set that was replaced.
- *
- * Anything else throws, including a 200 whose body does not describe the row
- * that was asked for.
- */
-async function fetchChoiceSource(projectId, options = {}) {
-  const choiceId = requireChoiceId(options.choiceId);
-  const id = options.id;
-  if (!Number.isInteger(id) || id < 0) {
-    throw new HostError("invalid_argument", "a source request needs a row id");
-  }
-
-  const route = `/choice/source?choiceId=${encodeURIComponent(choiceId)}&id=${id}`;
-  const response = await daemonFetch(projectId, route);
-
-  if (response.status === 404) return { status: "stale", id };
-  if (response.status === 400) {
-    return {
-      status: "not-script",
-      id,
-      message:
-        (typeof response.body?.error === "string" && response.body.error) ||
-        "This row is not a script.",
-    };
-  }
-  if (response.status === 503) {
-    return {
-      status: "no-plugin",
-      id,
-      message:
-        (typeof response.body?.error === "string" && response.body.error) ||
-        "No Studio plugin is connected.",
-    };
-  }
-  if (!response.ok) throw daemonRefusal("GET /choice/source", response);
-
-  return verifySourcePair(response.body ?? {}, { id, state: options.state ?? null });
-}
-
-/**
- * The row-source contract, checked before a line of it is rendered.
- *
- * The set is frozen and immutable (§7.2), so every one of these is a real
- * violation rather than a version skew: a body about a different row, a state
- * that moved under a frozen set, a side that is neither present nor absent, or
- * a source longer than the contract's own ceiling.
- */
-function verifySourcePair(body, expected) {
-  const fail = (why) => {
-    throw protocolError(
-      `GET /choice/source returned a row WSync cannot trust (${why}). Nothing was rendered.`,
-    );
-  };
-
-  if (!body || typeof body !== "object") fail("the response was not a JSON object");
-  if (body.id !== expected.id) {
-    fail(`it describes row ${JSON.stringify(body.id)}, not ${expected.id}`);
-  }
-  if (!DIVERGENCE_STATES.has(body.state)) fail(`state was ${JSON.stringify(body.state)}`);
-  if (expected.state !== null && body.state !== expected.state) {
-    fail(`state moved from ${expected.state} to ${body.state} under a frozen set`);
-  }
-
-  const side = (name) => {
-    const raw = body[name];
-    if (!raw || typeof raw !== "object") fail(`${name} was not an object`);
-    if (typeof raw.present !== "boolean") fail(`${name}.present was ${JSON.stringify(raw.present)}`);
-    if (raw.source !== undefined && raw.source !== null && typeof raw.source !== "string") {
-      fail(`${name}.source was neither a string nor absent`);
-    }
-    if (typeof raw.source === "string" && raw.source.length > SOURCE_MAX_CHARS) {
-      fail(`${name}.source is longer than the 256 KiB the contract allows`);
-    }
-    return {
-      present: raw.present,
-      source: typeof raw.source === "string" ? raw.source : null,
-      truncated: raw.truncated === true,
-    };
-  };
-
-  return {
-    status: "ok",
-    id: body.id,
-    path: typeof body.path === "string" && body.path !== "" ? body.path : null,
-    instancePath: typeof body.instancePath === "string" ? body.instancePath : "",
-    state: body.state,
-    disk: side("disk"),
-    studio: side("studio"),
-  };
-}
-
-const CHOICE_ANSWERS = new Set(["studio", "disk", "cancel"]);
-
-/**
- * `POST /choice` — the decision itself.
- *
- * Resolves to a typed outcome rather than a bare boolean, because the three
- * that matter read very differently to a user:
- *
- * - `applied` — the daemon did the work (Keep Disk pulls now).
- * - `pending-application` — the decision is recorded and the transfer is not
- *   built yet (Keep Studio). The caller must say exactly that; reporting it as
- *   success would promise files that never moved.
- * - `resolved-elsewhere` — a 409: the CLI or another window answered first.
- * - `cancelled` — the abort was recorded; the link stays up but unsynced.
- */
-async function submitChoice(projectId, choice, options = {}) {
-  if (!CHOICE_ANSWERS.has(choice)) {
-    throw new HostError("invalid_argument", `${JSON.stringify(choice)} is not a divergence answer`);
-  }
-  const choiceId = requireChoiceId(options.choiceId);
-  const payload = { choiceId, choice };
-  // Design 7.3: a selection covering the whole set upgrades to `mode:"all"`.
-  if (options.mode === "all") payload.mode = "all";
-
-  const response = await daemonPost(projectId, "/choice", payload);
-  if (response.status === 409 && response.body?.error === "resolved") {
-    return { status: "resolved-elsewhere", choiceId };
-  }
-  if (!response.ok) throw daemonRefusal("POST /choice", response);
-
-  const body = response.body ?? {};
-  if (body.ok !== true) throw daemonRefusal("POST /choice", response);
-  if (choice === "cancel") return { status: "cancelled", choiceId };
-  if (body.applied === true) return { status: "applied", choiceId };
-  if (body.pendingApplication === true) return { status: "pending-application", choiceId };
-  throw protocolError(
-    "POST /choice accepted the decision but reported neither applied nor pendingApplication.",
-  );
-}
-
-/** A submission id is only ever compared to itself; uniqueness is all it needs. */
-function newSubmissionId() {
-  const uuid = globalThis.crypto?.randomUUID;
-  if (typeof uuid === "function") return globalThis.crypto.randomUUID();
-  return `s_${Date.now().toString(36)}_${Math.floor(Math.random() * 2 ** 32).toString(36)}`;
-}
-
-/** Split ids into chunks inside both of Design 7.3's bounds at once. */
-function chunkSelection(ids) {
-  const chunks = [];
-  let current = [];
-  let bytes = SELECTION_ENVELOPE_BYTES;
-  for (const id of ids) {
-    const cost = String(id).length + 1;
-    if (current.length >= SELECTION_CHUNK_IDS || bytes + cost > SELECTION_CHUNK_BYTES) {
-      chunks.push(current);
-      current = [];
-      bytes = SELECTION_ENVELOPE_BYTES;
-    }
-    current.push(id);
-    bytes += cost;
-  }
-  if (current.length > 0 || chunks.length === 0) chunks.push(current);
-  return chunks;
-}
-
-/**
- * Every field of a chunk receipt, checked against what was actually sent.
- *
- * Design 7.3: "any receipt mismatch aborts with an explicit abort op". There is
- * no separate abort route in the contract — the abort *is* refusing to send the
- * next chunk, which leaves the partial submission uncommitted; the daemon
- * discards it when a later submission opens with `restart: true`.
- */
-function verifyReceipt(body, expected) {
-  const problems = [];
-  if (!body || typeof body !== "object") {
-    problems.push("the receipt was not a JSON object");
-  } else {
-    if (body.ok !== true) problems.push(`ok was ${JSON.stringify(body.ok)}`);
-    if (body.acceptedChunk !== expected.chunkIndex) {
-      problems.push(`acceptedChunk was ${JSON.stringify(body.acceptedChunk)}, sent ${expected.chunkIndex}`);
-    }
-    if (body.selectedCount !== expected.selectedCount) {
-      problems.push(
-        `selectedCount was ${JSON.stringify(body.selectedCount)}, ${expected.selectedCount} ids have been sent`,
-      );
-    }
-    if (expected.finalChunk) {
-      if (body.committed !== true) problems.push("the final chunk was not committed");
-      // The contract does not pin `nextChunk` past the end, so only a value
-      // that is positively wrong is treated as a mismatch.
-      const next = body.nextChunk;
-      if (next !== undefined && next !== null && next !== expected.chunkIndex + 1) {
-        problems.push(`nextChunk was ${JSON.stringify(next)} on the final chunk`);
-      }
-    } else {
-      if (body.committed === true) problems.push("committed arrived before the final chunk");
-      if (body.nextChunk !== expected.chunkIndex + 1) {
-        problems.push(`nextChunk was ${JSON.stringify(body.nextChunk)}, expected ${expected.chunkIndex + 1}`);
-      }
-    }
-  }
-  if (problems.length === 0) return;
-  throw protocolError(
-    `The daemon's receipt for chunk ${expected.chunkIndex} did not match what was sent ` +
-      `(${problems.join("; ")}). The submission was abandoned — nothing has been applied.`,
-  );
-}
-
-/**
- * `POST /choice/selection` — the staged ids, chunked, every receipt verified.
- *
- * Uploads only. The decision that acts on the committed selection is a separate
- * `POST /choice {choice:"disk"}`, per the contract, so the caller can report the
- * two phases separately.
- *
- * @param {string} projectId
- * @param {{choiceId: string, ids: number[],
- *   onProgress?: (progress: {sent: number, total: number, chunkIndex: number,
- *   chunkCount: number}) => void}} options
- */
-async function submitChoiceSelection(projectId, options = {}) {
-  const choiceId = requireChoiceId(options.choiceId);
-  const ids = Array.isArray(options.ids) ? options.ids : null;
-  if (!ids || ids.length === 0) {
-    throw new HostError("invalid_argument", "a selection needs at least one id");
-  }
-  if (!ids.every((id) => Number.isInteger(id) && id >= 0)) {
-    throw new HostError("invalid_argument", "selection ids must be non-negative integers");
-  }
-  const onProgress = typeof options.onProgress === "function" ? options.onProgress : () => {};
-
-  const submissionId = newSubmissionId();
-  const chunks = chunkSelection(ids);
-  let sent = 0;
-
-  for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
-    const chunk = chunks[chunkIndex];
-    const finalChunk = chunkIndex === chunks.length - 1;
-    const payload = { choiceId, submissionId, chunkIndex, finalChunk, ids: chunk };
-    // Chunk 0 always restarts: a previous abandoned submission must not be
-    // able to leave ids behind that this one would silently inherit.
-    if (chunkIndex === 0) payload.restart = true;
-
-    const response = await daemonPost(projectId, "/choice/selection", payload);
-    if (response.status === 409 && response.body?.error === "resolved") {
-      return { status: "resolved-elsewhere", choiceId, submissionId };
-    }
-    if (!response.ok) throw daemonRefusal("POST /choice/selection", response);
-
-    sent += chunk.length;
-    verifyReceipt(response.body, { chunkIndex, finalChunk, selectedCount: sent });
-    onProgress({ sent, total: ids.length, chunkIndex, chunkCount: chunks.length });
-  }
-
-  return { status: "committed", choiceId, submissionId, selectedCount: sent };
-}
-
-// -------------------------------------------------------- disk review (7.0) --
-//
-// The client half of Design 7.0's passive review. The engine has *already*
-// applied Studio → disk by the time any of this runs, so nothing here is a
-// decision about the sync — it is a list of disk items the apply left over, and
-// an optional push of some of them back into Studio.
-//
-// Everything is checked the same way the divergence set is, and for the same
-// reason: the ids in a page are what a push is submitted as. The one rule that
-// differs is density. A divergence set is frozen, so its ids run `cursor …
-// cursor + n - 1`; a review **shrinks** as items are pushed and keeps the ids
-// of what is left, so the check is "strictly increasing across the whole set"
-// rather than "dense from the cursor". Both rule out gaps, repeats and
-// reordering; only the second survives a partial push.
-
-/** Contract: ≤2048 ids per push call. */
-const PUSH_CHUNK_IDS = 2048;
-/** The same 64 KiB envelope the selection chunks use. */
-const PUSH_CHUNK_BYTES = 64 * 1024;
-
-const REVIEW_STATES = new Set(["disk-only", "differs"]);
-
-function emptyReviewStats() {
-  return { total: 0, diskOnly: 0, differs: 0 };
-}
-
-function normalizeReviewStats(stats) {
-  const source = stats && typeof stats === "object" ? stats : {};
-  return {
-    total: countOf(source.total),
-    diskOnly: countOf(source.diskOnly),
-    differs: countOf(source.differs),
-  };
-}
-
-function requireReviewId(reviewId) {
-  if (typeof reviewId !== "string" || reviewId.trim() === "") {
-    throw new HostError("invalid_argument", "no reviewId was supplied");
-  }
-  return reviewId;
-}
-
-/** `GET /review` — is a disk review pending, and how big is it? */
-async function fetchPendingReview(projectId) {
-  const response = await daemonFetch(projectId, "/review");
-  if (response.status === 404) {
-    throw new HostError("unavailable", "This engine has no /review route.");
-  }
-  if (!response.ok) throw daemonRefusal("GET /review", response);
-
-  const body = response.body ?? {};
-  if (body.pending !== true) {
-    return { projectId, pending: false, reviewId: null, stats: emptyReviewStats() };
-  }
-  const reviewId = typeof body.reviewId === "string" ? body.reviewId.trim() : "";
-  if (!reviewId) {
-    throw protocolError("GET /review reported a pending review with no reviewId.");
-  }
-  return { projectId, pending: true, reviewId, stats: normalizeReviewStats(body.stats) };
-}
-
-/**
- * `GET /review/details` — one verified page of the pending review.
- *
- * @param {string} projectId
- * @param {{reviewId: string, cursor?: number, limit?: number,
- *   expectedTotal?: number|null, after?: number|null}} options
- */
-async function fetchReviewDetails(projectId, options = {}) {
-  const reviewId = requireReviewId(options.reviewId);
-  const cursor = Number.isInteger(options.cursor) ? options.cursor : 0;
-  const limit = Math.min(Math.max(1, options.limit ?? CHOICE_PAGE_LIMIT), 1024);
-  if (cursor < 0) throw new HostError("invalid_argument", "cursor cannot be negative");
-
-  const route =
-    `/review/details?reviewId=${encodeURIComponent(reviewId)}` + `&cursor=${cursor}&limit=${limit}`;
-  const response = await daemonFetch(projectId, route);
-
-  if (response.status === 404 || response.status === 409) {
-    throw new HostError(
-      "daemon",
-      "That disk review is no longer available — it was pushed, dismissed, or replaced by a new connect.",
-    );
-  }
-  if (!response.ok) throw daemonRefusal("GET /review/details", response);
-
-  return verifyReviewPage(response.body ?? {}, {
-    reviewId,
-    cursor,
-    limit,
-    expectedTotal: Number.isInteger(options.expectedTotal) ? options.expectedTotal : null,
-  });
-}
-
-/**
- * The review page contract, checked before a row is drawn from it.
- *
- * Refused, each with its own reason:
- * - a different `reviewId` (a page about another set entirely)
- * - a non-integer, negative, or out-of-order id — the ids are what a push
- *   names, and a repeat would push one item twice while missing another
- * - a `totalCount` that moved between pages, or is not a count
- * - more items than the requested limit, or than the set claims to hold
- * - a `nextCursor` that does not advance by exactly this page's length
- * - a last page that stops short of `totalCount`
- */
-function verifyReviewPage(body, expected) {
-  const fail = (why) => {
-    throw protocolError(
-      `GET /review/details returned a page WSync cannot trust (${why}). ` +
-        "Nothing was picked; the list was abandoned rather than acted on.",
-    );
-  };
-
-  if (!body || typeof body !== "object") fail("the response was not a JSON object");
-  if (typeof body.reviewId !== "string" || body.reviewId !== expected.reviewId) {
-    fail(`it is about reviewId ${JSON.stringify(body.reviewId)}, not ${expected.reviewId}`);
-  }
-  if (!Array.isArray(body.items)) fail("items was not an array");
-  if (body.items.length > expected.limit) {
-    fail(`it holds ${body.items.length} items for a limit of ${expected.limit}`);
-  }
-  if (!Number.isInteger(body.totalCount) || body.totalCount < 0) {
-    fail(`totalCount was ${JSON.stringify(body.totalCount)}`);
-  }
-  if (expected.expectedTotal !== null && body.totalCount !== expected.expectedTotal) {
-    fail(`totalCount moved from ${expected.expectedTotal} to ${body.totalCount} mid-page`);
-  }
-
-  let previousId = -1;
-  const items = body.items.map((item, index) => {
-    const at = expected.cursor + index;
-    if (!item || typeof item !== "object") fail(`entry ${at} was not an object`);
-    if (!Number.isInteger(item.id) || item.id < 0) {
-      fail(`entry ${at} carries id ${JSON.stringify(item.id)}`);
-    }
-    if (item.id <= previousId) {
-      fail(`entry ${at} carries id ${item.id} after ${previousId}; ids must increase`);
-    }
-    previousId = item.id;
-    if (!REVIEW_STATES.has(item.state)) fail(`entry ${at} has state ${JSON.stringify(item.state)}`);
-    // A review entry is a *disk* item, so it always has a file path; the
-    // instance path is what may be missing, for a file Studio has never seen.
-    if (typeof item.path !== "string" || item.path === "") fail(`entry ${at} has no path`);
-    if (item.instancePath !== null && typeof item.instancePath !== "string") {
-      fail(`entry ${at} has an instancePath that is neither a string nor null`);
-    }
-    return {
-      id: item.id,
-      path: item.path,
-      instancePath: item.instancePath ?? null,
-      state: item.state,
-      class: typeof item.class === "string" ? item.class : null,
-    };
-  });
-
-  if (expected.cursor + items.length > body.totalCount) {
-    fail(`it runs past totalCount ${body.totalCount}`);
-  }
-
-  const hasNext = body.nextCursor !== undefined && body.nextCursor !== null;
-  if (hasNext) {
-    if (!Number.isInteger(body.nextCursor)) fail(`nextCursor was ${JSON.stringify(body.nextCursor)}`);
-    if (body.nextCursor !== expected.cursor + items.length) {
-      fail(`nextCursor ${body.nextCursor} does not follow ${items.length} items from ${expected.cursor}`);
-    }
-    if (body.nextCursor >= body.totalCount) {
-      fail(`nextCursor ${body.nextCursor} is past the end of a ${body.totalCount}-entry review`);
-    }
-    if (items.length === 0) fail("it is empty but claims there is more");
-  } else if (expected.cursor + items.length !== body.totalCount) {
-    fail(`it ends at ${expected.cursor + items.length} of ${body.totalCount} without a nextCursor`);
-  }
-
-  return {
-    reviewId: body.reviewId,
-    cursor: expected.cursor,
-    items,
-    nextCursor: hasNext ? body.nextCursor : null,
-    totalCount: body.totalCount,
-  };
-}
-
-/** Split ids into chunks inside both of the push contract's bounds at once. */
-function chunkPush(ids) {
-  const chunks = [];
-  let current = [];
-  let bytes = SELECTION_ENVELOPE_BYTES;
-  for (const id of ids) {
-    const cost = String(id).length + 1;
-    if (current.length >= PUSH_CHUNK_IDS || bytes + cost > PUSH_CHUNK_BYTES) {
-      chunks.push(current);
-      current = [];
-      bytes = SELECTION_ENVELOPE_BYTES;
-    }
-    current.push(id);
-    bytes += cost;
-  }
-  if (current.length > 0 || chunks.length === 0) chunks.push(current);
-  return chunks;
-}
-
-/**
- * `POST /review/push` — push chosen disk items into Studio.
- *
- * Two shapes, both repeatable: `{mode:"all"}` for everything still pending, or
- * an id list that is chunked at 2048. Each answer is `{ok, pushed, remaining}`
- * and each is checked before the next chunk goes out:
- *
- * - `pushed` never exceeds what the chunk asked for;
- * - `remaining` never goes *up*, and never survives a push that claims to have
- *   moved more than was left.
- *
- * An unchecked `remaining` is the field that matters: it is what tells the
- * modal whether the review is finished, and a daemon that under-reports it
- * would leave items stranded with the UI claiming success.
- *
- * `knownRemaining` is the caller's own count of what was pending — the size of
- * the list it is looking at. Passing it is what makes the *first* answer
- * checkable rather than taken on faith: without it there is nothing to compare
- * the first `remaining` against. A review only ever shrinks under a live
- * `reviewId` (a bigger one arrives as a new id), so "remaining is at most what
- * I knew, minus what this call pushed" holds even if another client is pushing
- * at the same time.
- *
- * @param {string} projectId
- * @param {{reviewId: string, mode?: "all", ids?: number[],
- *   knownRemaining?: number|null,
- *   onProgress?: (progress: {pushed: number, total: number, chunkIndex: number,
- *   chunkCount: number, remaining: number}) => void}} options
- */
-async function pushReview(projectId, options = {}) {
-  const reviewId = requireReviewId(options.reviewId);
-  const onProgress = typeof options.onProgress === "function" ? options.onProgress : () => {};
-  const known = Number.isInteger(options.knownRemaining) ? options.knownRemaining : null;
-
-  if (options.mode === "all") {
-    const answer = await postReview(projectId, "/review/push", { reviewId, mode: "all" });
-    if (answer.status === "gone") return answer;
-    const receipt = verifyPushReceipt(answer.body, { requested: null, remainingBefore: known });
-    return { status: "pushed", reviewId, ...receipt };
-  }
-
-  const ids = Array.isArray(options.ids) ? options.ids : null;
-  if (!ids || ids.length === 0) {
-    throw new HostError("invalid_argument", "a push needs at least one id");
-  }
-  if (!ids.every((id) => Number.isInteger(id) && id >= 0)) {
-    throw new HostError("invalid_argument", "push ids must be non-negative integers");
-  }
-
-  const chunks = chunkPush(ids);
-  let pushed = 0;
-  let remaining = known;
-
-  for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
-    const chunk = chunks[chunkIndex];
-    const answer = await postReview(projectId, "/review/push", { reviewId, ids: chunk });
-    if (answer.status === "gone") return answer;
-
-    const receipt = verifyPushReceipt(answer.body, {
-      requested: chunk.length,
-      remainingBefore: remaining,
-    });
-    pushed += receipt.pushed;
-    remaining = receipt.remaining;
-    onProgress({
-      pushed,
-      total: ids.length,
-      chunkIndex,
-      chunkCount: chunks.length,
-      remaining,
-    });
-  }
-
-  return { status: "pushed", reviewId, pushed, remaining };
-}
-
-/** `POST /review/dismiss` — drop the review without pushing anything. */
-async function dismissReview(projectId, options = {}) {
-  const reviewId = requireReviewId(options.reviewId);
-  const answer = await postReview(projectId, "/review/dismiss", { reviewId });
-  if (answer.status === "gone") return answer;
-  if (answer.body?.ok !== true) {
-    throw protocolError("POST /review/dismiss answered without ok:true.");
-  }
-  return { status: "dismissed", reviewId };
-}
-
-/**
- * The shared half of both writes: a 404 is "that review is gone" — pushed out
- * by someone else, dismissed, or replaced by a new connect — and never a
- * failure to report as one.
- */
-async function postReview(projectId, route, payload) {
-  const response = await daemonPost(projectId, route, payload);
-  if (response.status === 404 || response.status === 409) {
-    return { status: "gone", body: null };
-  }
-  if (!response.ok) throw daemonRefusal(`POST ${route}`, response);
-  return { status: "ok", body: response.body ?? {} };
-}
-
-function verifyPushReceipt(body, expected) {
-  const problems = [];
-  if (!body || typeof body !== "object") {
-    problems.push("the receipt was not a JSON object");
-  } else {
-    if (body.ok !== true) problems.push(`ok was ${JSON.stringify(body.ok)}`);
-    if (!Number.isInteger(body.pushed) || body.pushed < 0) {
-      problems.push(`pushed was ${JSON.stringify(body.pushed)}`);
-    } else if (expected.requested !== null && body.pushed > expected.requested) {
-      problems.push(`pushed ${body.pushed} of ${expected.requested} requested ids`);
-    }
-    if (!Number.isInteger(body.remaining) || body.remaining < 0) {
-      problems.push(`remaining was ${JSON.stringify(body.remaining)}`);
-    } else if (expected.remainingBefore !== null) {
-      if (body.remaining > expected.remainingBefore) {
-        problems.push(`remaining rose from ${expected.remainingBefore} to ${body.remaining}`);
-      } else if (
-        Number.isInteger(body.pushed) &&
-        expected.remainingBefore - body.remaining < body.pushed
-      ) {
-        problems.push(
-          `remaining fell from ${expected.remainingBefore} to ${body.remaining} for ${body.pushed} pushed`,
-        );
-      }
-    }
-  }
-  if (problems.length > 0) {
-    throw protocolError(
-      `The daemon's answer to a review push did not add up (${problems.join("; ")}). ` +
-        "The push was abandoned; whatever it already applied is in Studio and the rest is untouched.",
-    );
-  }
-  return { pushed: body.pushed, remaining: body.remaining };
-}
-
-// ------------------------------------------------------- conflicts (6.3) ----
-
-/**
- * `POST /resolve` — answer one parked conflict.
- *
- * `keep` and `choice` carry the same value in the contract; both are sent
- * rather than one guessed at. The conflict id is passed through exactly as the
- * daemon reported it — it is the daemon's handle, not something to reformat.
- *
- * A 404 is reported as `already-resolved`, not as a failure: the id is only
- * unknown because someone (the CLI, another window, the plugin) answered it
- * first, and the card should disappear rather than turn red.
- */
-async function resolveConflict(projectId, conflict, keep) {
-  if (keep !== "local" && keep !== "studio") {
-    throw new HostError("invalid_argument", `${JSON.stringify(keep)} is not a conflict answer`);
-  }
-  const id = conflict?.id;
-  if (typeof id !== "string" && !Number.isInteger(id)) {
-    throw new HostError("invalid_argument", "the conflict carried no usable id");
-  }
-
-  const payload = { id, keep, choice: keep };
-  if (typeof conflict?.path === "string" && conflict.path !== "") payload.path = conflict.path;
-
-  const response = await daemonPost(projectId, "/resolve", payload);
-  if (response.status === 404) return { status: "already-resolved", id };
-  if (!response.ok) throw daemonRefusal("POST /resolve", response);
-
-  const body = response.body ?? {};
-  if (body.ok !== true) throw daemonRefusal("POST /resolve", response);
-  if (body.resolved !== undefined && body.resolved !== id) {
-    throw protocolError(
-      `POST /resolve acknowledged ${JSON.stringify(body.resolved)} for a request about ${JSON.stringify(id)}.`,
-    );
-  }
-  return { status: "resolved", id };
-}
-
 // --------------------------------------------------------- conflict polling --
 
-/** Design 8.2: 20 s poll, plus invalidation whenever a `conflict` event lands. */
-const CONFLICT_POLL_MS = 20_000;
-let conflictTimer = null;
-let conflictPollInFlight = false;
+/**
+ * Keep the backlog badge honest on a timer.
+ *
+ * The `backlog` event is the fast path, but not the only one: content that
+ * lost while this app was closed would otherwise never show a count. Reading
+ * the list is cheap and changes nothing, so it rides the same cadence the
+ * conflict poll used to.
+ */
+async function pollBacklog() {
+  await refreshBacklog();
 
-async function pollConflicts() {
-  const served = servedProjectIds();
-  if (!IS_TAURI || served.length === 0) {
-    app.conflictsUnsupported.clear();
-    conflictBadge.report(0);
-    emit("conflicts", { items: [], total: 0, partial: false, unsupported: 0, unreachable: 0, served: 0 });
-    await refreshPendingChoice();
-    await refreshPendingReview();
-    return;
-  }
-  if (conflictPollInFlight) return;
-  conflictPollInFlight = true;
+  const total = app.backlog?.total ?? 0;
 
-  const items = [];
-  let total = 0;
-  let partial = false;
-  let unsupported = 0;
-  let unreachable = 0;
-
-  try {
-    for (const projectId of served) {
-      let response;
-      try {
-        response = await daemonFetch(projectId, "/resolve");
-      } catch {
-        unreachable += 1;
-        continue;
-      }
-
-      if (response.status === 404) {
-        // An engine that predates the conflict engine. Report "unknown", never
-        // "zero" — a wrong zero would read as "nothing to resolve".
-        app.conflictsUnsupported.add(projectId);
-        unsupported += 1;
-        continue;
-      }
-      app.conflictsUnsupported.delete(projectId);
-      if (!response.ok) {
-        unreachable += 1;
-        continue;
-      }
-
-      const body = response.body ?? {};
-      const list = Array.isArray(body.conflicts) ? body.conflicts : Array.isArray(body) ? body : [];
-      for (const conflict of list) items.push({ ...conflict, projectId });
-      total += Number.isFinite(body.total) ? Number(body.total) : list.length;
-      partial ||= body.partial === true || list.length < total;
-    }
-  } finally {
-    conflictPollInFlight = false;
-  }
-
-  const allUnsupported = unsupported === served.length;
-  const nothingAnswered = unsupported + unreachable === served.length;
-  if (allUnsupported) {
-    conflictBadge.report(null, { note: "This engine predates the conflict engine." });
-  } else if (nothingAnswered) {
-    conflictBadge.report(null, { note: "No daemon answered /resolve." });
-  } else {
-    conflictBadge.report(total, { partial });
-  }
-
-  emit("conflicts", {
-    items,
-    total,
-    partial,
-    unsupported,
-    unreachable,
-    served: served.length,
-  });
-
-  // Same cadence, same triggers: a pending divergence is the set-level half of
-  // the same question the conflict list answers item by item (Design 7.5).
-  await refreshPendingChoice();
-  await refreshPendingReview();
+  conflictBadge.report(total);
 }
 
-function startConflictPolling() {
+function startBacklogPolling() {
   if (conflictTimer !== null) return;
-  conflictTimer = setInterval(() => void pollConflicts(), CONFLICT_POLL_MS);
-  void pollConflicts();
+  conflictTimer = setInterval(() => void pollBacklog(), CONFLICT_POLL_MS);
+  void pollBacklog();
 }
 
 /**
- * Ask the linked daemon whether a divergence decision is waiting.
+ * Poll `GET /backlog` and keep the banner's count honest.
  *
- * The `choice-needed` event is the fast path, but it is not the only one: a
- * choice raised before this app connected — or while it was reconnecting —
- * would otherwise never produce a banner. `GET /choice` is the durable truth,
- * so it rides the same 20 s cadence as the conflict poll.
+ * Nothing here opens itself. Sync never asks a question, so the backlog is
+ * something you go and look at when you want it — a window that appeared over
+ * your work to tell you a file lost would be the interruption this whole model
+ * exists to remove.
  *
- * One project at a time, deliberately: the socket follows one served project
- * and the modal can only answer one choice, so a second project's banner would
- * be an offer the app cannot honour.
+ * An engine without `/backlog` (or one not answering) leaves whatever the
+ * banner already says alone: claiming "nothing waiting" on a failed read would
+ * hide entries that are really there.
  */
-async function refreshPendingChoice() {
-  // The dev fixture is not a daemon's answer; never let a poll clear it.
-  if (app.pendingDivergence?.fixture === true) return;
-
+async function refreshBacklog() {
   const projectId = linkProjectId();
   if (!IS_TAURI || !projectId) {
-    if (app.pendingDivergence) emit("divergence", null);
+    if (app.backlog) emit("backlog", null);
     return;
   }
 
-  let choice;
+  let backlog;
   try {
-    choice = await fetchPendingChoice(projectId);
-  } catch {
-    // An engine without `/choice`, or one that is not answering. Leave whatever
-    // the banner already says alone rather than claiming the choice is gone.
-    return;
-  }
-
-  if (!choice.pending) {
-    if (app.pendingDivergence) emit("divergence", null);
-    return;
-  }
-  if (app.pendingDivergence?.choiceId === choice.choiceId) return;
-  emit("divergence", { projectId, choiceId: choice.choiceId, ...choice.stats, fixture: false });
-}
-
-/**
- * Ask the linked daemon whether a disk review is waiting (Design 7.0).
- *
- * The `disk-review` event is the fast path; this is the durable one, for a
- * review raised before the app connected — which is the normal case, since the
- * daemon raises it the moment Studio connects and the app may well have been
- * started afterwards.
- *
- * An engine without `/review` (or one that is not answering) leaves whatever
- * the banner already says alone: claiming "no review" on a failed read would
- * hide a real one.
- */
-async function refreshPendingReview() {
-  const projectId = linkProjectId();
-  if (!IS_TAURI || !projectId) {
-    if (app.pendingReview) emit("review", null);
-    return;
-  }
-
-  let review;
-  try {
-    review = await fetchPendingReview(projectId);
+    backlog = await fetchBacklog(projectId);
   } catch {
     return;
   }
 
-  if (!review.pending) {
-    if (app.pendingReview) emit("review", null);
-    // There is no "someone else answered it" event in the contract — a review
-    // is answered by a push or a dismiss, and the poll is how this window finds
-    // out about another client's. An open modal is then showing a list of ids
-    // the daemon has dropped, so it is told rather than left there.
-    app.review?.resolvedElsewhere();
-    return;
+  const summary = backlog.total > 0 ? { projectId, total: backlog.total } : null;
+  const known = app.backlog;
+
+  if (known?.total !== summary?.total || known?.projectId !== summary?.projectId) {
+    emit("backlog", summary);
   }
-  const summary = { projectId, reviewId: review.reviewId, ...review.stats };
-  // The same review with a smaller count is still news: another client (or this
-  // one's modal) pushed part of it, and the banner is a number.
-  const known = app.pendingReview;
-  if (!(known?.reviewId === review.reviewId && known.total === review.stats.total)) {
-    emit("review", summary);
-  }
-  // Checked even when nothing changed: an auto-open blocked earlier (another
-  // modal was up) gets its retry on this cadence.
-  maybeAutoOpenReview(summary);
 }
 
 /**
- * The initial-sync popup (Design 7.0 revised): when a review with anything in
- * it is reported for the served project — by the `disk-review` event or the
- * `GET /review` poll — the picker opens itself as a dismissible overlay.
- *
- * Once per reviewId, ever: Escape backgrounds it to the banner, and a
- * reconnect re-broadcasting the same set must not shove it back at a user who
- * closed it. A *new* reviewId is a new set and opens fresh. Marked as shown
- * only when the modal really opened — if another overlay held the modal root,
- * the next event or poll tries again.
- *
- * @returns {boolean} true when this call opened the modal.
+ * Open the backlog window. One at a time, and only ever because the user asked
+ * — there is no auto-open counterpart, by design.
  */
-function maybeAutoOpenReview(summary) {
-  if (!summary?.reviewId || !(summary.total > 0)) return false;
-  if (summary.projectId !== linkProjectId()) return false;
-  if (app.reviewAutoShown.has(summary.reviewId)) return false;
-  if (app.review) return false;
-  const handle = openDiskReviewModal({ review: summary });
-  if (!handle) return false;
-  app.reviewAutoShown.add(summary.reviewId);
-  return true;
-}
+function openBacklog(options = {}) {
+  if (app.backlogWindow) return app.backlogWindow;
 
-/**
- * Open the divergence modal, holding on to its handle so daemon events can
- * reach it. One at a time: a second call while one is open returns the open one.
- */
-function openDivergenceModal(options = {}) {
-  if (app.overwrite) return app.overwrite;
-  const handle = openOverwriteModal(buildApi(), {
+  const handle = openBacklogModal(buildApi(), {
     ...options,
+    projectId: options.projectId ?? linkProjectId(),
     onClosed: () => {
-      app.overwrite = null;
+      app.backlogWindow = null;
+      void refreshBacklog();
     },
   });
-  // A modal that refused to open (no divergence to show) never registers.
-  app.overwrite = handle?.close ? handle : null;
-  return handle;
-}
 
-/**
- * Open the disk-review modal. Same one-at-a-time rule, and the same reason for
- * holding the handle: a `disk-review` for a *new* set has to be able to close
- * a window holding ids the daemon has dropped.
- *
- * Two callers: the banner's Review button, and `maybeAutoOpenReview` — the
- * initial-sync popup that opens once per reviewId when the review arrives.
- * Either way it is a dismissible overlay over a sync that already happened;
- * nothing waits on it.
- */
-function openDiskReviewModal(options = {}) {
-  if (app.review) return app.review;
-  const seed = options.review ?? app.pendingReview;
-  if (!seed) return null;
-  const handle = openReviewModal(buildApi(), {
-    ...options,
-    review: seed,
-    onClosed: () => {
-      app.review = null;
-    },
-  });
-  app.review = handle?.close ? handle : null;
+  app.backlogWindow = handle?.close ? handle : null;
   return handle;
-}
-
-/**
- * The banner's Skip: tell the daemon the review can go, and drop the banner.
- * The same decision as the modal's Skip — keep Studio's versions everywhere.
- *
- * A 404 is success — someone else already answered it — because the user's
- * intent was "stop showing me this", and it has been met either way.
- */
-async function dismissPendingReview() {
-  const pending = app.pendingReview;
-  if (!pending?.projectId || !pending.reviewId) {
-    emit("review", null);
-    return true;
-  }
-  try {
-    await dismissReview(pending.projectId, { reviewId: pending.reviewId });
-    emit("review", null);
-    setStatus("Skipped — Studio's versions are kept everywhere.", "");
-    return true;
-  } catch (error) {
-    setStatus("The review could not be skipped.", "err");
-    toast("Could not skip the review", {
-      kind: "err",
-      body: error instanceof HostError ? error.message : String(error),
-    });
-    return false;
-  }
 }
 
 // --------------------------------------------------------- shell chrome ----
@@ -1983,7 +877,7 @@ const conflictBadge = {
       $conflictsBadge.hidden = false;
       $conflictsBadge.dataset.state = "unknown";
       $conflictsBadge.textContent = "—";
-      $conflictsBadge.title = note || "Conflict count has not been checked";
+      $conflictsBadge.title = note || "Backlog has not been checked";
       return;
     }
     if (count === 0) {
@@ -1993,7 +887,7 @@ const conflictBadge = {
     $conflictsBadge.hidden = false;
     $conflictsBadge.dataset.state = "some";
     $conflictsBadge.textContent = partial ? `${count}+` : String(count);
-    $conflictsBadge.title = `${count}${partial ? " or more" : ""} parked conflicts`;
+    $conflictsBadge.title = `${count}${partial ? " or more" : ""} files waiting in the backlog`;
   },
   invalidate() {
     app.conflictCount = null;
@@ -2049,19 +943,11 @@ function buildApi() {
     getPluginStatus: (projectId) => app.plugin.get(projectId ?? linkProjectId()) ?? null,
 
     // conflicts + divergence data layer
-    refreshConflicts: () => pollConflicts(),
-    resolveConflict: (projectId, conflict, keep) => resolveConflict(projectId, conflict, keep),
-    fetchPendingChoice,
-    fetchDivergenceDetails,
-    fetchChoiceSource,
-    submitChoice,
-    submitChoiceSelection,
-
-    // the disk review (Design 7.0)
-    fetchPendingReview,
-    fetchReviewDetails,
-    pushReview,
-    dismissReview,
+    refreshBacklog: () => pollBacklog(),
+    // the backlog
+    fetchBacklog,
+    restoreBacklogEntry,
+    dropBacklogEntries,
 
     // the last-edited ledger (Design 7.3), read-only from a view's side
     lastEditedStamps: (projectId) => lastEdited.stampsFor(projectId),
@@ -2074,11 +960,9 @@ function buildApi() {
     navigate,
     reportConflictCount: conflictBadge.report,
     invalidateConflictCount: conflictBadge.invalidate,
-    getPendingDivergence: () => app.pendingDivergence,
-    openOverwriteModal: (options) => openDivergenceModal(options),
-    getPendingReview: () => app.pendingReview,
-    openReviewModal: (options) => openDiskReviewModal(options),
-    dismissPendingReview: () => dismissPendingReview(),
+    getBacklog: () => app.backlog,
+    getServedProjectId: () => linkProjectId(),
+    openBacklog: (options) => openBacklog(options),
 
     // host
     host,
@@ -2186,15 +1070,15 @@ async function boot() {
   installHostEventListeners();
   await reconcileSessions();
   refreshLink();
-  startConflictPolling();
+  startBacklogPolling();
   // Seed the broker mirror: `broker:up` may already have fired during boot, and
   // a folder that is authorized but cannot bind never fires one at all.
   void refreshBrokerStatus();
 
-  // Dev affordance: `index.html?dev=overwrite` renders the divergence modal
-  // from its fixture so the layout can be reviewed without a daemon.
-  if (new URLSearchParams(location.search).get("dev") === "overwrite") {
-    openDivergenceModal({ fixture: true });
+  // Dev affordance: `index.html?dev=backlog` opens the backlog window so the
+  // layout can be reviewed without waiting for something to lose to Studio.
+  if (new URLSearchParams(location.search).get("dev") === "backlog") {
+    openBacklog({});
   }
 }
 
@@ -2295,7 +1179,7 @@ function installHostEventListeners() {
       emit("daemon", { projectId, ok: false, reason: event.reason });
     }
     refreshLink();
-    void pollConflicts();
+    void pollBacklog();
   });
 }
 

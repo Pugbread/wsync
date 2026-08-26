@@ -70,8 +70,10 @@ async fn grow_second_module(daemon: &TestDaemon) -> String {
 	}
 }
 
-/// Commits a one-row divergence set (update Hello) and returns the choiceId
-async fn commit_hello_update(daemon: &TestDaemon, hello: &str, submission: &str) -> String {
+/// Commits a one-row divergence set (update Hello). Sync is Studio-first with
+/// no choice to make, so the commit runs the apply and this receipt is the
+/// apply's own receipt
+async fn commit_hello_update(daemon: &TestDaemon, hello: &str, submission: &str) -> Value {
 	let (status, receipt) = post_json(
 		daemon,
 		"/compare",
@@ -90,7 +92,7 @@ async fn commit_hello_update(daemon: &TestDaemon, hello: &str, submission: &str)
 	assert_eq!(status, 200);
 	assert_eq!(receipt["committed"], true);
 
-	receipt["choiceId"].as_str().unwrap().to_owned()
+	receipt
 }
 
 #[tokio::test]
@@ -136,17 +138,9 @@ async fn keep_studio_applies_with_staging_backups_and_baselines() {
 	)
 	.await;
 
-	let choice_id = commit_hello_update(&daemon, &hello, "sub-happy").await;
-
-	let (status, receipt) = post_json(
-		&daemon,
-		"/choice",
-		&json!({ "choiceId": choice_id, "choice": "studio", "mode": "all" }),
-	)
-	.await;
+	let receipt = commit_hello_update(&daemon, &hello, "sub-happy").await;
 
 	// Pinned success receipt
-	assert_eq!(status, 200);
 	assert_eq!(receipt["ok"], true, "receipt: {receipt}");
 	assert_eq!(receipt["applied"], true);
 	assert_eq!(receipt["direction"], "studio");
@@ -287,17 +281,9 @@ async fn sha256_mismatch_aborts_without_touching_the_live_root() {
 	)
 	.await;
 
-	let choice_id = commit_hello_update(&daemon, &hello, "sub-corrupt").await;
-
-	let (status, receipt) = post_json(
-		&daemon,
-		"/choice",
-		&json!({ "choiceId": choice_id, "choice": "studio", "mode": "all" }),
-	)
-	.await;
+	let receipt = commit_hello_update(&daemon, &hello, "sub-corrupt").await;
 
 	// Pinned partial receipt: HTTP 200, replayable and honest
-	assert_eq!(status, 200);
 	assert_eq!(receipt["ok"], false);
 	assert_eq!(receipt["action"], "partial");
 	assert_eq!(receipt["recoveryRequired"], true);
@@ -364,16 +350,8 @@ async fn fence_refuses_when_the_disk_moves_mid_apply() {
 	)
 	.await;
 
-	let choice_id = commit_hello_update(&daemon, &hello, "sub-fence").await;
+	let receipt = commit_hello_update(&daemon, &hello, "sub-fence").await;
 
-	let (status, receipt) = post_json(
-		&daemon,
-		"/choice",
-		&json!({ "choiceId": choice_id, "choice": "studio", "mode": "all" }),
-	)
-	.await;
-
-	assert_eq!(status, 200);
 	assert_eq!(receipt["ok"], false);
 	assert_eq!(receipt["action"], "partial");
 	assert_eq!(receipt["failedRoot"], "ReplicatedStorage");
@@ -488,17 +466,9 @@ async fn partial_failure_keeps_committed_roots_and_their_backups() {
 		}),
 	)
 	.await;
-	assert_eq!(status, 200);
-	let choice_id = receipt["choiceId"].as_str().unwrap().to_owned();
 
-	let (status, receipt) = post_json(
-		&daemon,
-		"/choice",
-		&json!({ "choiceId": choice_id, "choice": "studio", "mode": "all" }),
-	)
-	.await;
-
-	// Pinned partial receipt with the committed root listed for recovery
+	// The commit is the apply: a partial failure comes back on this receipt,
+	// with the committed root listed for recovery
 	assert_eq!(status, 200);
 	assert_eq!(receipt["ok"], false);
 	assert_eq!(receipt["action"], "partial");
@@ -565,15 +535,8 @@ async fn partial_failure_keeps_committed_roots_and_their_backups() {
 		}),
 	)
 	.await;
-	assert_eq!(status, 200);
-	let choice_id = receipt["choiceId"].as_str().unwrap().to_owned();
 
-	let (_, receipt) = post_json(
-		&daemon,
-		"/choice",
-		&json!({ "choiceId": choice_id, "choice": "studio", "mode": "all" }),
-	)
-	.await;
+	assert_eq!(status, 200);
 	assert_eq!(receipt["ok"], true, "second transfer should succeed: {receipt}");
 	assert_eq!(receipt["backups"].as_array().unwrap().len(), 2);
 
@@ -645,15 +608,11 @@ async fn prune_removes_only_completed_transfers_by_age_and_count() {
 	)
 	.await;
 
-	let choice_id = commit_hello_update(&daemon, &hello, "sub-prune").await;
+	let receipt = commit_hello_update(&daemon, &hello, "sub-prune").await;
 
-	let (_, receipt) = post_json(
-		&daemon,
-		"/choice",
-		&json!({ "choiceId": choice_id, "choice": "studio", "mode": "all" }),
-	)
-	.await;
 	assert_eq!(receipt["ok"], true, "receipt: {receipt}");
+
+	let transfer_id = receipt["transferId"].as_str().unwrap().to_owned();
 
 	// Age rule: the ancient completed transfer is gone; the ancient partial
 	// one is untouchable recovery material
@@ -671,81 +630,12 @@ async fn prune_removes_only_completed_transfers_by_age_and_count() {
 
 	assert_eq!(completed.len(), 32, "completed transfers: {completed:?}");
 	assert!(
-		completed.iter().any(|name| name.contains(&choice_id)),
+		completed.iter().any(|name| name.contains(&transfer_id)),
 		"the new transfer must survive"
 	);
 	assert!(
 		!completed.iter().any(|name| name.ends_with("-recent-31")),
 		"the oldest completed transfer must be pruned by count"
-	);
-
-	plugin.abort();
-}
-
-#[tokio::test]
-async fn keep_disk_brackets_the_replay_in_one_transaction() {
-	let daemon = start_daemon(None);
-	let mod_a = grow_second_module(&daemon).await;
-	let hello = child_ref_in(&daemon, "ReplicatedStorage", "Hello").await.unwrap();
-
-	let plugin = spawn_fake_plugin(&daemon, "bracket-plugin", FakePluginScript::default()).await;
-
-	let (status, receipt) = post_json(
-		&daemon,
-		"/compare",
-		&json!({
-			"submissionId": "sub-bracket",
-			"chunkIndex": 0,
-			"finalChunk": true,
-			"entries": [
-				{ "ref": mod_a, "change": "add", "class": "ModuleScript", "name": "ModA", "instancePath": "ReplicatedStorage/ModA" },
-				{ "ref": hello, "change": "update", "class": "ModuleScript", "name": "Hello", "instancePath": "ReplicatedStorage/Hello" },
-				{ "ref": STUDIO_ONLY_REF, "change": "remove", "class": "Folder", "name": "StudioOnly", "instancePath": "ReplicatedStorage/StudioOnly" },
-			],
-		}),
-	)
-	.await;
-	assert_eq!(status, 200);
-	let choice_id = receipt["choiceId"].as_str().unwrap().to_owned();
-
-	let (status, outcome) = post_json(
-		&daemon,
-		"/choice",
-		&json!({ "choiceId": choice_id, "choice": "disk", "mode": "all" }),
-	)
-	.await;
-	assert_eq!(status, 200);
-	assert_eq!(outcome["ok"], true);
-	assert_eq!(outcome["applied"], true);
-
-	// The replay arrives over the live sync channel...
-	let sync = plugin
-		.wait_for(Duration::from_secs(10), |frame| {
-			frame["type"] == "sync" && !frame["additions"].as_array().unwrap_or(&Vec::new()).is_empty()
-		})
-		.await
-		.expect("no replay sync frame");
-
-	assert_eq!(sync["additions"].as_array().unwrap()[0]["name"], "ModA");
-	assert_eq!(sync["updates"].as_array().unwrap()[0]["id"], hello.as_str());
-	assert_eq!(sync["removals"].as_array().unwrap()[0], STUDIO_ONLY_REF);
-
-	// ...strictly bracketed: begin before the first frame, commit after the
-	// last (the fake plugin records protocol order)
-	let bracket: Vec<String> = plugin
-		.events()
-		.into_iter()
-		.filter(|event| event == "transaction_begin" || event == "sync" || event.starts_with("transaction_finish"))
-		.collect();
-
-	assert_eq!(
-		bracket,
-		vec![
-			"transaction_begin".to_owned(),
-			"sync".to_owned(),
-			"transaction_finish:true".to_owned(),
-		],
-		"bracket order"
 	);
 
 	plugin.abort();

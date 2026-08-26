@@ -186,10 +186,6 @@ impl Cli {
 			Commands::Where(command) => command.main(),
 
 			// Conflict resolution
-			Commands::Conflicts(command) => command.main(),
-			Commands::Resolve(command) => command.main(),
-			Commands::Decision(command) => command.main(),
-			Commands::Diff(command) => command.main(),
 
 			// Live writes
 			Commands::Set(command) => command.main(),
@@ -221,7 +217,7 @@ impl Cli {
 
 			// Live inspection & Studio control additions
 			Commands::Snapshot(command) => command.main(),
-			Commands::Changes(command) => command.main(),
+			Commands::Backlog(command) => command.main(),
 			Commands::Services(command) => command.main(),
 			Commands::Open(command) => command.main(),
 
@@ -287,11 +283,6 @@ pub enum Commands {
 	Meta(live::Meta),
 	Where(live::Where),
 
-	Conflicts(live::Conflicts),
-	Resolve(live::Resolve),
-	Decision(live::Decision),
-	Diff(live::Diff),
-
 	Set(live::Set),
 	New(live::New),
 	Rm(live::Rm),
@@ -317,7 +308,7 @@ pub enum Commands {
 	Auth(auth::Auth),
 
 	Snapshot(live::Snapshot),
-	Changes(live::Changes),
+	Backlog(live::Backlog),
 	Services(live::Services),
 	Open(live::Open),
 

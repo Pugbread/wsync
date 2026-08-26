@@ -24,15 +24,16 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
 	collections::{BTreeSet, HashMap},
+	fs,
 	sync::Mutex,
 };
 use uuid::Uuid;
 
 use crate::{
 	constants::{
-		CHOICE_DETAILS_BYTE_BUDGET, CHOICE_DETAILS_DEFAULT_LIMIT, CHOICE_DETAILS_MAX_LIMIT, COMPARE_BODY_MAX_BYTES,
-		COMPARE_CHUNK_MAX_ENTRIES, CONFLICT_SOURCE_CAP, REQUEST_DEFAULT_TIMEOUT_MS, SELECTION_BODY_MAX_BYTES,
-		SELECTION_CHUNK_MAX_IDS,
+		BACKUPS_DIR, CHOICE_DETAILS_BYTE_BUDGET, CHOICE_DETAILS_DEFAULT_LIMIT, CHOICE_DETAILS_MAX_LIMIT,
+		COMPARE_BODY_MAX_BYTES, COMPARE_CHUNK_MAX_ENTRIES, CONFLICT_SOURCE_CAP, REQUEST_DEFAULT_TIMEOUT_MS,
+		SELECTION_BODY_MAX_BYTES, SELECTION_CHUNK_MAX_IDS,
 	},
 	core::{
 		changes::Changes,
@@ -42,13 +43,7 @@ use crate::{
 	},
 	lock,
 	project::Scope,
-	server::{
-		self, bulk,
-		review::{self, PendingReview, ReviewItem, ReviewState},
-		ws::frames::codes,
-		ws::frames::Event,
-		AppState,
-	},
+	server::{self, backlog, bulk, ws::frames::codes, ws::frames::Event, AppState},
 	util,
 };
 
@@ -356,15 +351,11 @@ fn ingest_chunk(state: &AppState, request: &CompareRequest, entries: Vec<Entry>,
 	let upload = inner.upload.take().unwrap();
 
 	if upload.entries.is_empty() {
-		// Both sides agree — no choice needed. This is the moment agreement
-		// is proven for the whole projection, so every baseline stamps
+		// Both sides agree. This is the moment agreement is proven for the
+		// whole projection, so every baseline stamps. Nothing is cleared
+		// alongside it: the backlog is not pending work, it is what was kept,
+		// and it expires on its own schedule rather than on a clean connect.
 		drop(inner);
-
-		// A new comparison replaces any pending review (Design §7.0); a
-		// clean commit leaves nothing to review
-		if scope.is_code() {
-			state.review.clear();
-		}
 
 		seed_all_baselines(&state.core);
 
@@ -381,50 +372,14 @@ fn ingest_chunk(state: &AppState, request: &CompareRequest, entries: Vec<Entry>,
 		);
 	}
 
-	let (items, stats) = freeze(&state.core, upload.entries);
+	let (items, _stats) = freeze(&state.core, upload.entries);
 
-	if scope.is_code() {
-		// Studio-first (Design §7.0): no choice, no prompt — the caller runs
-		// the apply outside the divergence lock (it awaits plugin ops)
-		return Ingested::StudioFirst { items, accepted, next };
-	}
+	// Studio-first, always: no choice, no prompt, whatever the scope. The
+	// caller runs the apply outside the divergence lock (it awaits plugin ops)
+	// and the disk side goes to the backlog rather than to a question.
+	let _ = scope;
 
-	let choice_id = Uuid::new_v4().to_string();
-
-	info!(
-		"Divergence set {choice_id} frozen: {} entries ({} only-on-disk, {} differ, {} missing-on-disk)",
-		stats.total, stats.only_on_disk, stats.differs, stats.missing_on_disk
-	);
-
-	inner.set = Some(DivergenceSet {
-		choice_id: choice_id.clone(),
-		items,
-		stats,
-		selection: None,
-	});
-
-	drop(inner);
-
-	state.ws.emit(Event::ChoiceNeeded {
-		choice_id: choice_id.clone(),
-		total: stats.total,
-		studio_count: stats.studio_count,
-		disk_count: stats.disk_count,
-		only_on_disk: stats.only_on_disk,
-		differs: stats.differs,
-		missing_on_disk: stats.missing_on_disk,
-	});
-
-	Ingested::Done(
-		Json(json!({
-			"ok": true,
-			"acceptedChunk": accepted,
-			"nextChunk": next,
-			"committed": true,
-			"choiceId": choice_id,
-		}))
-		.into_response(),
-	)
+	Ingested::StudioFirst { items, accepted, next }
 }
 
 /// Commits a code-scope comparison Studio-first (Design §7.0): runs the
@@ -434,52 +389,52 @@ fn ingest_chunk(state: &AppState, request: &CompareRequest, entries: Vec<Entry>,
 /// disk with the disk original preserved into the review store; disk-only →
 /// left untouched on the live disk (the staged swap overlays them forward);
 /// Studio-only → written to disk as part of the apply
+/// Commits a comparison Studio-first: runs the fenced Studio → disk apply
+/// immediately — no choice, no prompt — and moves whatever disk content lost
+/// into the backlog.
+///
+/// Studio is the only authority here, so the deltas resolve without asking:
+/// `differs` → Studio's content lands on disk and the disk original is
+/// backlogged; `only-on-disk` → the file leaves the workspace for the backlog,
+/// because a file Studio does not have is the divergence this model exists to
+/// end; `missing-on-disk` → written out as part of the apply.
 async fn studio_first_commit(state: &AppState, items: Vec<Item>, accepted: u64, next: u64) -> Response {
-	let review_id = Uuid::new_v4().to_string();
-
-	// A new connect/compare replaces any pending review
-	state.review.clear();
-
-	// Disk-side entries become the review candidates; `differs` disk
-	// originals are preserved under the fence during the apply
+	let transfer_id = Uuid::new_v4().to_string();
 	let workspace_dir = state.core.project().workspace_dir.clone();
-	let mut review_items = Vec::new();
+
+	// `differs` originals are preserved under the fence, then moved into the
+	// backlog once the apply has actually succeeded — a failed apply must not
+	// leave the only copy of someone's work in a half-built entry
+	let staging = workspace_dir
+		.join(BACKUPS_DIR)
+		.join("backlog-staging")
+		.join(&transfer_id);
 	let mut preserve = HashMap::new();
+	let mut differs: Vec<String> = Vec::new();
+	let mut disk_only: Vec<String> = Vec::new();
 
 	for item in &items {
-		let state_kind = match item.state {
-			"only-on-disk" => ReviewState::DiskOnly,
-			"differs" => ReviewState::Differs,
-			_ => continue,
-		};
-
-		let Some(path) = item.path.clone().filter(|path| review::safe_rel_path(path)) else {
+		let Some(path) = item.path.clone().filter(|path| backlog::safe_rel_path(path)) else {
 			debug!(
-				"Skipping review candidate {}: no safe disk path behind it",
+				"Skipping backlog candidate {}: no safe disk path behind it",
 				item.instance_path
 			);
 			continue;
 		};
 
-		if state_kind == ReviewState::Differs {
-			preserve.insert(
-				workspace_dir.join(&path),
-				state.review.preserved_path(&review_id, &path),
-			);
+		match item.state {
+			"differs" => {
+				preserve.insert(workspace_dir.join(&path), staging.join(&path));
+				differs.push(path);
+			}
+			"only-on-disk" => disk_only.push(path),
+			_ => {}
 		}
-
-		review_items.push(ReviewItem {
-			id: review_items.len() as u32,
-			path,
-			instance_path: Some(item.instance_path.clone()),
-			state: state_kind,
-			class: Some(item.class.clone()),
-		});
 	}
 
 	// Roots carrying Studio-side content (differs / missing-on-disk) are
-	// pulled and swapped whole; roots with only disk-only entries have
-	// nothing to pull — their files stay untouched on the live disk
+	// pulled and swapped whole; roots with only disk-only entries have nothing
+	// to pull and are handled by the backlog sweep below
 	let staged_roots: BTreeSet<String> = items
 		.iter()
 		.filter(|item| item.state != "only-on-disk")
@@ -489,61 +444,71 @@ async fn studio_first_commit(state: &AppState, items: Vec<Item>, accepted: u64, 
 		.collect();
 
 	info!(
-		"Studio-first apply for review {review_id}: {} staged root(s), {} review candidate(s)",
+		"Studio-first apply {transfer_id}: {} staged root(s), {} replaced, {} disk-only",
 		staged_roots.len(),
-		review_items.len()
+		differs.len(),
+		disk_only.len()
 	);
 
 	let options = bulk::StudioFirstOptions { preserve };
 
-	if let Err((status, mut payload)) = bulk::apply_roots(state, &review_id, &staged_roots, Some(&options)).await {
-		// A failed apply leaves no pending review; the partial preservation
-		// is discarded (the transfer backups carry the recovery state)
-		state.review.discard_preserved(&review_id);
+	let backups = match bulk::apply_roots(state, &transfer_id, &staged_roots, Some(&options)).await {
+		Ok(backups) => backups,
+		Err((status, mut payload)) => {
+			fs::remove_dir_all(&staging).ok();
 
-		payload["acceptedChunk"] = json!(accepted);
-		payload["nextChunk"] = json!(next);
-		payload["committed"] = json!(true);
+			payload["acceptedChunk"] = json!(accepted);
+			payload["nextChunk"] = json!(next);
+			payload["committed"] = json!(true);
 
-		return (status, Json(payload)).into_response();
+			return (status, Json(payload)).into_response();
+		}
+	};
+
+	// The VFS is paused across the moves for the same reason the apply pauses
+	// it: content leaving disk here is the resolution, not an edit to
+	// broadcast, and a disk-only file has no instance in Studio to remove
+	let vfs = state.core.vfs();
+
+	vfs.pause();
+
+	let mut backlogged = 0;
+
+	for path in &differs {
+		if state
+			.backlog
+			.capture(path, &staging.join(path), backlog::Reason::InitialSync)
+			.is_some()
+		{
+			backlogged += 1;
+		}
 	}
+
+	fs::remove_dir_all(&staging).ok();
+
+	for path in &disk_only {
+		if state
+			.backlog
+			.capture(path, &workspace_dir.join(path), backlog::Reason::InitialSync)
+			.is_some()
+		{
+			backlogged += 1;
+		}
+	}
+
+	vfs.resume();
 
 	// Baselines stamp as today: the tree now holds exactly the applied state
-	// (agreed content + Studio content + carried-forward disk-only files)
 	seed_all_baselines(&state.core);
 
-	if review_items.is_empty() {
-		// Nothing stayed disk-side: done silently, no event (Design §7.0)
-		return Json(json!({
-			"ok": true,
-			"acceptedChunk": accepted,
-			"nextChunk": next,
-			"committed": true,
-			"applied": true,
-		}))
-		.into_response();
+	if backlogged > 0 {
+		info!("Backlogged {backlogged} disk entr(ies) that lost to Studio");
+
+		state.ws.emit(Event::Backlog {
+			total: state.backlog.list().len(),
+			added: backlogged,
+		});
 	}
-
-	let total = review_items.len();
-	let disk_only = review_items
-		.iter()
-		.filter(|item| item.state == ReviewState::DiskOnly)
-		.count();
-	let differs = total - disk_only;
-
-	info!("Disk review {review_id} pending: {total} entr(ies) ({disk_only} disk-only, {differs} differ)");
-
-	state.review.replace(PendingReview {
-		review_id: review_id.clone(),
-		items: review_items,
-	});
-
-	state.ws.emit(Event::DiskReview {
-		review_id: review_id.clone(),
-		total,
-		disk_only,
-		differs,
-	});
 
 	Json(json!({
 		"ok": true,
@@ -551,7 +516,10 @@ async fn studio_first_commit(state: &AppState, items: Vec<Item>, accepted: u64, 
 		"nextChunk": next,
 		"committed": true,
 		"applied": true,
-		"reviewId": review_id,
+		"direction": "studio",
+		"transferId": transfer_id,
+		"backups": backups,
+		"backlogged": backlogged,
 	}))
 	.into_response()
 }

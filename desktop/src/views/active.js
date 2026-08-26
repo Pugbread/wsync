@@ -381,8 +381,7 @@ function describe(frame, topic) {
       ? `Studio plugin connected${where ? ` — ${where}` : ""}`
       : "Studio plugin disconnected";
   }
-  if (topic === "choice-needed") return "Studio and disk are different";
-  if (topic === "choice-made") return "Divergence resolved";
+  if (topic === "backlog") return "Disk content moved to the backlog";
   if (topic === "conflict") return "A conflict was parked";
   if (topic === "project-init") return "Studio asked for a new project";
   if (topic === "config-changed") return "Project configuration changed";
@@ -391,7 +390,7 @@ function describe(frame, topic) {
 
 function categoryFor(topic) {
   if (topic === "plugin-status") return "plugin";
-  if (topic === "conflict" || topic === "choice-needed" || topic === "choice-made") return "conflict";
+  if (topic === "backlog") return "backlog";
   if (topic === "project-init") return "project";
   if (topic === "config-changed") return "config";
   return "sync";

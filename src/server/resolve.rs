@@ -7,7 +7,7 @@ use axum::{
 	http::StatusCode,
 	response::{IntoResponse, Json, Response},
 };
-use log::{debug, trace};
+use log::{debug, info, trace, warn};
 use rbx_dom_weak::ustr;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -324,5 +324,60 @@ fn stamp_from_tree(core: &Core, id: rbx_dom_weak::types::Ref) {
 
 			engine.stamp(id, content.hash);
 		}
+	}
+}
+
+/// Resolves a freshly parked conflict toward Studio, without asking.
+///
+/// This is the whole conflict policy: Studio is the authority, so a clash
+/// resolves the moment it is detected. What makes that safe rather than
+/// destructive is the order — the disk side is copied into the backlog first,
+/// so the edit that lost is recoverable for a day, and only then does Studio's
+/// version take the file.
+///
+/// Failures are logged and the conflict is left parked. That is the honest
+/// outcome: a park nobody can see is better than reporting a resolution that
+/// did not happen, and the next connect is Studio-first anyway.
+pub async fn auto_keep_studio(state: &AppState, parked: Parked) {
+	// Backlog before resolving: once Studio's version lands the disk bytes are
+	// gone, and this is the copy the user gets to drag back
+	if let Some(rel_path) = parked.info.rel_path.clone() {
+		let live = state.core.project().workspace_dir.join(&rel_path);
+
+		if live.exists() {
+			let vfs = state.core.vfs();
+
+			// The move is the daemon's own bookkeeping, not an edit to echo
+			vfs.pause();
+
+			let captured = state
+				.backlog
+				.capture(&rel_path, &live, crate::server::backlog::Reason::Conflict)
+				.is_some();
+
+			vfs.resume();
+
+			if captured {
+				state.ws.emit(crate::server::ws::frames::Event::Backlog {
+					total: state.backlog.list().len(),
+					added: 1,
+				});
+			}
+		}
+	}
+
+	match keep_studio(&state.core, &parked).await {
+		Ok(()) => {
+			state.core.conflicts().take(&parked.id);
+
+			info!(
+				"Conflict {} on {} resolved toward Studio; the disk side is in the backlog",
+				parked.id, parked.info.instance_path
+			);
+		}
+		Err((_, message)) => warn!(
+			"Could not resolve conflict {} toward Studio ({message}); leaving it parked",
+			parked.id
+		),
 	}
 }

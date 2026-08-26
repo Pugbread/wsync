@@ -2,7 +2,7 @@
 
 # wsync command reference
 
-72 commands in 16 categories. Every entry is generated from one JSON file
+68 commands in 15 categories. Every entry is generated from one JSON file
 under `docs/commands/`; edit the JSON and re-run `node scripts/build-command-docs.mjs`.
 
 `wsync commands [name] [--compact]` serves this same registry from the binary, and the desktop
@@ -14,12 +14,11 @@ Docs view renders it from `docs/client-commands.generated.json`.
 - [Daemon](#daemon) (3) — `daemon`, `serve`, `stop`
 - [Command registry](#command-registry) (3) — `commands`, `context`, `plan`
 - [Agent runtime](#agent-runtime) (4) — `capabilities`, `capture`, `playtest`, `run`
-- [Live inspection](#live-inspection) (15) — `query`, `get`, `ls`, `tree`, `snapshot`, `diff`, `changes`, `services`, `props`, `source`, `find`, `find-attr`, `classinfo`, `enums`, `enum`
+- [Live inspection](#live-inspection) (14) — `query`, `get`, `ls`, `tree`, `snapshot`, `backlog`, `services`, `props`, `source`, `find`, `find-attr`, `classinfo`, `enums`, `enum`
 - [Path tools](#path-tools) (3) — `path`, `meta`, `where`
 - [Live diagnostics](#live-diagnostics) (8) — `lint`, `tail`, `watch`, `logs`, `status`, `doctor`, `ping`, `version`
 - [Open Cloud](#open-cloud) (2) — `upload`, `monetization`
 - [Studio control](#studio-control) (5) — `open`, `transmit`, `exec`, `studio`, `debug`
-- [Conflict resolution](#conflict-resolution) (3) — `conflicts`, `resolve`, `decision`
 - [Maintenance](#maintenance) (1) — `repair`
 - [Project docs](#project-docs) (1) — `refresh`
 - [Live writes](#live-writes) (13) — `set`, `new`, `rm`, `mv`, `attr`, `tag`, `call`, `select`, `eval`, `save`, `waypoint`, `undo`, `redo`
@@ -609,54 +608,39 @@ wsync snapshot --project . --output snapshots/
 
 ---
 
-### `wsync diff`
+### `wsync backlog`
 
-Lists the pending Studio-first disk review — the disk entries that survived the connect-time apply.
-
-**Usage**
-
-```sh
-wsync diff [--project <path>] [--port <port>] [--depth <n>] [--raw]
-```
-
-**Examples**
-
-```sh
-wsync diff --project .
-wsync diff --project . --raw
-```
-
-**Notes**
-
-- On connect WSync applies Studio to disk automatically (Studio-first, code scope): `differs` files get Studio's content with the disk original preserved, Studio-only instances are written out as `.luau` files and directories, and disk-only files stay untouched on the live disk. This command lists what stayed disk-side: `+` disk-only entries and `~` differs entries whose preserved original can still be pushed back.
-- The listing is the same review set `wsync decision` acts on, so entries carry the `reviewId` they belong to. Results are paged; `--raw` emits NDJSON.
-- A clean connect leaves nothing behind, so an empty listing is the normal, healthy state. A new connect or comparison replaces the pending review, and a daemon restart keeps it answerable.
-- On a `"scope": "full"` project the connect-time comparison freezes a divergence choice instead of auto-applying; that surface is answered from the desktop app, not here.
-- This is a review tool for what the connect kept disk-side, not a post-edit verification step and not a startup ritual.
-
----
-
-### `wsync changes`
-
-Alias for `wsync diff`, intended for reviewing what stayed disk-side after connect.
+Reviews, restores, or drops the disk content that lost to Studio. WSync is Studio-first and never stops to ask: a connect applies Studio over the project and a mid-session clash resolves the same way, so the disk bytes that lost are moved to the backlog instead of being dropped or waiting behind a prompt.
 
 **Usage**
 
 ```sh
-wsync changes [--project <path>] [--port <port>] [--depth <n>] [--raw]
+wsync backlog [list|restore <id>|drop <id>|drop --all] [--project <path>] [--port <port>] [--raw]
 ```
+
+**Subcommands**
+
+- `list` — safety `read-only`, requires `project`, `daemon`
+- `restore` — safety `mutates-studio`, requires `project`, `daemon`, `studio-plugin`
+- `drop` — safety `mutates-disk`, requires `project`, `daemon`
 
 **Examples**
 
 ```sh
-wsync changes --project .
-wsync changes --project . --raw
+wsync backlog --project . --raw
+wsync backlog restore 5f1c1f6e-2f0e-4a1a-9a5b-7c1d2e3f4a5b --project .
+wsync backlog drop 5f1c1f6e-2f0e-4a1a-9a5b-7c1d2e3f4a5b --project .
+wsync backlog drop --all --project .
 ```
 
 **Notes**
 
-- Lists the pending Studio-first disk review: disk-only entries the connect-time apply left untouched and `differs` entries whose disk original was preserved. Only what the project's tree and scope map is ever compared, so out-of-projection files are ignored, never deleted.
-- Identical output contract to `wsync diff`; the two names exist so both a review question and a resync question read naturally.
+- Sync is Studio-first with no questions asked. A connect applies Studio over the project, and a change that clashes with Studio mid-session resolves toward Studio the moment it is detected. Neither stops to ask, because being interrupted by a decision you did not plan to make is worse than the loss it guards against.
+- The guard is this backlog. Whenever disk content would be overwritten or dropped, its bytes move to `.wsync-backups/backlog/` first, recorded with the path they came from and whether they lost to the initial sync or to a later conflict.
+- `restore <id>` writes an entry back to its project path and pushes it to Studio, which is the old Keep Disk answer, deferred until you actually want it. It needs a connected Studio plugin: a restore that never reaches Studio would be sent straight back to the backlog by the next connect.
+- Entries expire a day after capture and are swept on every read, so an expiry never depends on the app being open. The backlog is a safety net for the edit you did not notice losing, not a version history.
+- `drop` forgets an entry without restoring it; `drop --all` empties the backlog. Neither touches what is already synced.
+- There is no divergence prompt, no pending review, and no Keep Disk / Keep Studio decision anywhere in WSync. The commands that drove them — `diff`, `changes`, `decision`, `conflicts`, and `resolve` — no longer exist.
 
 ---
 
@@ -1354,90 +1338,6 @@ wsync debug stop
 - Requires the Studio application, not a daemon or plugin connection. It reports what it sent, not what Studio did — there is no confirmation channel.
 - For scripted, observable playtests with return values, streamed logs, virtual input, and captures, use `wsync playtest` instead.
 - Runtime changes made during a debug session never sync to disk.
-
----
-
-## Conflict resolution
-
-### `wsync conflicts`
-
-Lists parked conflicts waiting for a Keep Disk or Keep Studio decision.
-
-**Usage**
-
-```sh
-wsync conflicts [--project <path>] [--port <port>] [--raw]
-```
-
-**Examples**
-
-```sh
-wsync conflicts
-wsync conflicts --project .
-wsync conflicts --raw
-```
-
-**Notes**
-
-- Shows items parked by the daemon's baseline conflict engine. The engine is instance-granular across the whole projection, so script `Source`, encoded property maps, attributes, and tags can all park a conflict, as can a delete or rename on one side of something the other side edited.
-- While an item is parked nothing propagates for it, both sides' latest content is retained for diff rendering, and live sync for every other path continues.
-- This is for resolving observed conflicts, not a health poll. The connect-time Studio-first apply and its pending disk review are a different object and surface through `wsync decision` and `wsync diff`.
-
----
-
-### `wsync resolve`
-
-Resolves one parked conflict by keeping either disk or Studio content.
-
-**Usage**
-
-```sh
-wsync resolve --path <filesystem-path> (--disk | --studio) [--project <path>] [--port <port>] [--raw]
-```
-
-**Examples**
-
-```sh
-wsync resolve --path src/Client/UIController.client.luau --studio
-wsync resolve --project . --path src/Client/UIController.client.luau --studio
-wsync resolve --path src/Client/UIController.client.luau --disk
-```
-
-**Notes**
-
-- `--studio` writes the Studio state to disk; `--disk` pushes the disk state back to Studio.
-- `--path` is the filesystem path the conflicting instance projects to, which includes sidecar-backed and model-backed instances, not only script files. Use `wsync conflicts --raw` or `wsync path` to get the exact key.
-- Resolution stamps a fresh baseline for the instance on both sides, so the same edit does not re-park.
-
----
-
-### `wsync decision`
-
-Shows or acts on the pending Studio-first disk review without opening the desktop app.
-
-**Usage**
-
-```sh
-wsync decision [--project <path>] [--port <port>] [--review-id <id>] [--disk|--studio|--cancel] [--raw]
-```
-
-**Examples**
-
-```sh
-wsync decision --project .
-wsync decision --project . --disk
-wsync decision --project . --cancel
-```
-
-**Notes**
-
-- On connect the daemon applies Studio to disk automatically (Studio-first, code scope): nothing blocks and there is no decision modal. What remains is a passive review of the disk-side entries — disk-only files left untouched on disk, and `differs` files whose disk original was preserved before Studio's version landed.
-- Without a flag, prints the pending review: its `reviewId` and the aggregate counts (total, disk-only, differs). Use `wsync diff` to page the entries.
-- `--disk` pushes every remaining review entry back to Studio over the live sync channel: disk-only entries are created in Studio, and `differs` entries have their preserved disk copy pushed to Studio and restored to the live disk. Pushing is repeatable until the review is empty; hand-picking a subset is a desktop-app surface.
-- `--studio` is informational: Studio already won at connect, so it exits 0 and points at `--disk`/`--cancel`. `--cancel` dismisses the review and deletes the preserved copies; Studio's version stands.
-- When exactly one review is pending, `--review-id` can be omitted. `--choice-id` remains accepted as an alias of `--review-id`.
-- The review is non-blocking and survives daemon restarts; a new connect or comparison replaces it. On a `"scope": "full"` project the connect-time comparison still freezes a divergence choice instead — answer that from the desktop app; this command reports it when nothing else is pending.
-- A stale or already-handled `reviewId` is reported as such with a non-zero exit instead of acting twice.
 
 ---
 

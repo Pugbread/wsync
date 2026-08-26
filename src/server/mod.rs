@@ -24,6 +24,7 @@ use crate::{
 };
 
 pub mod audit;
+pub mod backlog;
 pub mod bulk;
 mod details;
 pub mod divergence;
@@ -37,7 +38,6 @@ pub mod ops;
 mod read;
 pub mod request;
 pub mod resolve;
-pub mod review;
 mod snapshot;
 pub mod snapshot_json;
 mod stop;
@@ -139,7 +139,7 @@ pub struct AppState {
 	ws: Arc<ws::state::WsState>,
 	lifecycle: Arc<lifecycle::Lifecycle>,
 	divergence: Arc<divergence::Divergence>,
-	review: Arc<review::ReviewStore>,
+	backlog: Arc<backlog::BacklogStore>,
 	audit: Arc<audit::WritesLog>,
 }
 
@@ -241,22 +241,27 @@ impl Server {
 			lifecycle: Arc::new(lifecycle::Lifecycle::new(self.identity.control_token.is_some())),
 			divergence: Arc::new(divergence::Divergence::new()),
 			// A pending disk review (Design §7.0) persists across restarts
-			review: Arc::new(review::ReviewStore::load(&workspace_dir)),
+			backlog: Arc::new(backlog::BacklogStore::load(&workspace_dir)),
 			audit: Arc::new(audit::WritesLog::new(&self.resolve_state_dir())),
 		};
 
-		// Parked conflicts broadcast as `conflict` events (Design §6.3); the
-		// engine lives in the core, so the event sink is wired here
+		// A clash is never a question. The engine still parks — that is where
+		// both sides are captured — but the park is resolved toward Studio
+		// immediately, and the disk side goes to the backlog so the edit that
+		// lost is recoverable for a day instead of being dropped or waiting on
+		// a decision nobody planned to make.
 		{
-			let ws = state.ws.clone();
+			let resolver = state.clone();
+			// The engine notifies from the processor thread, which is not a
+			// Tokio context, so the handle is captured here (where one exists)
+			// rather than reached for at notify time
+			let runtime = tokio::runtime::Handle::current();
 
 			self.core.conflicts().set_notifier(Box::new(move |parked| {
-				ws.emit(ws::frames::Event::Conflict {
-					id: parked.id.clone(),
-					path: parked.info.rel_path.clone(),
-					instance_path: parked.info.instance_path.clone(),
-					classification: parked.classification.as_str().to_owned(),
-				});
+				let state = resolver.clone();
+				let parked = parked.clone();
+
+				runtime.spawn(async move { resolve::auto_keep_studio(&state, parked).await });
 			}));
 		}
 
@@ -308,12 +313,14 @@ impl Server {
 				"/choice/selection",
 				post(divergence::choice_selection).fallback(Self::default_redirect),
 			)
-			.route("/review", get(review::status).fallback(Self::default_redirect))
-			.route("/review/details", get(review::details).fallback(Self::default_redirect))
-			.route("/review/push", post(review::push).fallback(Self::default_redirect))
+			.route("/backlog", get(backlog::status).fallback(Self::default_redirect))
 			.route(
-				"/review/dismiss",
-				post(review::dismiss).fallback(Self::default_redirect),
+				"/backlog/restore",
+				post(backlog::restore).fallback(Self::default_redirect),
+			)
+			.route(
+				"/backlog/drop",
+				post(backlog::drop_entry).fallback(Self::default_redirect),
 			)
 			.route(
 				"/manager-heartbeat",

@@ -218,7 +218,7 @@ mod tests {
 		// A representative spread across the surface — including this change's
 		// own commands, so `refresh` can never render itself as unbuilt
 		for name in [
-			"serve", "get", "set", "capture", "playtest", "run", "plan", "refresh", "auth", "snapshot", "changes",
+			"serve", "get", "set", "capture", "playtest", "run", "plan", "refresh", "auth", "snapshot", "backlog",
 			"services", "open",
 		] {
 			assert!(commands.iter().any(|command| command == name), "missing `{name}`");

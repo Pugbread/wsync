@@ -50,13 +50,10 @@ const IDLE_TIMEOUT_MS = 30_000;
 export const APP_TOPICS = Object.freeze([
   "sync-activity",
   "plugin-status",
-  "conflict",
-  // Design 7.0's passive review, and Design 7.3's blocking choice — the app
-  // subscribes to both because which one a project raises depends on its scope,
-  // and a subscription is not the place to guess.
-  "disk-review",
-  "choice-needed",
-  "choice-made",
+  // Disk content that lost to Studio. Sync never asks a question, so this is
+  // an announcement rather than a prompt: the app updates a count with it and
+  // opens nothing.
+  "backlog",
   "config-changed",
   "project-init",
 ]);

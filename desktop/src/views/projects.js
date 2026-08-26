@@ -13,7 +13,7 @@
 // daemon lifecycle.
 
 import { el, icon, initials, plural, relativeTime } from "./dom.js";
-import { reviewBanner } from "./review.js";
+import { backlogBanner } from "./backlog.js";
 
 /** How a host error code reads in the project-error card. */
 const FAILURE_HEADINGS = {
@@ -328,13 +328,13 @@ export function mountProjects(root, api) {
 
     const failure = api.getDaemonFailure(project.id);
     const removing = confirmingRemoval === project.id;
-    // Design 7.0: the disk review belongs to a project, so it is shown on one —
-    // and only on the project it is about. Non-blocking by construction: it is
-    // a strip above the details, not an overlay.
-    const pendingReview = api.getPendingReview?.();
+    // The backlog belongs to a project, so it is shown on one — and only on the
+    // project it is about. Non-blocking by construction: a strip above the
+    // details, never an overlay, because nothing here is waiting on an answer.
+    const backlog = api.getBacklog?.();
     const banner =
-      pendingReview?.projectId === project.id
-        ? reviewBanner(api, pendingReview, { style: "margin:0 0 14px" })
+      backlog?.projectId === project.id
+        ? backlogBanner(api, backlog, { style: "margin:0 0 14px" })
         : null;
 
     detailPane.replaceChildren(

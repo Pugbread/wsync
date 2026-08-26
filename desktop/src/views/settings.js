@@ -715,15 +715,15 @@ export function mountSettings(root, api) {
         el(
           "div",
           { class: "row-copy" },
-          el("div", { class: "row-title", text: "Divergence modal" }),
-          el("div", { class: "row-sub", text: "Opens the overwrite flow against its sample divergence set." }),
+          el("div", { class: "row-title", text: "Backlog window" }),
+          el("div", { class: "row-sub", text: "Opens the backlog window for the served project." }),
         ),
         el(
           "div",
           { class: "row-actions" },
           el(
             "button",
-            { class: "btn", type: "button", on: { click: () => api.openOverwriteModal({ fixture: true }) } },
+            { class: "btn", type: "button", on: { click: () => api.openBacklog({}) } },
             "Preview",
           ),
         ),

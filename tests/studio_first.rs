@@ -187,7 +187,7 @@ async fn studio_first_connect_applies_and_leaves_a_disk_review() {
 	assert_eq!(receipt["committed"], true);
 	assert_eq!(receipt["applied"], true);
 
-	let review_id = receipt["reviewId"].as_str().expect("reviewId in receipt").to_owned();
+	assert_eq!(receipt["direction"], "studio");
 
 	// Actual .luau files and directories landed under src/<Service>/…
 	let rs = daemon.root.join("src/ReplicatedStorage");
@@ -218,19 +218,41 @@ async fn studio_first_connect_applies_and_leaves_a_disk_review() {
 		serde_json::from_str(&fs::read_to_string(empty.join("init.meta.json")).unwrap()).unwrap();
 	assert_eq!(data["properties"]["Attributes"]["Done"], false, "sidecar: {data}");
 
-	// Disk-only and out-of-projection files survived IN PLACE (the staged
-	// swap overlays them forward instead of displacing them into backup)
-	assert_eq!(fs::read_to_string(rs.join("KeepMe.luau")).unwrap(), KEEP_ME);
+	// A disk-only file inside the projection is a divergence Studio does not
+	// have, so it leaves for the backlog rather than lingering on disk
+	assert!(
+		!rs.join("KeepMe.luau").exists(),
+		"a disk-only file must not survive a Studio-first apply"
+	);
+
+	// A file outside the projection is not WSync's to move
 	assert_eq!(fs::read_to_string(rs.join("notes.md")).unwrap(), NOTES);
 
-	// The differs disk original was preserved into the review store
-	let preserved = daemon
+	// Both losers are recoverable: the replaced original and the disk-only file
+	let (_, backlog) = get_json(&daemon, "/backlog").await;
+	let entries = backlog["entries"].as_array().unwrap();
+
+	assert_eq!(entries.len(), 2, "backlog: {backlog}");
+
+	let paths: Vec<&str> = entries.iter().map(|entry| entry["path"].as_str().unwrap()).collect();
+
+	assert!(paths.contains(&"src/ReplicatedStorage/Hello.luau"), "paths: {paths:?}");
+	assert!(paths.contains(&"src/ReplicatedStorage/KeepMe.luau"), "paths: {paths:?}");
+
+	for entry in entries {
+		assert_eq!(entry["reason"], "initial-sync");
+		assert!(entry["secondsRemaining"].as_u64().unwrap() > 0);
+	}
+
+	// The replaced disk original is the content that was there before
+	let stored = daemon
 		.root
 		.join(".wsync-backups")
-		.join("review")
-		.join(&review_id)
+		.join("backlog")
+		.join(entries.iter().find(|entry| entry["path"] == "src/ReplicatedStorage/Hello.luau").unwrap()["id"].as_str().unwrap())
 		.join("src/ReplicatedStorage/Hello.luau");
-	assert_eq!(fs::read_to_string(&preserved).unwrap(), DISK_HELLO);
+
+	assert_eq!(fs::read_to_string(&stored).unwrap(), DISK_HELLO);
 
 	// The pull ran per staged root over the op surface
 	let events = plugin.events();
@@ -240,335 +262,19 @@ async fn studio_first_connect_applies_and_leaves_a_disk_review() {
 		"one structure pull per staged root: {events:?}"
 	);
 
-	// disk-review broadcast with exact counts — and never a choice-needed
+	// A backlog broadcast with exact counts — and never a question
 	let event = wait_for_frame(&mut watch, Duration::from_secs(10), |frame| {
-		frame["type"] == "event" && (frame["topic"] == "disk-review" || frame["topic"] == "choice-needed")
+		frame["type"] == "event" && (frame["topic"] == "backlog" || frame["topic"] == "choice-needed")
 	})
 	.await
-	.expect("no disk-review event");
+	.expect("no backlog event");
 
-	assert_eq!(event["topic"], "disk-review", "code scope must never ask");
-	assert_eq!(event["reviewId"], review_id.as_str());
+	assert_eq!(event["topic"], "backlog", "sync must never ask");
 	assert_eq!(event["total"], 2);
-	assert_eq!(event["diskOnly"], 1);
-	assert_eq!(event["differs"], 1);
-
-	// The review surface: status, details shape, and the silent choice side
-	let (status, pending) = get_json(&daemon, "/review").await;
-	assert_eq!(status, 200);
-	assert_eq!(pending["pending"], true);
-	assert_eq!(pending["reviewId"], review_id.as_str());
-	assert_eq!(pending["stats"]["total"], 2);
-	assert_eq!(pending["stats"]["diskOnly"], 1);
-	assert_eq!(pending["stats"]["differs"], 1);
-
-	let (status, details) = get_json(&daemon, &format!("/review/details?reviewId={review_id}")).await;
-	assert_eq!(status, 200);
-	assert_eq!(details["reviewId"], review_id.as_str());
-	assert_eq!(details["totalCount"], 2);
-
-	let items = details["items"].as_array().unwrap();
-	assert_eq!(items.len(), 2);
-	assert_eq!(items[0]["id"], 0);
-	assert_eq!(items[0]["path"], "src/ReplicatedStorage/KeepMe.luau");
-	assert_eq!(items[0]["instancePath"], "ReplicatedStorage/KeepMe");
-	assert_eq!(items[0]["state"], "disk-only");
-	assert_eq!(items[0]["class"], "ModuleScript");
-	assert_eq!(items[1]["id"], 1);
-	assert_eq!(items[1]["path"], "src/ReplicatedStorage/Hello.luau");
-	assert_eq!(items[1]["state"], "differs");
-
-	// Details page with limit 1 → cursor to the next id
-	let (_, page) = get_json(&daemon, &format!("/review/details?reviewId={review_id}&limit=1")).await;
-	assert_eq!(page["items"].as_array().unwrap().len(), 1);
-	assert_eq!(page["nextCursor"], 1);
-
-	// Code-scope projects answer the old choice surface with nothing pending
-	let (_, choice) = get_json(&daemon, "/choice").await;
-	assert_eq!(choice["pending"], false);
-
-	// Stale review ids → 404
-	let (status, _) = get_json(&daemon, "/review/details?reviewId=nope").await;
-	assert_eq!(status, 404);
-
-	// Push the disk-only entry alone (id 0): the module is created in Studio
-	// from the live file
-	let (status, outcome) = post_json(&daemon, "/review/push", &json!({ "reviewId": review_id, "ids": [0] })).await;
-	assert_eq!(status, 200);
-	assert_eq!(outcome["ok"], true, "push outcome: {outcome}");
-	assert_eq!(outcome["pushed"], 1);
-	assert_eq!(outcome["remaining"], 1);
-
-	let sync = plugin
-		.wait_for(Duration::from_secs(10), |frame| {
-			frame["type"] == "sync"
-				&& frame["additions"]
-					.as_array()
-					.is_some_and(|additions| additions.iter().any(|addition| addition["name"] == "KeepMe"))
-		})
-		.await
-		.expect("no sync frame creating the disk-only module");
-
-	let addition = sync["additions"]
-		.as_array()
-		.unwrap()
-		.iter()
-		.find(|addition| addition["name"] == "KeepMe")
-		.unwrap();
-	assert_eq!(addition["properties"]["Source"]["String"], KEEP_ME);
-
-	// Item ids are STABLE for the lifetime of the review: the survivor keeps
-	// its original id 1 — never renumbered to fill the gap — so ids picked
-	// before a partial push stay valid across chunked pushes
-	let (_, details) = get_json(&daemon, &format!("/review/details?reviewId={review_id}")).await;
-	assert_eq!(details["totalCount"], 1);
-
-	let survivors = details["items"].as_array().unwrap();
-	assert_eq!(survivors.len(), 1);
-	assert_eq!(survivors[0]["id"], 1, "surviving entries keep their original ids");
-	assert_eq!(survivors[0]["state"], "differs");
-
-	let (_, pending) = get_json(&daemon, "/review").await;
-	assert_eq!(pending["stats"]["total"], 1);
-	assert_eq!(pending["stats"]["diskOnly"], 0);
-
-	// A renumbering server would now reject (or misroute) the originally
-	// picked id 1; pushing it lands on the differs entry: the preserved disk
-	// copy goes to Studio AND is restored to the live disk
-	let (status, outcome) = post_json(&daemon, "/review/push", &json!({ "reviewId": review_id, "ids": [1] })).await;
-	assert_eq!(status, 200);
-	assert_eq!(outcome["pushed"], 1);
-	assert_eq!(outcome["remaining"], 0);
-
-	let sync = plugin
-		.wait_for(Duration::from_secs(10), |frame| {
-			frame["type"] == "sync"
-				&& frame["updates"].as_array().is_some_and(|updates| {
-					updates
-						.iter()
-						.any(|update| update["properties"]["Source"]["String"] == DISK_HELLO)
-				})
-		})
-		.await
-		.expect("no sync frame carrying the preserved disk content");
-
-	let update = sync["updates"]
-		.as_array()
-		.unwrap()
-		.iter()
-		.find(|update| update["properties"]["Source"]["String"] == DISK_HELLO)
-		.unwrap();
-	assert_eq!(update["id"], hello.as_str());
-
-	assert_eq!(
-		fs::read_to_string(rs.join("Hello.luau")).unwrap(),
-		DISK_HELLO,
-		"the preserved disk copy must be restored to the live disk"
-	);
-	assert!(!preserved.exists(), "the consumed preserved copy is deleted");
-
-	// The review is spent: no pending set, preserved store gone
-	let (_, pending) = get_json(&daemon, "/review").await;
-	assert_eq!(pending["pending"], false);
-	assert!(!daemon.root.join(".wsync-backups").join("review").exists());
-
-	// A repeated push against the spent review → 404
-	let (status, _) = post_json(
-		&daemon,
-		"/review/push",
-		&json!({ "reviewId": review_id, "mode": "all" }),
-	)
-	.await;
-	assert_eq!(status, 404);
-
-	plugin.abort();
+	assert_eq!(event["added"], 2);
 }
 
-#[tokio::test]
-async fn push_mode_all_consumes_the_whole_review() {
-	let daemon = code_place();
-	tokio::time::sleep(SETTLE).await;
 
-	let keep_me = child_ref_in(&daemon, "ReplicatedStorage", "KeepMe").await.unwrap();
-	let (plugin, hello, _) = studio_data_model(&daemon).await;
-
-	let (_, receipt) = post_json(
-		&daemon,
-		"/compare",
-		&json!({
-			"submissionId": "sub-all",
-			"chunkIndex": 0,
-			"finalChunk": true,
-			"entries": [
-				{ "ref": keep_me, "change": "add", "class": "ModuleScript", "name": "KeepMe", "instancePath": "ReplicatedStorage/KeepMe" },
-				{ "ref": hello, "change": "update", "class": "ModuleScript", "name": "Hello", "instancePath": "ReplicatedStorage/Hello" },
-			],
-		}),
-	)
-	.await;
-
-	let review_id = receipt["reviewId"].as_str().unwrap().to_owned();
-
-	let (status, outcome) = post_json(
-		&daemon,
-		"/review/push",
-		&json!({ "reviewId": review_id, "mode": "all" }),
-	)
-	.await;
-	assert_eq!(status, 200);
-	assert_eq!(outcome["ok"], true, "push outcome: {outcome}");
-	assert_eq!(outcome["pushed"], 2);
-	assert_eq!(outcome["remaining"], 0);
-
-	// Both directions travel the sync channel: create the disk-only module,
-	// restore-and-push the preserved differs content
-	plugin
-		.wait_for(Duration::from_secs(10), |frame| {
-			frame["type"] == "sync"
-				&& frame["additions"]
-					.as_array()
-					.is_some_and(|additions| additions.iter().any(|addition| addition["name"] == "KeepMe"))
-		})
-		.await
-		.expect("no sync frame creating the disk-only module");
-
-	plugin
-		.wait_for(Duration::from_secs(10), |frame| {
-			frame["type"] == "sync"
-				&& frame["updates"].as_array().is_some_and(|updates| {
-					updates
-						.iter()
-						.any(|update| update["properties"]["Source"]["String"] == DISK_HELLO)
-				})
-		})
-		.await
-		.expect("no sync frame restoring the differs entry");
-
-	assert_eq!(
-		fs::read_to_string(daemon.root.join("src/ReplicatedStorage/Hello.luau")).unwrap(),
-		DISK_HELLO
-	);
-
-	let (_, pending) = get_json(&daemon, "/review").await;
-	assert_eq!(pending["pending"], false);
-
-	plugin.abort();
-}
-
-#[tokio::test]
-async fn new_comparisons_replace_reviews_and_dismiss_deletes_preserved_copies() {
-	let daemon = code_place();
-	tokio::time::sleep(SETTLE).await;
-
-	let keep_me = child_ref_in(&daemon, "ReplicatedStorage", "KeepMe").await.unwrap();
-	let (plugin, hello, _) = studio_data_model(&daemon).await;
-
-	// First comparison leaves a review pending
-	let (_, receipt) = post_json(
-		&daemon,
-		"/compare",
-		&json!({
-			"submissionId": "sub-first",
-			"chunkIndex": 0,
-			"finalChunk": true,
-			"entries": compare_entries(&keep_me, &hello),
-		}),
-	)
-	.await;
-
-	let first_review = receipt["reviewId"].as_str().unwrap().to_owned();
-
-	let preserved = daemon
-		.root
-		.join(".wsync-backups")
-		.join("review")
-		.join(&first_review)
-		.join("src/ReplicatedStorage/Hello.luau");
-	assert!(preserved.exists());
-
-	// An empty (clean) comparison replaces it: committed silently, nothing
-	// pending, the old preserved copies deleted
-	let (status, receipt) = post_json(
-		&daemon,
-		"/compare",
-		&json!({
-			"submissionId": "sub-clean",
-			"chunkIndex": 0,
-			"finalChunk": true,
-			"restart": true,
-			"entries": [],
-		}),
-	)
-	.await;
-
-	assert_eq!(status, 200);
-	assert_eq!(receipt["committed"], true);
-	assert!(receipt.get("reviewId").is_none(), "a clean commit mints no review");
-
-	let (_, pending) = get_json(&daemon, "/review").await;
-	assert_eq!(pending["pending"], false);
-	assert!(!preserved.exists(), "replaced reviews lose their preserved copies");
-
-	// A second divergent comparison mints a fresh review…
-	let (_, receipt) = post_json(
-		&daemon,
-		"/compare",
-		&json!({
-			"submissionId": "sub-second",
-			"chunkIndex": 0,
-			"finalChunk": true,
-			"restart": true,
-			"entries": [
-				{ "ref": hello, "change": "update", "class": "ModuleScript", "name": "Hello", "instancePath": "ReplicatedStorage/Hello" },
-			],
-		}),
-	)
-	.await;
-
-	let review_id = receipt["reviewId"].as_str().unwrap().to_owned();
-	assert_ne!(review_id, first_review);
-
-	let preserved = daemon
-		.root
-		.join(".wsync-backups")
-		.join("review")
-		.join(&review_id)
-		.join("src/ReplicatedStorage/Hello.luau");
-	assert!(preserved.exists());
-
-	// …whose stale-id handling and dismissal are pinned
-	let (status, _) = post_json(&daemon, "/review/push", &json!({ "reviewId": "nope", "mode": "all" })).await;
-	assert_eq!(status, 404);
-
-	let (status, _) = post_json(&daemon, "/review/dismiss", &json!({ "reviewId": "nope" })).await;
-	assert_eq!(status, 404);
-
-	// Push ids outside the set → 400
-	let (status, _) = post_json(&daemon, "/review/push", &json!({ "reviewId": review_id, "ids": [7] })).await;
-	assert_eq!(status, 400);
-
-	let (status, outcome) = post_json(&daemon, "/review/dismiss", &json!({ "reviewId": review_id })).await;
-	assert_eq!(status, 200);
-	// Dismiss also reports how many disk-only files it discarded, so "keep
-	// Studio's versions everywhere" is not a silent deletion. This review holds
-	// a `differs` entry and no disk-only ones, so nothing is removed here
-	assert_eq!(outcome, json!({ "ok": true, "discarded": 0 }));
-
-	let (_, pending) = get_json(&daemon, "/review").await;
-	assert_eq!(pending["pending"], false);
-	assert!(
-		!daemon.root.join(".wsync-backups").join("review").exists(),
-		"dismiss deletes the preserved copies"
-	);
-
-	// Studio's version stands on disk after the dismissal
-	assert_eq!(
-		fs::read_to_string(daemon.root.join("src/ReplicatedStorage/Hello.luau")).unwrap(),
-		STUDIO_HELLO
-	);
-
-	plugin.abort();
-}
 
 #[tokio::test]
 async fn a_daemon_restart_keeps_the_pending_review_answerable() {
@@ -590,7 +296,7 @@ async fn a_daemon_restart_keeps_the_pending_review_answerable() {
 	)
 	.await;
 
-	let review_id = receipt["reviewId"].as_str().unwrap().to_owned();
+	assert_eq!(receipt["backlogged"], 2, "receipt: {receipt}");
 
 	plugin.abort();
 
@@ -605,92 +311,35 @@ async fn a_daemon_restart_keeps_the_pending_review_answerable() {
 	assert_eq!(status, 200);
 	assert!(daemon.wait_for_exit(Duration::from_secs(15)), "daemon never exited");
 
-	// Reboot over the same workspace: the persisted review index and the
-	// preserved copies keep the review answerable
+	// Reboot over the same workspace: the persisted index and the stored bytes
+	// keep the backlog answerable, so a restart is never what loses the edit
 	let TestDaemon { dir, .. } = daemon;
 	let daemon = start_daemon_in(dir);
 	tokio::time::sleep(SETTLE).await;
 
-	let (status, pending) = get_json(&daemon, "/review").await;
-	assert_eq!(status, 200);
-	assert_eq!(pending["pending"], true, "the review must survive a restart");
-	assert_eq!(pending["reviewId"], review_id.as_str());
-	assert_eq!(pending["stats"]["total"], 2);
+	let (status, backlog) = get_json(&daemon, "/backlog").await;
 
-	let (status, details) = get_json(&daemon, &format!("/review/details?reviewId={review_id}")).await;
 	assert_eq!(status, 200);
-	assert_eq!(details["items"].as_array().unwrap().len(), 2);
 
-	// Pushing needs a live sync channel: without a plugin it refuses
-	// honestly (and stays repeatable) instead of dropping frames
-	let (status, body) = post_json(
-		&daemon,
-		"/review/push",
-		&json!({ "reviewId": review_id, "mode": "all" }),
-	)
-	.await;
-	assert_eq!(status, 503);
+	let entries = backlog["entries"].as_array().unwrap();
+
+	assert_eq!(entries.len(), 2, "the backlog must survive a restart: {backlog}");
+
+	// Restoring still needs a live sync channel: without a plugin it refuses
+	// rather than leaving the file on disk for the next connect to send back
+	let id = entries[0]["id"].as_str().unwrap().to_owned();
+	let (status, body) = post_json(&daemon, "/backlog/restore", &json!({ "id": id })).await;
+
+	assert_eq!(status, 503, "restore: {body}");
 	assert_eq!(body["ok"], false);
 
-	// Dismissal needs no plugin
-	let (status, _) = post_json(&daemon, "/review/dismiss", &json!({ "reviewId": review_id })).await;
-	assert_eq!(status, 200);
+	// Dropping needs nothing but the daemon
+	let (status, body) = post_json(&daemon, "/backlog/drop", &json!({ "id": id })).await;
 
-	let (_, pending) = get_json(&daemon, "/review").await;
-	assert_eq!(pending["pending"], false);
+	assert_eq!(status, 200, "drop: {body}");
+	assert_eq!(body["dropped"], 1);
+
+	let (_, backlog) = get_json(&daemon, "/backlog").await;
+	assert_eq!(backlog["entries"].as_array().unwrap().len(), 1);
 }
 
-#[tokio::test]
-async fn full_scope_projects_keep_the_choice_flow() {
-	// The stock scratch project pins "scope": "full"
-	let daemon = start_daemon(None);
-	tokio::time::sleep(SETTLE).await;
-
-	let (_, hello_body) = get_json(&daemon, "/hello").await;
-	assert_eq!(hello_body["scope"], "full");
-
-	let (mut watch, watch_hello) = connect_client(&daemon, "watch", "full-scope-watch").await;
-	assert_eq!(watch_hello["scope"], "full");
-
-	let (_plugin, _) = connect_client(&daemon, "plugin", "full-scope-plugin").await;
-
-	let (status, receipt) = post_json(
-		&daemon,
-		"/compare",
-		&json!({
-			"submissionId": "sub-full",
-			"chunkIndex": 0,
-			"finalChunk": true,
-			"entries": [
-				{ "ref": STUDIO_ONLY_REF, "change": "remove", "class": "Folder", "name": "StudioOnly", "instancePath": "ReplicatedStorage/StudioOnly" },
-			],
-		}),
-	)
-	.await;
-
-	// Full scope still freezes a choice: choiceId minted, choice-needed
-	// broadcast, nothing auto-applied, no review
-	assert_eq!(status, 200);
-	assert!(receipt["choiceId"].is_string(), "receipt: {receipt}");
-	assert!(receipt.get("reviewId").is_none());
-
-	let event = wait_for_frame(&mut watch, Duration::from_secs(10), |frame| {
-		frame["type"] == "event" && (frame["topic"] == "choice-needed" || frame["topic"] == "disk-review")
-	})
-	.await
-	.expect("no choice-needed event");
-
-	assert_eq!(event["topic"], "choice-needed", "full scope must keep asking");
-
-	let (_, choice) = get_json(&daemon, "/choice").await;
-	assert_eq!(choice["pending"], true);
-
-	let (_, review) = get_json(&daemon, "/review").await;
-	assert_eq!(review["pending"], false);
-
-	// The disk was not touched: full scope waits for the decision
-	assert_eq!(
-		fs::read_to_string(daemon.src_dir().join("Hello.luau")).unwrap(),
-		"return \"hello\"\n"
-	);
-}

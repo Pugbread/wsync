@@ -96,18 +96,10 @@ const STDERR_TAIL_LINES: usize = 24;
 /// resolve or change anything — which is why it belongs on this side of the
 /// line and not on the write allowlist.
 ///
-/// `/review` and `/review/details` are Design 7.0's passive disk review: the
-/// same paged read against the set of disk items left over after the connect
-/// applied Studio → disk. Reads, and nothing more — pushing is a write.
-const READABLE_ROUTES: &[&str] = &[
-    "/hello",
-    "/resolve",
-    "/choice",
-    "/choice/details",
-    "/choice/source",
-    "/review",
-    "/review/details",
-];
+/// `/backlog` is the disk content that lost to Studio: sync never asks a
+/// question, so what is left is a list of recoverable losers, read here and
+/// acted on through the write allowlist below.
+const READABLE_ROUTES: &[&str] = &["/hello", "/backlog"];
 
 /// The routes the data layer may *write*, and the cap on each one's body.
 ///
@@ -117,22 +109,10 @@ const READABLE_ROUTES: &[&str] = &[
 /// the contract's own bounds with envelope headroom, not round numbers picked
 /// for comfort:
 ///
-/// * `/resolve` — `{id, path?, keep, choice}`: four short strings.
-/// * `/choice` — `{choiceId, choice, mode?}`: three short strings.
-/// * `/choice/selection` — `{choiceId, submissionId, chunkIndex, finalChunk,
-///   restart, ids:[…]}`. Design 7.3 bounds one chunk at ≤2048 ids / ≤64 KiB;
-///   the rest is the envelope around them.
-/// * `/review/push` — `{reviewId, ids:[…≤2048]}` or `{reviewId, mode:"all"}`:
-///   Design 7.0's push of chosen disk items into Studio. Same id ceiling as a
-///   selection chunk, so the same cap.
-/// * `/review/dismiss` — `{reviewId}`: one short string.
-const WRITABLE_ROUTES: &[(&str, usize)] = &[
-    ("/resolve", 4 * 1024),
-    ("/choice", 4 * 1024),
-    ("/choice/selection", 80 * 1024),
-    ("/review/push", 80 * 1024),
-    ("/review/dismiss", 4 * 1024),
-];
+/// * `/backlog/restore` — `{id}`: one short string. Puts one entry back on
+///   disk and pushes it to Studio.
+/// * `/backlog/drop` — `{id}` or `{all: true}`: forgets without restoring.
+const WRITABLE_ROUTES: &[(&str, usize)] = &[("/backlog/restore", 4 * 1024), ("/backlog/drop", 4 * 1024)];
 
 // --------------------------------------------------------- serialized types --
 
@@ -1399,59 +1379,34 @@ mod tests {
 
     #[test]
     fn route_allowlist_is_exact() {
-        assert!(validate_route("/resolve").is_ok());
-        assert!(validate_route("/choice/details?cursor=abc").is_ok());
+        assert!(validate_route("/hello").is_ok());
+        assert!(validate_route("/backlog").is_ok());
         // Traversal is a path concern; a query value that contains dots is not
-        // one, and a choiceId is opaque.
-        assert!(validate_route("/choice/details?choiceId=ch..1&cursor=0").is_ok());
         for bad in [
             "/stop",
             "/push",
-            "resolve",
-            "//evil.example/resolve",
-            "/choice/../stop",
-            "/resolvex",
-            "http://127.0.0.1:7978/resolve",
+            "backlog",
+            "//evil.example/backlog",
+            "/backlog/../stop",
+            "/backlogx",
+            "http://127.0.0.1:7978/backlog",
         ] {
             assert!(validate_route(bad).is_err(), "{bad} should be refused");
         }
     }
 
     #[test]
-    fn the_row_source_route_is_readable_and_never_writable() {
-        // The staging list's inline diff (Design 7.3): a cursor-free read of one
-        // frozen row, query string and all.
-        assert!(validate_route("/choice/source?choiceId=ch_1&id=17").is_ok());
-        assert!(validate_route("/choice/source").is_ok());
-        // Neighbours of the exact path stay refused — the allowlist is not a
-        // prefix match, which is the whole reason it is spelled out.
-        for bad in [
-            "/choice/sources",
-            "/choice/source/17",
-            "/choice/../choice/source",
-        ] {
-            assert!(validate_route(bad).is_err(), "{bad} should be refused");
-        }
-        // Readable is not writable: a row diff is a read, and nothing about
-        // opening one may reach a route that changes state.
-        assert!(validate_post_route("/choice/source").is_err());
-    }
+    fn the_backlog_routes_split_reads_from_writes() {
+        // Listing what lost is a read; restoring or dropping one is not, and
+        // neither can be reached the other way round.
+        assert!(validate_route("/backlog").is_ok());
+        assert!(validate_post_route("/backlog/restore").is_ok());
+        assert!(validate_post_route("/backlog/drop").is_ok());
 
-    #[test]
-    fn the_review_routes_split_the_same_way_the_choice_ones_do() {
-        // Design 7.0's passive review: two reads, two writes, no overlap.
-        assert!(validate_route("/review").is_ok());
-        assert!(validate_route("/review/details?reviewId=rv_1&cursor=0&limit=512").is_ok());
-        assert!(validate_post_route("/review/push").is_ok());
-        assert!(validate_post_route("/review/dismiss").is_ok());
-
-        // Pushing is a write, listing is not — neither can be reached the other
-        // way round, and neighbours of both are refused.
-        assert!(validate_post_route("/review").is_err());
-        assert!(validate_post_route("/review/details").is_err());
-        assert!(validate_route("/review/push").is_err());
-        assert!(validate_route("/review/dismiss").is_err());
-        for bad in ["/reviews", "/review/detail", "/review/pushes", "/review/../stop"] {
+        assert!(validate_post_route("/backlog").is_err());
+        assert!(validate_route("/backlog/restore").is_err());
+        assert!(validate_route("/backlog/drop").is_err());
+        for bad in ["/backlogs", "/backlog/restores", "/backlog/../stop"] {
             assert!(validate_route(bad).is_err(), "{bad} should be refused");
             assert!(validate_post_route(bad).is_err(), "{bad} should be refused");
         }
@@ -1459,21 +1414,13 @@ mod tests {
 
     #[test]
     fn write_allowlist_is_exact_and_narrower_than_the_read_one() {
-        for good in [
-            "/resolve",
-            "/choice",
-            "/choice/selection",
-            "/review/push",
-            "/review/dismiss",
-        ] {
+        for good in ["/backlog/restore", "/backlog/drop"] {
             assert!(validate_post_route(good).is_ok(), "{good} should be allowed");
         }
         for bad in [
             // Readable, but nothing the app may write.
             "/hello",
-            "/choice/details",
-            "/review",
-            "/review/details",
+            "/backlog",
             // Never reachable from the webview at all.
             "/stop",
             "/push",
@@ -1497,18 +1444,11 @@ mod tests {
 
     #[test]
     fn every_write_route_carries_a_cap_that_fits_its_contract() {
-        // Design 7.3: ≤2048 ids / ≤64 KiB per selection chunk. The cap has to
-        // clear that with room for the envelope, and the two small routes have
-        // to stay small — a cap nobody can hit is not a cap.
+        // Both backlog writes carry one short id, so both stay small — a cap
+        // nobody can hit is not a cap.
         let cap = |route: &str| validate_post_route(route).unwrap().1;
-        assert!(cap("/choice/selection") >= 64 * 1024);
-        assert!(cap("/choice/selection") <= 128 * 1024);
-        assert_eq!(cap("/resolve"), 4 * 1024);
-        assert_eq!(cap("/choice"), 4 * 1024);
-        // Design 7.0's push carries the same ≤2048 ids, so it gets the same
-        // room; dismissing carries one id and stays small.
-        assert_eq!(cap("/review/push"), cap("/choice/selection"));
-        assert_eq!(cap("/review/dismiss"), 4 * 1024);
+        assert_eq!(cap("/backlog/restore"), 4 * 1024);
+        assert_eq!(cap("/backlog/drop"), 4 * 1024);
     }
 
     #[tokio::test]
@@ -1518,7 +1458,7 @@ mod tests {
         // Both checks run before the session lookup, so a bad body is reported
         // as a bad body rather than as "no daemon is tracked".
         let error = registry
-            .post("p_none", "/choice", Value::Array(vec![]))
+            .post("p_none", "/backlog/restore", Value::Array(vec![]))
             .await
             .unwrap_err();
         assert_eq!(error.code, crate::error::code::INVALID_ARGUMENT);
@@ -1528,8 +1468,8 @@ mod tests {
         let error = registry
             .post(
                 "p_none",
-                "/choice/selection",
-                serde_json::json!({ "choiceId": "c", "ids": ids }),
+                "/backlog/restore",
+                serde_json::json!({ "id": "b", "padding": ids }),
             )
             .await
             .unwrap_err();
@@ -1538,7 +1478,7 @@ mod tests {
 
         // A body inside the cap gets as far as the (absent) session.
         let error = registry
-            .post("p_none", "/choice", serde_json::json!({ "choice": "disk" }))
+            .post("p_none", "/backlog/drop", serde_json::json!({ "all": true }))
             .await
             .unwrap_err();
         assert_eq!(error.code, crate::error::code::UNAVAILABLE);
@@ -1753,9 +1693,9 @@ mod tests {
         );
 
         // The data layer's read works; the allowlist still holds.
-        let resolve = registry.request("p_test", "/resolve").await.unwrap();
-        assert_eq!(resolve.status, 200);
-        assert!(resolve.ok);
+        let backlog = registry.request("p_test", "/backlog").await.unwrap();
+        assert_eq!(backlog.status, 200);
+        assert!(backlog.ok);
         assert!(registry.request("p_test", "/stop").await.is_err());
 
         // ...and so does its write, including the part that matters most: a
@@ -1764,8 +1704,8 @@ mod tests {
         let unknown = registry
             .post(
                 "p_test",
-                "/resolve",
-                serde_json::json!({ "id": "no-such-conflict", "keep": "local", "choice": "local" }),
+                "/backlog/restore",
+                serde_json::json!({ "id": "no-such-entry" }),
             )
             .await
             .unwrap();
