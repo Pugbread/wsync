@@ -10,7 +10,29 @@ History prior to the fork lives in
 
 ## [0.1.0] - Unreleased
 
+### Agent interface corrections
+
+- Validate live tagged values against the generated canonical schema, with
+  exact field examples and offline discovery hints for datatype mismatches.
+- Preserve explicit return counts and nil slots across Roblox BindableEvent
+  and BindableFunction boundaries; encode each return with a shared budget.
+- Pin runtime requests and multipart reads to their playtest generation;
+  enforce named-context readiness instead of accepting a different context.
+
 ### Fixed
+
+- Moving a folder or script with children to another place in Studio (or
+  deleting one and undoing) no longer lands on disk without its children. A
+  reparent reaches syncback as a removal followed by an addition of the same
+  objects, and the removal only untracked the moved instance itself, so the
+  addition skipped every still-tracked descendant as an echo — while the
+  removal had already deleted their files. Removals now untrack the whole
+  subtree (`Tree.removeSubtree`, used by the read processor and by
+  daemon-applied removals alike), and the Watcher disconnects and rewires a
+  moved subtree cleanly instead of leaking a second set of connections. The
+  event → changes mapping moved from Core into `ReadProcessor.onEvent` so
+  `plugin/tests/syncback-subtree.luau` exercises exactly what Core runs
+  (`node scripts/check-plugin-syncback.mjs`)
 
 - Connecting to a game the WSync app already has a project for no longer
   offers the two-step Create Project confirm when its daemon is down: the
@@ -27,6 +49,24 @@ History prior to the fork lives in
 
 ### Added
 
+- `AvoidSync` attribute (`SyncScope`): an instance of any class whose boolean
+  `AvoidSync` attribute is `true` is kept in Studio with its whole subtree, on
+  the same plumbing as `--!ignoresync` — never paired at connect, never
+  snapshotted by live syncback, never walked by `read_subtree`. An Attributes
+  change that sets it on a tracked instance pushes a removal; one that clears
+  it pushes the subtree back as an addition. Daemon changes that arrive
+  carrying either marker are untracked on arrival (Studio-only from the moment
+  they land, nothing pushed back), and a live hydrate never pairs through, or
+  stands a copy beside, a kept-in-Studio instance. The connect stage line
+  counts both markers. Covered by `plugin/tests/exclusion-markers.luau`
+- `--!ignoresync` script directive (`SyncScope`): a script carrying it on its
+  own line within its first 10 lines is kept in Studio with its whole subtree —
+  never paired with a file at connect, never snapshotted by live syncback,
+  never walked by `read_subtree` (so its bytes never count against the
+  transfer bounds). A Source edit that adds the directive to a tracked script
+  pushes a removal (the daemon drops the disk copy); one that deletes it from
+  a kept-out script pushes the script back as an addition. The connect stage
+  line reports how many scripts the directive kept in Studio
 - Forked from argon-roblox 2.0.23 and rebranded to WSync
 - Transport-agnostic client layer (`src/Transport/`) with two implementations:
   the inherited HTTP long-poll path (msgpack) and a new `wsync/1` WebSocket

@@ -3,16 +3,17 @@
   "title": "wsync context",
   "category": "Command registry",
   "description": "Prints a compact LLM-oriented project context snapshot as JSON.",
-  "usage": "wsync context [--project <path>] [--port <port>] [--full-commands]",
+  "usage": "wsync context [--project <path>] [--port <port>] [--full-commands] [--raw]",
   "examples": [
     "wsync context --project .",
     "wsync context --project . --full-commands",
     "wsync context --project . --port 7978"
   ],
   "notes": [
-    "Does not mutate disk or Studio.",
-    "Includes project config, synced roots, key generated files, daemon status, daemon project mismatch warnings, conflict count, and command registry pointers.",
-    "Includes the `llmPolicy` block so agents that read only `context` still get the command budget: use `wsync commands --compact` and `wsync commands <name>` instead of dumping the full registry, and do not run `diff`, `changes`, `conflicts`, or live `source` as a startup ritual.",
-    "Use `--full-commands` only when the caller needs the complete embedded command registry in the same response."
+    "Reads project and daemon state without mutation or backlog cleanup. Missing live facts are null/unknown, not zero.",
+    "Includes canonical project identity, synced roots, generated-file presence, instruction-size warning, daemon/project match, plugin status, read-only backlog count and schema/build fingerprints.",
+    "Fetch when necessary project/connection facts are missing or stale. Refresh after project switches, reconnects, daemon restarts, binary upgrades or configuration changes. Reuse a successful snapshot during ordinary work.",
+    "Includes focused command/value-schema pointers and a concise llmPolicy: retain user authorization, coordinate one Studio lifecycle owner, avoid guessing value schemas, and check partial/unknown writes before retrying.",
+    "Use --full-commands only when the complete registry is needed; --raw returns a single JSON line."
   ]
 }

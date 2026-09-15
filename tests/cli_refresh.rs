@@ -383,7 +383,6 @@ fn snapshot_exports_the_live_tree_to_a_file() {
 	);
 }
 
-
 #[test]
 fn services_lists_roots_with_presence_on_both_sides() {
 	let daemon = start_daemon(None);

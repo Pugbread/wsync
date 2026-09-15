@@ -6,60 +6,13 @@
 mod common;
 
 use serde_json::{json, Value};
-use std::{fs, time::Duration};
+use std::time::Duration;
 
-use common::{connect_client, start_daemon, wait_for_frame, TestDaemon};
-
-const SETTLE: Duration = Duration::from_millis(600);
+use common::{start_daemon, TestDaemon};
 
 /// A well-formed ref no daemon-side instance ever has (the "Studio-only"
 /// side of the comparison)
 const STUDIO_ONLY_REF: &str = "ffffffffffffffffffffffffffffffff";
-
-async fn snapshot(daemon: &TestDaemon) -> Value {
-	reqwest::get(daemon.http("/snapshot"))
-		.await
-		.unwrap()
-		.json()
-		.await
-		.unwrap()
-}
-
-async fn child_ref(daemon: &TestDaemon, name: &str) -> Option<String> {
-	let snapshot = snapshot(daemon).await;
-
-	let storage = snapshot["children"]
-		.as_array()?
-		.iter()
-		.find(|child| child["name"] == "ReplicatedStorage")?;
-
-	storage["children"]
-		.as_array()?
-		.iter()
-		.find(|child| child["name"] == name)
-		.and_then(|child| child["id"].as_str())
-		.map(str::to_owned)
-}
-
-/// Writes a second module and waits until the watcher ingested it
-async fn grow_second_module(daemon: &TestDaemon) -> String {
-	tokio::time::sleep(SETTLE).await;
-	fs::write(daemon.src_dir().join("ModA.luau"), "return \"mod-a\"\n").unwrap();
-
-	let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-
-	loop {
-		if let Some(id) = child_ref(daemon, "ModA").await {
-			return id;
-		}
-
-		assert!(
-			tokio::time::Instant::now() < deadline,
-			"ModA never appeared in the tree"
-		);
-		tokio::time::sleep(Duration::from_millis(100)).await;
-	}
-}
 
 async fn post_json(daemon: &TestDaemon, path: &str, body: &Value) -> (reqwest::StatusCode, Value) {
 	let response = reqwest::Client::new()
@@ -73,13 +26,6 @@ async fn post_json(daemon: &TestDaemon, path: &str, body: &Value) -> (reqwest::S
 	(status, response.json().await.unwrap())
 }
 
-async fn get_json(daemon: &TestDaemon, path: &str) -> (reqwest::StatusCode, Value) {
-	let response = reqwest::get(daemon.http(path)).await.unwrap();
-	let status = response.status();
-
-	(status, response.json().await.unwrap())
-}
-
 fn entry(reference: &str, change: &str, class: &str, name: &str, instance_path: &str) -> Value {
 	json!({
 		"ref": reference,
@@ -89,11 +35,6 @@ fn entry(reference: &str, change: &str, class: &str, name: &str, instance_path: 
 		"instancePath": instance_path,
 	})
 }
-
-
-
-
-
 
 #[tokio::test]
 async fn compare_and_selection_validate_bounds() {

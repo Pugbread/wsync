@@ -30,10 +30,12 @@ mod upload;
 // The server's plugin-connect sites call the auto-refresh hook here
 pub(crate) mod refresh;
 mod serve;
+mod source_input;
 mod sourcemap;
 mod stop;
 mod studio;
 mod update;
+mod value_schema;
 mod watch;
 mod workflow;
 
@@ -92,7 +94,18 @@ pub struct Cli {
 
 impl Cli {
 	pub fn new() -> Cli {
-		Cli::parse()
+		let args: Vec<_> = env::args_os().collect();
+		if let Some(command) = args.get(1).and_then(|arg| arg.to_str()) {
+			if matches!(
+				command,
+				"diff" | "changes" | "conflicts" | "decision" | "resolve" | "review"
+			) {
+				clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, format!(
+					"`wsync {command}` belongs to the retired conflict-review workflow. WSync now uses Studio-first sync. Use `wsync backlog list --project <path>` to inspect retained disk edits; `backlog restore` writes them back. Run `wsync commands` for the current offline index and `wsync refresh --project <path>` to update stale project instructions.\n"
+				)).exit();
+			}
+		}
+		Cli::parse_from(args)
 	}
 
 	pub fn profile(&self) -> bool {

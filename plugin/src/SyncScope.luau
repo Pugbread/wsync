@@ -13,10 +13,12 @@
 --     and settings semantics stay as they were.
 --
 -- This module is the single owner of the allowlist, the current session's
--- scope, and the fixed-value resolution for the settings §7.0 retires. It is
+-- scope, the fixed-value resolution for the settings §7.0 retires, and the
+-- two Studio-side exclusion markers — the `AvoidSync` attribute and the
+-- `--!ignoresync` source directive — that keep an instance out of sync. It is
 -- deliberately require-free (the Protocol/Policy pattern) so a standalone
--- `luau` binary can load it for behavior tests; Core stamps the scope after
--- the hello and resets it on disconnect.
+-- `luau` binary can load it for behavior tests (`plugin/tests/`); Core stamps
+-- the scope after the hello and resets it on disconnect.
 
 local SyncScope = {}
 
@@ -72,6 +74,75 @@ end
 --- Is this class inside the code-scope allowlist?
 function SyncScope.isCodeClass(className: string?): boolean
 	return className ~= nil and SyncScope.CODE_CLASSES[className] == true
+end
+
+--------------------------------------------------------------------------------
+-- The `AvoidSync` attribute (Design §4.3)
+--------------------------------------------------------------------------------
+
+--- An instance of any class whose boolean `AvoidSync` attribute is `true`
+--- stays in Studio, together with everything under it: never written to
+--- disk, never pushed over from disk, never counted by the connect diff. The
+--- Studio-side counterpart of `ignoreGlobs` — set from the Properties panel
+--- or `wsync attr set`, no file edit needed — and the marker already used
+--- by existing places.
+SyncScope.AVOID_SYNC_ATTRIBUTE = "AvoidSync"
+
+--- Does this attribute value opt the instance out? Exactly the boolean
+--- `true` does; a string `"true"`, a number, or an absent attribute do not —
+--- the attribute is documented as boolean, and a lenient reading would make
+--- a typo in the Properties panel silently take a subtree out of sync.
+function SyncScope.attributeAvoidsSync(value: any): boolean
+	return value == true
+end
+
+--------------------------------------------------------------------------------
+-- The `--!ignoresync` source directive (Design §4.3)
+--------------------------------------------------------------------------------
+
+--- A script that carries `--!ignoresync` on its own line within its first
+--- `IGNORE_DIRECTIVE_LINES` lines stays in Studio, together with everything
+--- under it: never written to disk, never pushed over from disk, and none of
+--- its bytes count against the transfer bounds. The Studio-side counterpart
+--- of `ignoreGlobs` for the one exclusion the body of the script itself is
+--- the reason for — bulk data kept in string literals, far past what a
+--- per-root transfer should carry.
+SyncScope.IGNORE_DIRECTIVE = "--!ignoresync"
+SyncScope.IGNORE_DIRECTIVE_LINES = 10
+
+--- Does this source carry the directive? Leading whitespace is allowed, the
+--- match is case-insensitive, and the directive must end the line or be
+--- followed by whitespace (`--!ignoresyncing` is not it). Only the first
+--- `IGNORE_DIRECTIVE_LINES` lines are looked at, and nothing past the line
+--- being looked at is copied — a script this exists for may have a
+--- megabytes-long line right after the header, and this runs on every
+--- source edit.
+function SyncScope.sourceIgnoresSync(source: string): boolean
+	local directive = SyncScope.IGNORE_DIRECTIVE
+	local position = 1
+
+	for _ = 1, SyncScope.IGNORE_DIRECTIVE_LINES do
+		local newline = string.find(source, "\n", position, true)
+		local lineEnd = if newline then newline - 1 else #source
+		local start = string.find(source, "%S", position)
+
+		if start ~= nil and start <= lineEnd then
+			local candidate = string.lower(string.sub(source, start, start + #directive - 1))
+			local after = string.sub(source, start + #directive, start + #directive)
+
+			if candidate == directive and (after == "" or string.find(after, "%s") == 1) then
+				return true
+			end
+		end
+
+		if newline == nil then
+			break
+		end
+
+		position = newline + 1
+	end
+
+	return false
 end
 
 --------------------------------------------------------------------------------

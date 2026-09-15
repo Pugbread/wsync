@@ -53,7 +53,12 @@ pub struct Transmit {
 
 	/// Luau render source executed in Studio (eval trust — inspect scripts
 	/// first)
-	#[arg(long, value_name = "LUAU", conflicts_with = "source_file")]
+	#[arg(
+		long,
+		value_name = "LUAU",
+		conflicts_with = "source_file",
+		allow_hyphen_values = true
+	)]
 	source: Option<String>,
 
 	/// Read the render source from a file

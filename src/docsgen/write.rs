@@ -123,6 +123,12 @@ pub fn write_all(workspace_dir: &Path, docs: &GeneratedDocs, preserve: Preserve)
 			continue;
 		};
 
+		if file == DocFile::AgentsMd {
+			if let Some(warning) = super::agent_size_warning(&rendered) {
+				log::warn!("{warning}");
+			}
+		}
+
 		let status = if existing.as_deref() == Some(rendered.as_str()) {
 			WriteStatus::Unchanged
 		} else {

@@ -708,17 +708,15 @@ impl Capabilities {
 }
 
 impl Client {
-	/// Wraps an already-probed daemon, swallowing the identity check so the
-	/// tolerant diagnostics (`status`, `doctor`, `context`) can still ask a
-	/// mismatched daemon for its plugin state instead of aborting
+	/// Wraps an already-probed daemon only if its project matches. Tolerant
+	/// diagnostics can still report a mismatched `/hello` identity, but must
+	/// not send plugin operations to that unrelated project.
 	pub(crate) fn open_probed(target: &Target, hello: Option<Hello>) -> Option<Client> {
 		let hello = hello?;
 		let target = Target {
 			project_path: target.project_path.clone(),
 			project_exists: target.project_exists,
-			// Identity is reported as its own `doctor` check; re-checking it
-			// here would turn a reportable mismatch into a hard failure
-			canonical: None,
+			canonical: target.canonical.clone(),
 			state_dir: target.state_dir.clone(),
 			record: None,
 			port: target.port,

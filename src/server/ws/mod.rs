@@ -368,7 +368,16 @@ fn handle_plugin_frame(
 
 			frames_tx.try_send(frame.to_text()).ok();
 		}
-		Incoming::Response(response) => state.ws.resolve_request(response),
+		Incoming::Response(response) => {
+			// Audit at receipt time, including late answers after the HTTP
+			// caller timed out. Waiting for HTTP delivery used to lose them.
+			if let (Some(op), Some(meta)) = (state.ws.operation_name(response.request_id), response.meta.as_ref()) {
+				if meta.get("mutation").and_then(serde_json::Value::as_bool) == Some(true) {
+					state.audit.record(&op, response.ok, "cli", meta);
+				}
+			}
+			state.ws.resolve_request(response);
+		}
 		Incoming::Ping => {
 			frames_tx.try_send(ServerFrame::Pong.to_text()).ok();
 		}

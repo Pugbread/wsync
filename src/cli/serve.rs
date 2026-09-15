@@ -22,6 +22,10 @@ pub struct Serve {
 	#[arg()]
 	project: Option<PathBuf>,
 
+	/// Project path (named alternative to the positional project)
+	#[arg(long = "project", value_name = "PATH", conflicts_with = "project")]
+	project_flag: Option<PathBuf>,
+
 	/// Session identifier
 	#[arg()]
 	session: Option<String>,
@@ -53,7 +57,12 @@ pub struct Serve {
 
 impl Serve {
 	pub fn main(self) -> Result<()> {
-		let project_path = project::resolve(self.project.clone().unwrap_or_default())?;
+		let project_path = project::resolve(
+			self.project_flag
+				.clone()
+				.or_else(|| self.project.clone())
+				.unwrap_or_default(),
+		)?;
 
 		Config::load_workspace(project_path.get_parent());
 		let config = Config::new();
@@ -191,9 +200,14 @@ impl Serve {
 	}
 
 	fn spawn(self) -> Result<()> {
+		Program::new(ProgramName::Wsync).args(self.spawn_args()).spawn()?;
+		Ok(())
+	}
+
+	fn spawn_args(self) -> Vec<String> {
 		let mut args = vec![String::from("serve")];
 
-		if let Some(project) = self.project {
+		if let Some(project) = self.project_flag.or(self.project) {
 			args.push(project.to_string());
 		}
 
@@ -219,8 +233,27 @@ impl Serve {
 			args.push("--ts".into());
 		}
 
-		Program::new(ProgramName::Wsync).args(args).spawn()?;
+		args
+	}
+}
 
-		Ok(())
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn named_project_survives_child_arguments() {
+		let command = Serve::try_parse_from(["serve", "--project", "a project/default.project.json"]).unwrap();
+		let child = Serve::try_parse_from(command.spawn_args()).unwrap();
+		assert_eq!(child.project, Some(PathBuf::from("a project/default.project.json")));
+	}
+
+	#[test]
+	fn legacy_project_and_session_remain_supported() {
+		let command = Serve::try_parse_from(["serve", "place.json", "my-session"]).unwrap();
+		let child = Serve::try_parse_from(command.spawn_args()).unwrap();
+		assert_eq!(child.project, Some(PathBuf::from("place.json")));
+		assert_eq!(child.session.as_deref(), Some("my-session"));
+		assert!(Serve::try_parse_from(["serve", "place.json", "--project", "other.json"]).is_err());
 	}
 }

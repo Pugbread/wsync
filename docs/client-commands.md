@@ -35,7 +35,7 @@ Initializes a directory as a WSync project from a template and writes the projec
 **Usage**
 
 ```sh
-wsync init [--project <path>] [-T place|quick|model|package|plugin|empty] [--name <name>] [--game-id <id>] [--group-id <id>] [--place-id <id>]... [--git] [--wally] [--selene] [--docs] [--license <spdx>] [--ts] [--raw]
+wsync init [<path> | --project <path>] [-T <template>] [--git [true|false]] [--wally [true|false]] [--selene [true|false]] [--docs [true|false]] [--license <spdx>] [--ts [true|false]]
 ```
 
 **Examples**
@@ -43,50 +43,49 @@ wsync init [--project <path>] [-T place|quick|model|package|plugin|empty] [--nam
 ```sh
 wsync init --project .
 wsync init --project ./game -T place --git --wally --selene
-wsync init --project ./game --name my-game --game-id 123 --group-id 456 --place-id 789 --raw
+wsync init ./model -T model --docs false
 ```
 
 **Notes**
 
 - Templates are `place`, `quick`, `model`, `package`, `plugin`, and `empty`. They ship embedded, install to `~/.wsync/templates/`, and are versioned and refreshed by `wsync update templates`.
-- Writes `default.project.json` plus the generated agent docs (`wsync.md`, `AGENTS.md`, `CLAUDE.md`, `.codex/config.toml`). Existing custom project files are preserved or merged by the same guarded writers used by `wsync refresh`.
-- `--name`, `--game-id`, `--group-id`, and repeated `--place-id` populate the project identity fields; `--git`, `--wally`, `--selene`, `--docs`, `--license`, and `--ts` control scaffolding.
-- When the target directory holds a legacy pre-WSync single-file project config, `init` migrates it into `default.project.json` instead of reading it at runtime.
-- This command never starts a background process.
+- Writes default.project.json plus agent docs (a concise AGENTS.md contract linking the detailed wsync.md reference, CLAUDE.md import, and .codex/config.toml). Existing user notes are preserved by guarded writers.
+- Project names and Roblox identity fields belong in the generated .project.json config. `--git`, `--wally`, `--selene`, `--docs`, `--license`, and `--ts` control scaffolding.
+- An existing project is retained and init asks before adding missing template files. No legacy migration or identity flags are implied.
+- This command never starts a daemon.
 
 ---
 
 ### `wsync plugin`
 
-Installs, removes, or verifies the WSync Roblox Studio plugin in the local Studio plugins directory.
+Installs or removes a local WSync Studio plugin file.
 
 **Usage**
 
 ```sh
-wsync plugin <install|uninstall|status> [--source <WSync.rbxm>] [--plugin-dir <path>] [--raw]
+wsync plugin [install|uninstall] [<destination-path>]
 ```
 
 **Subcommands**
 
-- `install` — safety `writes-local-files`, requires `bundled-plugin`, `roblox-plugin-directory`
+- `install` — safety `writes-local-files`, requires `local-plugin-source`, `roblox-plugin-directory`
 - `uninstall` — safety `writes-local-files`, requires `roblox-plugin-directory`
-- `status` — safety `read-only`, requires `bundled-plugin`, `roblox-plugin-directory`
 
 **Examples**
 
 ```sh
 wsync plugin install
-wsync plugin status --raw
-wsync plugin uninstall --raw
-wsync plugin install --source ./plugin/WSync.rbxm --plugin-dir ./scratch-plugins --raw
+wsync plugin uninstall
+wsync plugin install ./scratch-plugins/WSync.rbxm
 ```
 
 **Notes**
 
-- `install` atomically writes `WSync.rbxm`; `status` compares the installed copy with the bundle by SHA-256 and reports whether the installed plugin's protocol matches this CLI's.
-- The default destination is ~/Documents/Roblox/Plugins on macOS and LocalAppData/Roblox/Plugins on Windows.
-- Install candidates are resolved next to the binary first, then in the desktop app resources; with no bundled copy available, `install` falls back to downloading the matching published release asset.
-- Installation removes stale `WSync.lua` and `WSync.luau` copies and reports that Studio must be restarted.
+- Default mode is install. The optional second positional argument is the destination file or directory, not a source plugin.
+- Installation searches plugin/WSync.rbxm relative to the working directory, then WSync.rbxm next to the CLI binary, then the binary-embedded plugin. If no source exists it returns an error; this command does not download one.
+- With no destination, Roblox Studio installation discovery chooses the local plugins directory. Directory destinations receive WSync.rbxm; smart_paths also interprets extensionless destinations.
+- Install creates destination parent directories and writes the plugin file. Uninstall removes that selected file and returns a filesystem error if it is absent.
+- No status subcommand or --raw/--source/--plugin-dir flags are implemented. Use the destination positional argument for a custom install location. Reload plugins or restart Studio to load a changed plugin file.
 
 ---
 
@@ -127,12 +126,12 @@ wsync auth clear --raw
 
 ### `wsync daemon`
 
-Starts, inspects, gracefully stops, restarts, or reads logs from one project-scoped managed background daemon.
+Starts, inspects, stops, restarts or reads logs from a project-scoped daemon with a lifecycle record.
 
 **Usage**
 
 ```sh
-wsync daemon <start|status|stop|restart|logs> --project <path> [options]
+wsync daemon <start|status|stop|restart|logs> [--project <path>] [options]
 ```
 
 **Subcommands**
@@ -149,30 +148,32 @@ wsync daemon <start|status|stop|restart|logs> --project <path> [options]
 wsync daemon start --project . --raw
 wsync daemon status --project . --raw
 wsync daemon stop --project . --timeout 10 --raw
-wsync daemon restart --project . --game-id 123 --place-id 456 --raw
+wsync daemon restart --project . --port 7978 --timeout 10 --raw
 wsync daemon logs --project . --lines 100
+wsync daemon start --project . --game-id 123 --place-id 456 --raw
 ```
 
 **Notes**
 
-- `start` and `restart` accept `--port`, `--projects-root`, `--managed-by`, `--data-dir`, `--timeout`, `--game-id`, `--group-id`, and repeated `--place-id`. `status`, `stop`, and `logs` use the same canonical project identity and optional `--data-dir`.
-- `--projects-root` enables the authenticated Studio project initializer for a manager-authorized canonical root; it is not required for normal project daemons.
-- A matching daemon already running for the project is returned instead of spawning a duplicate. A requested port serving another project is a hard error. `restart` prefers the port the daemon was already on.
-- Stop authenticates an exact canonical project and boot ID before graceful shutdown. WSync never kills a PID read from a stale runtime record.
-- Runtime records live under the platform data directory at `WSync/daemons/<sha256(project)>.json` beside their start lock and log file; the mutation audit log is `WSync/writes.log`.
-- `wsync daemon stop --project <path>` is the authenticated per-project form. `wsync stop` is the session-level form and works over `~/.wsync/sessions.toml`.
-- Desktop managers should supply their browser capability through `--owner-token-env <ENV>`; secrets are never returned by lifecycle JSON.
+- Start and restart serve in the current process; they do not detach into a background child. A process manager can launch them as a background service. --raw emits a readiness JSON line and then the process continues serving.
+- Start accepts --project, --port, --managed-by, --owner-token-env, --data-dir, --game-id, --group-id, repeated --place-id and --raw. Metadata flags persist those IDs into the project before startup.
+- Restart accepts --project, --port, --managed-by, --owner-token-env, --data-dir, --timeout and --raw. It uses persisted project metadata and does not accept game/group/place ID flags. The timeout is the wait for the old daemon to stop.
+- Status accepts --project, --data-dir and --raw. Stop also accepts --timeout. Logs accepts --project, --data-dir and --lines; it prints text lines without a --raw mode.
+- A matching daemon already running for the project is reported instead of starting a duplicate. A requested port serving another project is an error. Restart prefers the previous daemon port.
+- Stop verifies the exact live canonical project and boot ID before graceful shutdown. On graceful timeout it can use an OS-kill fallback only for that verified process; a stale PID record alone is insufficient.
+- Runtime records live in the platform data directory under WSync/daemons, alongside start locks and lifecycle logs. The mutation audit log is WSync/writes.log.
+- Desktop managers can supply an owner token through --owner-token-env <ENV>. Lifecycle JSON does not disclose the token. No --projects-root flag is implemented in this CLI family.
 
 ---
 
 ### `wsync serve`
 
-Runs the local HTTP/WebSocket daemon that bridges the Studio plugin, filesystem watcher, and CLI in the foreground.
+Runs a local HTTP/WebSocket server with filesystem watching, optionally in an asynchronous child process.
 
 **Usage**
 
 ```sh
-wsync serve --project <path> [--port <port>] [--projects-root <path>] [--sourcemap] [--ts] [--game-id <id>] [--group-id <id>] [--place-id <id>]...
+wsync serve [<project> [<session>] | --project <path>] [-H|--host <host>] [-P|--port <port>] [--sourcemap] [--ts] [-A|--async]
 ```
 
 **Examples**
@@ -180,16 +181,17 @@ wsync serve --project <path> [--port <port>] [--projects-root <path>] [--sourcem
 ```sh
 wsync serve --project . --port 7978
 wsync serve --project . --sourcemap
-wsync serve --project . --port 7978 --game-id 1234567890
+wsync serve . dev-session --port 7978 --async
 ```
 
 **Notes**
 
-- `serve` stays in the foreground for launchd, systemd, Task Scheduler, containers, or development terminals.
-- For an ordinary CLI-managed background process, use `wsync daemon start` instead.
-- The port defaults to 7978 and, with `scan_ports` enabled, auto-scans upward to `port_scan_max` for the first free port. Each serve registers a session in `~/.wsync/sessions.toml` so `wsync stop` can end it.
-- `--sourcemap` keeps a sourcemap regenerated from the live tree for as long as the daemon runs; `--ts` enables the roblox-ts passthrough.
-- `--projects-root` advertises the authenticated Studio project initializer and constrains creation to one direct child below that canonical directory. Omit it for ordinary manual daemons.
+- Runs in the foreground unless --async or the run_async configuration is enabled. --async spawns a WSync child process.
+- --project is the named alternative to the positional project. Use the positional form when also supplying a session identifier; both project forms together are rejected.
+- Host/port come from explicit flags, then the project, then configuration. With scan_ports enabled, a busy port scans upward to port_scan_max. The process registers in ~/.wsync/sessions.toml for wsync stop.
+- --sourcemap keeps sourcemap.json regenerated from the live tree. --ts enables the roblox-ts watcher.
+- For the project lifecycle record and manager authentication, use wsync daemon start. That command also stays in the current process while serving; launch it through your process manager when background operation is needed.
+- Serve does not accept game/group/place metadata flags. Configure project metadata in the project file or use wsync daemon start --game-id/--group-id/--place-id.
 
 ---
 
@@ -231,24 +233,26 @@ Prints generated command docs as JSON, either as a compact LLM index, one comman
 **Usage**
 
 ```sh
-wsync commands [command-name] [--compact]
+wsync commands [command [subcommand...]] [--compact | --full] [--project <path>]
 ```
 
 **Examples**
 
 ```sh
-wsync commands --compact
-wsync commands get
-wsync commands resolve
-wsync commands upload --compact
+wsync commands
+wsync commands attr ls
+wsync commands monetization gamepass list
+wsync commands types Vector3
+wsync commands types Color3
+wsync commands --full
 ```
 
 **Notes**
 
-- This is the LLM-facing replacement for scraping `--help` text.
-- Prefer `--compact` for choosing between command families. Prefer `wsync commands <name>` for the exact usage of the command about to be run.
-- Plain `wsync commands` prints the full registry and should be reserved for explicit full-doc requests.
-- The output is embedded verbatim from `docs/client-commands.generated.json`, which is rebuilt from `docs/commands/*.json`. The desktop Docs view and the published docs render the same bundle.
+- Defaults to a compact offline index; --compact remains an alias for index mode. --full explicitly prints the complete embedded registry.
+- Focused command lookup accepts nested paths and reports current parser help plus exact subcommand effects. --project is accepted for consistency and never causes discovery to connect to Studio.
+- `wsync commands types [TypeName]` provides offline JSON value schemas, field names, constraints and examples. Type lookup is case-insensitive.
+- The compact index includes CLI version, build commit/dirty identity, schema version and SHA-256 fingerprints of the embedded command and value catalogs. No network is required.
 
 ---
 
@@ -259,7 +263,7 @@ Prints a compact LLM-oriented project context snapshot as JSON.
 **Usage**
 
 ```sh
-wsync context [--project <path>] [--port <port>] [--full-commands]
+wsync context [--project <path>] [--port <port>] [--full-commands] [--raw]
 ```
 
 **Examples**
@@ -272,10 +276,11 @@ wsync context --project . --port 7978
 
 **Notes**
 
-- Does not mutate disk or Studio.
-- Includes project config, synced roots, key generated files, daemon status, daemon project mismatch warnings, conflict count, and command registry pointers.
-- Includes the `llmPolicy` block so agents that read only `context` still get the command budget: use `wsync commands --compact` and `wsync commands <name>` instead of dumping the full registry, and do not run `diff`, `changes`, `conflicts`, or live `source` as a startup ritual.
-- Use `--full-commands` only when the caller needs the complete embedded command registry in the same response.
+- Reads project and daemon state without mutation or backlog cleanup. Missing live facts are null/unknown, not zero.
+- Includes canonical project identity, synced roots, generated-file presence, instruction-size warning, daemon/project match, plugin status, read-only backlog count and schema/build fingerprints.
+- Fetch when necessary project/connection facts are missing or stale. Refresh after project switches, reconnects, daemon restarts, binary upgrades or configuration changes. Reuse a successful snapshot during ordinary work.
+- Includes focused command/value-schema pointers and a concise llmPolicy: retain user authorization, coordinate one Studio lifecycle owner, avoid guessing value schemas, and check partial/unknown writes before retrying.
+- Use --full-commands only when the complete registry is needed; --raw returns a single JSON line.
 
 ---
 
@@ -385,6 +390,7 @@ wsync capture viewport --project . --skybox --ui overlay --size 1920x1080 --outp
 - For every no-skybox capture, WSync temporarily moves every `Sky` and `Atmosphere` descendant out from under `Lighting` before rendering and watches for matching descendants added while capture is active. Cleanup restores each object to its exact original parent—even after preparation, rendering, transport, or PNG failure—and falls back to `Lighting` only if that parent disappeared. Camera, UI, Lighting properties, and temporary clones receive the same protected cleanup.
 - `--size WIDTHxHEIGHT` is optional and requests exact output dimensions. Without it, model captures use the focused-render default of 1024x1024 while UI and viewport captures keep their native/current render dimensions. `--output`/`-o`, `--timeout`, and `--raw` are common to every capture type; default files are `wsync-ui.png`, `wsync-model.png`, and `wsync-viewport.png`. Each axis is limited to 4096 pixels and the image to 16777216 pixels.
 - The plugin sends tightly packed RGBA8 in bounded chunks. The CLI checks dimensions, exact byte length, offsets, and EOF, then encodes and verifies the PNG locally. Raw output includes the absolute output path, MIME type, byte size, dimensions, SHA-256, and prepared capture metadata without placing pixels on stdout.
+- Negative camera vectors and CFrame components are accepted as separate option values, for example --direction -1,0,0. The equals form --direction=-1,0,0 works too.
 
 ---
 
@@ -431,6 +437,8 @@ wsync playtest input --project . --context client:1 --file ./input-actions.json 
 wsync playtest capture --project . --context client:1 --output ./captures/client-1.png --raw
 wsync playtest clip --project . --context client:1 --seconds 8 --output ./captures/client-1.mp4 --raw
 wsync playtest stop --project . --raw
+wsync playtest logs --project . --job job-id --context client:1 --since-seq 42 --raw
+wsync playtest wait --project . --job job-id --context client:1 --timeout 30 --raw
 ```
 
 **Notes**
@@ -448,6 +456,12 @@ wsync playtest stop --project . --raw
 - All runtime changes are temporary and never sync to disk or persist to edit mode. Play and Run DataModels are a separate environment and never reverse-sync. Run coordination is authenticated with the private job generation token. The start audit record includes script paths and SHA-256 hashes; the completion record includes the outcome and exit code.
 - `start` returns a lower-level asynchronous job. Use `--wait`, `playtest wait`, `status`, and `contexts` to synchronize with `server` and `client:N`; the low-level commands remain supported and unchanged.
 - Runtime copies communicate only with the edit-mode plugin through PluginConnectionService. They do not connect to localhost. `playtest capture --context client:N -o FILE` writes one PNG and `playtest clip --context client:N --seconds 1-30 -o FILE` writes one MP4; both take a PlayClient context only, because the PlayServer renders no viewport. A running experience cannot read a screenshot back into pixels, so the engine writes each frame into Roblox's capture directory and the local CLI copies it out and deletes it — no screenshot permission is requested and no artifact is uploaded from Studio.
+- playtest exec accepts exactly one of --source, --source-file or --stdin; --source-file - also reads stdin. Leading Luau comments are accepted inline. --timeout for exec is 1-60 seconds (other playtest operations have separate bounds).
+- playtest exec prints the runtime value/count result and exits nonzero when the submitted source fails, even if delivery succeeded. Earlier source mutations may have applied before that error.
+- Existing-job operations accept --job <ID>: status, contexts, wait, exec, logs, ui, input, capture, clip, stop, and request. A stale generation cannot select or mutate a newer runtime. Pin the job returned by start when coordinating multiple agents. start itself creates a new generation and rejects --job.
+- wait --context client:1 waits for that exact context to be ready; a different ready context does not satisfy it. start --wait pins its own returned job ID.
+- Exec results always include count. Returns without nil use value (one value or a dense array); returns containing nil use results with indexed slots {index:1,value:...} or {index:2,isNil:true}. Each returned value is serialized once so ordinary results retain the full 1 MiB envelope capacity.
+- The exec source timeout is separate from its request deadline: WSync reserves an additional 45 seconds for dispatch and multipart result transfer, so a valid near-deadline script is not cut off while returning its result.
 
 ---
 
@@ -489,14 +503,14 @@ Matches a selector inside Studio and optionally projects selected properties, at
 **Usage**
 
 ```sh
-wsync query [--project <path>] [--port <port>] <selector> [--prop <name>]... [--attributes] [--tags] [--limit <n>] [--format json|paths|classes]
+wsync query [--project <path>] [--port <port>] <selector> [--prop <name>]... [--attributes] [--tags] [--limit <n>] [--format json|paths|classes] [--raw]
 ```
 
 **Examples**
 
 ```sh
 wsync query --project . 'Workspace/**/Camera'
-wsync query --project . '**/RemoteEvent' --format paths
+wsync query --project . 'ReplicatedStorage/Remotes/**' --format paths
 wsync query --project . 'Workspace/**/Camera' --prop CFrame --prop FieldOfView --attributes --tags --limit 500 --format json
 ```
 
@@ -505,7 +519,9 @@ wsync query --project . 'Workspace/**/Camera' --prop CFrame --prop FieldOfView -
 - `*` matches one path segment and `**` matches zero or more segments.
 - Matching and projection run in Studio, making this preferable to requesting a deep full tree for broad searches.
 - Repeat `--prop` for only the properties you need; `--attributes` and `--tags` add those maps to each JSON match.
-- `--limit` defaults to 5000 and accepts 1-10000. JSON output is `{matches,count,truncated,truncationReason,limit,visitedNodes,responseBytes}`; paths/classes are line formats and print a reason-specific warning to stderr when the result is truncated.
+- `--limit` defaults to 200 and accepts 1-10000. JSON output is `{matches,count,truncated,truncationReason,limit,visitedNodes,responseBytes}`; paths/classes are line formats and print a reason-specific warning to stderr when the result is truncated.
+- Selectors match instance names and paths, not classes. To find every RemoteEvent regardless of name, use `wsync find --class RemoteEvent --under ReplicatedStorage --raw`.
+- --raw aliases the default JSON format; do not combine it with --format. --props is an alias of --prop (repeat once per property). Inspect truncated/truncationReason before treating results as complete; narrow the subtree or explicitly raise --limit if needed.
 
 ---
 
@@ -699,7 +715,7 @@ Prints an instance's script source from live Studio, or the content of the file 
 **Usage**
 
 ```sh
-wsync source --path <path> [--project <path>] [--port <port>] [--disk] [--raw]
+wsync source [<studio-path> | --path <studio-path>] [--project <path>] [--port <port>] [--disk] [--output <file>] [--raw]
 ```
 
 **Examples**
@@ -707,6 +723,7 @@ wsync source --path <path> [--project <path>] [--port <port>] [--disk] [--raw]
 ```sh
 wsync source --path ReplicatedStorage/Client/UIController
 wsync source --project . --path ReplicatedStorage/Client/UIController --disk
+wsync source ReplicatedStorage/Client/UIController --project . --output ./UIController.live.luau
 ```
 
 **Notes**
@@ -714,6 +731,7 @@ wsync source --project . --path ReplicatedStorage/Client/UIController --disk
 - Without `--disk`, reads the live `Source` through the plugin's `ScriptEditorService` path. Live source is unreliable while an editor draft is open for that script, so a mismatch is not by itself proof of divergence.
 - `--disk` resolves the target through the sync middleware, so `.model.json`, `.rbxm`, and `.data.json`-backed instances answer as well as plain script files.
 - This is a loose divergence diagnostic, not a verification step. To verify an edit, use the narrowest `wsync lint --path` plus a local file read.
+- Prefer --output to shell redirection for saved source: it writes only after a successful string response, using an atomic replacement. A failed read leaves an existing destination untouched. --raw preserves structured diagnostics; do not merge stderr into saved source. Output paths are relative to cwd.
 
 ---
 
@@ -756,11 +774,14 @@ wsync find-attr [--project <path>] [--port <port>] --name <attribute> [--under <
 ```sh
 wsync find-attr --project . --name Health --under Workspace
 wsync find-attr --project . --name Color --value '{"__type":"Color3","r":1,"g":0,"b":0}'
+wsync find-attr --project . --name SpawnOffset --value '{"__type":"Vector3","x":0,"y":5,"z":0}'
 ```
 
 **Notes**
 
 - `--value` uses the same JSON literal and tagged-value codec as `wsync set --value`.
+- Offline value schemas and copyable examples for every supported type: `wsync commands types`; narrow with `wsync commands types Vector3` or `wsync commands types Color3`. The live JSON wire format uses the exact `__type` key and lowercase component fields; arrays, constructor strings, and sidecar `{Vector3:[...]}` shapes are not equivalent.
+- Codec support does not imply attribute compatibility: Roblox SetAttribute supports only its attribute datatypes. Instance references, buffers, and output-only markers are not valid attribute values.
 
 ---
 
@@ -945,6 +966,7 @@ wsync lint --project . --compile required --luau-compile /path/to/luau-compile
 - Structured diagnostics recognize luau-lsp's default and GNU formatters, including adversarial Studio instance names. `--formatter=plain` is rejected because luau-lsp 1.68.1 can emit TypeErrors in that mode while returning a successful process status.
 - `--no-sourcemap` disables WSync DataModel coverage. Requiring `studio` or `filesystem` mode while disabling or replacing the generated sourcemap is rejected.
 - The narrowest `lint --path <file>` is the intended post-edit verification step; unrelated global diff output is not.
+- With an explicit --project, relative --path values are resolved against the selected project directory; absolute --path values remain absolute. Without --project, --path follows cwd. Tool and output file paths remain cwd-relative.
 
 ---
 
@@ -978,7 +1000,7 @@ Streams raw daemon WebSocket frames for debugging sync traffic.
 **Usage**
 
 ```sh
-wsync watch [--project <path>] [--port <port>] [--compact]
+wsync watch [<project> | --project <path>] [-P|--port <port>] [--compact] [--raw]
 ```
 
 **Examples**
@@ -987,12 +1009,15 @@ wsync watch [--project <path>] [--port <port>] [--compact]
 wsync watch
 wsync watch --project .
 wsync watch --compact
+wsync watch --project . --raw
 ```
 
 **Notes**
 
-- Connects as a `watch` role client and prints `wsync/1` JSON text frames as they pass: `sync`, `push`, `event`, `request`, `response`, and lifecycle frames.
-- Use this for debugging daemon/plugin traffic; `wsync tail` is better for Studio output.
+- Connects to the daemon WebSocket as a watch-role client and prints received event/lifecycle frames. Protocol heartbeat ping/pong messages are handled internally.
+- Without --port, it discovers the daemon port from the project runtime record, then the project file, then configuration. --project and the positional project are alternatives.
+- --raw suppresses the status banner and prints NDJSON frames. --compact prints one-line human summaries; combining it with --raw still selects summaries.
+- Use this for daemon/plugin events; wsync logs or wsync tail are the tools for Studio output.
 
 ---
 
@@ -1039,7 +1064,7 @@ wsync status --project . --raw
 
 **Notes**
 
-- Useful as the first live check before making further CLI calls; `wsync context` and `wsync status --raw` are the canonical opening pair for an agent.
+- Use when the task needs current daemon/plugin health or a failed live operation needs diagnosis. Existing fresh context often makes another status call unnecessary; there is no mandatory context/status startup pair.
 
 ---
 
@@ -1273,18 +1298,20 @@ wsync exec --project . 'game:GetService("Selection"):Set({})' --raw
 - `exec` is fire-and-forget: the daemon delivers one `execute` frame to every connected client and no value comes back. `wsync eval` is the request/response form and is what to use when the result matters.
 - Because it broadcasts, every connected place runs the code. Scope work with `wsync eval` when only one session should be touched.
 - `--focus` raises the Roblox Studio window before the code runs.
-- The broadcast is recorded in `writes.log` like other Studio mutations. Inspect the source first and confirm user intent before running it.
+- With --project, the daemon identity must match the canonical project and boot; --port never overrides that check. Legacy positional session/--host targeting remains available.
+- Success acknowledges that the daemon queued the broadcast. It does not prove the code ran or completed. HTTP/transport failures exit nonzero; a lost reply may follow execution, so inspect state before retrying. --raw exposes queued and completion:unknown.
+- Use within existing task authorization. --standalone fails explicitly and points to playtest run; it is not implemented.
 
 ---
 
 ### `wsync studio`
 
-Launches Roblox Studio, optionally opening a place or model file, or reports whether Studio is already running.
+Launches Roblox Studio, optionally opening a place/model file, with an option to reuse an already running Studio.
 
 **Usage**
 
 ```sh
-wsync studio [<place-path>] [-c|--check] [--raw]
+wsync studio [<place-path>] [-c|--check]
 ```
 
 **Examples**
@@ -1292,16 +1319,15 @@ wsync studio [<place-path>] [-c|--check] [--raw]
 ```sh
 wsync studio
 wsync studio ./build/game.rbxl
-wsync studio --check --raw
+wsync studio --check
 ```
 
 **Notes**
 
-- Controls the local Studio application only. No project, daemon, or plugin connection is required.
-- With no argument Studio is launched empty; a path opens that place or model file.
-- `--check` launches nothing and reports whether a Studio process is running, exiting non-zero when it is not.
-- Launching is asynchronous: the command returns once Studio has been started, not once the place has finished loading.
-- The plugin connects on its own after Studio loads, by port scan and GameId match; this command does not perform the handshake.
+- Controls the local Studio application; no project, daemon or plugin connection is required.
+- With no path it launches Studio without a place file; a path opens that file.
+- --check means launch only when Studio is not already running. When Studio is running it reports that fact and exits successfully; when Studio is absent it launches Studio. This is not a read-only process-status query.
+- Launching returns before the place has finished loading. The plugin performs its own connection handshake afterwards.
 
 ---
 
@@ -1397,8 +1423,8 @@ wsync refresh --project . --raw
 
 - Updates `wsync.md`, `AGENTS.md`, `CLAUDE.md`, and `.codex/config.toml` while preserving project notes outside the generated marker blocks. Marker blocks owned by other tools are left untouched.
 - The generated docs also regenerate automatically on every plugin connect.
-- The generated content is templated from the live project config: the sync-scope statement, synced-roots list, and filesystem-conventions table are rendered from the project's actual tree and sync rules, including custom `syncRules` and `OnlyCodeMode`, so the steering never describes a scope this project does not have.
-- When Wally is enabled or a `wally.toml` is present, the regenerated `AGENTS.md` block embeds the resolved Wally settings and package config.
+- AGENTS.md contains a concise generated contract (at most 8 KiB) linking the detailed wsync.md project reference. Actual project mappings and active sync rules remain in that reference.
+- User notes and foreign marker blocks are preserved. Oversized AGENTS.md files trigger an instruction-budget warning; WSync never truncates notes. `wsync context` exposes size and warning metadata.
 
 ---
 
@@ -1419,6 +1445,10 @@ wsync set [--project <path>] [--port <port>] (--path <studio-path> --prop <prope
 ```sh
 wsync set --project . --path Workspace/Camera --prop FieldOfView --value 90
 wsync set --project . --batch writes.json --waypoint "refactor camera"
+wsync set --project . --path Workspace/Box --prop Size --value '{"__type":"Vector3","x":12,"y":8,"z":28}'
+wsync set --project . --path Workspace/Box --prop Color --value '{"__type":"Color3","r":1,"g":0.5,"b":0}'
+wsync set --project . --path Workspace/Box --prop CFrame --value '{"__type":"CFrame","components":[0,5,0]}'
+wsync set --project . --path Workspace/Box --prop Material --value '{"__type":"EnumItem","enum":"Enum.Material","name":"Neon"}'
 ```
 
 **Notes**
@@ -1430,6 +1460,9 @@ wsync set --project . --batch writes.json --waypoint "refactor camera"
 - `--waypoint` brackets the write so one Studio undo can reverse the batch.
 - `--batch` rejects the whole batch before any network call when any entry trips a guardrail; `--keep-going` only relaxes per-entry runtime failures, never the pre-flight guards.
 - Live mutating commands are user-initiated escape hatches. Inspect the exact live target with read-only commands and confirm intent before running one.
+- Offline value schemas and copyable examples for every supported type: `wsync commands types`; narrow with `wsync commands types Vector3` or `wsync commands types Color3`. The live JSON wire format uses the exact `__type` key and lowercase component fields; arrays, constructor strings, and sidecar `{Vector3:[...]}` shapes are not equivalent.
+- Color3 r/g/b use the 0–1 scale, not 0–255. For RGB(255,128,0), use {"__type":"Color3","r":1,"g":0.5019607843137255,"b":0}. Vector3 uses {"__type":"Vector3","x":1,"y":2,"z":3}.
+- Content has no JSON input tag: use native `Content.fromUri(...)` in `eval`/`exec` for Content properties, or an available legacy string property. Native Roblox datatype globals are already available there; no extra sandbox permission is needed for Vector3/Color3/CFrame constructors.
 
 ---
 
@@ -1448,6 +1481,7 @@ wsync new [--project <path>] [--port <port>] --path <parent-path> --class <Class
 ```sh
 wsync new --project . --path Workspace --class Part --name Box --props '{"Anchored":true}'
 wsync new --project . --path ReplicatedStorage --class RemoteEvent --name DamageEvent
+wsync new --project . --path Workspace --class Part --name Box --props '{"Anchored":true,"Size":{"__type":"Vector3","x":12,"y":8,"z":28},"Color":{"__type":"Color3","r":1,"g":0.5,"b":0}}'
 ```
 
 **Notes**
@@ -1456,6 +1490,9 @@ wsync new --project . --path ReplicatedStorage --class RemoteEvent --name Damage
 - `--name` (and a `Name` in `--props`) must not be empty or contain `/`: paths are `/`-separated with no escaping, so such a name could never be addressed by a path-based command. The refusal happens before any request is made, and the plugin refuses the same write again.
 - The created instance is written to `writes.log`.
 - If the parent is inside the project's projection, the new instance syncs back to disk through the write middleware; a leaf class with no dedicated middleware becomes a folder plus `.data.json`, or a `<Name>.model.json` when `syncback_model_json` is enabled.
+- Offline value schemas and copyable examples for every supported type: `wsync commands types`; narrow with `wsync commands types Vector3` or `wsync commands types Color3`. The live JSON wire format uses the exact `__type` key and lowercase component fields; arrays, constructor strings, and sidecar `{Vector3:[...]}` shapes are not equivalent.
+- Color3 r/g/b use the 0–1 scale, not 0–255. For RGB(255,128,0), use {"__type":"Color3","r":1,"g":0.5019607843137255,"b":0}. Vector3 uses {"__type":"Vector3","x":1,"y":2,"z":3}.
+- Content has no JSON input tag: use native `Content.fromUri(...)` in `eval`/`exec` for Content properties, or an available legacy string property. Native Roblox datatype globals are already available there; no extra sandbox permission is needed for Vector3/Color3/CFrame constructors.
 
 ---
 
@@ -1529,13 +1566,17 @@ wsync attr <set|rm|ls> [--project <path>] [--port <port>] --path <studio-path> [
 wsync attr set --project . --path Workspace/Box --name Speed --value 12.5
 wsync attr rm --project . --path Workspace/Box --name Speed
 wsync attr ls --project . --path Workspace/Box
+wsync attr set --project . --path Workspace/Box --name SpawnOffset --value '{"__type":"Vector3","x":0,"y":5,"z":0}'
 ```
 
 **Notes**
 
 - `attr ls` is read-only; `attr set` and `attr rm` are written to `writes.log`.
 - `--value` uses the same JSON literal and tagged-value codec as `wsync set --value`.
-- Attributes on projected instances sync back to their `.data.json` sidecar. Setting the boolean `AvoidSync` attribute to true excludes that subtree from sync in both directions, including divergence comparison.
+- Attributes on projected instances sync back to their `.data.json` sidecar. Setting the boolean `AvoidSync` attribute to `true` keeps that instance and its subtree in Studio: the plugin pushes a removal (its files leave disk, as for a deletion in Studio), and from then on nothing under it is written to disk, pushed over from disk, or counted by the connect-time comparison. Removing the attribute syncs the subtree back. The daemon never reads the attribute from a sidecar; a disk-side exclusion is `ignoreGlobs`.
+- Offline value schemas and copyable examples for every supported type: `wsync commands types`; narrow with `wsync commands types Vector3` or `wsync commands types Color3`. The live JSON wire format uses the exact `__type` key and lowercase component fields; arrays, constructor strings, and sidecar `{Vector3:[...]}` shapes are not equivalent.
+- Color3 r/g/b use the 0–1 scale, not 0–255. For RGB(255,128,0), use {"__type":"Color3","r":1,"g":0.5019607843137255,"b":0}. Vector3 uses {"__type":"Vector3","x":1,"y":2,"z":3}.
+- Codec support does not imply attribute compatibility: Roblox SetAttribute supports only its attribute datatypes. Instance references, buffers, and output-only markers are not valid attribute values.
 
 ---
 
@@ -1582,12 +1623,15 @@ wsync call [--project <path>] [--port <port>] --path <studio-path> --method <Met
 
 ```sh
 wsync call --project . --path Workspace/Folder --method FindFirstChild --args '["Box"]'
+wsync call --project . --path Workspace/Box --method PivotTo --args '[{"__type":"CFrame","components":[0,5,0]}]'
 ```
 
 **Notes**
 
 - `--args` is a JSON array using the same tagged-value codec as `wsync set --value`.
 - Treat methods with side effects as writes; successful calls are audited.
+- Offline value schemas and copyable examples for every supported type: `wsync commands types`; narrow with `wsync commands types Vector3` or `wsync commands types Color3`. The live JSON wire format uses the exact `__type` key and lowercase component fields; arrays, constructor strings, and sidecar `{Vector3:[...]}` shapes are not equivalent.
+- Content has no JSON input tag: use native `Content.fromUri(...)` in `eval`/`exec` for Content properties, or an available legacy string property. Native Roblox datatype globals are already available there; no extra sandbox permission is needed for Vector3/Color3/CFrame constructors.
 
 ---
 
@@ -1627,20 +1671,23 @@ Executes Luau source inside Studio through the plugin sandbox and returns the re
 **Usage**
 
 ```sh
-wsync eval [--project <path>] [--port <port>] --source <luau> [--raw]
+wsync eval [--project <path>] [--port <port>] (--source <luau> | --source-file <file> | --stdin) [--raw]
 ```
 
 **Examples**
 
 ```sh
-wsync eval --project . --source 'return #game.Workspace:GetChildren()'
+wsync eval --project . --source 'return Vector3.new(1, 2, 3)'
+wsync eval --project . --source-file ./scripts/probe.luau --raw
+wsync eval --project . --stdin --raw
 ```
 
 **Notes**
 
-- Use `return ...` when you need a returned value.
-- `eval` is request/response against one connected Studio session and carries the standard 5 second remote-op timeout. `wsync exec` is the fire-and-forget broadcast form and returns no value.
-- This is the broadest escape hatch; ask before using it for mutations.
+- Use `return ...` when you need a returned value. Native Roblox globals such as Vector3.new, Color3.fromRGB, CFrame.new, UDim2.new, Enum, and Instance.new are available in Studio execution; the JSON wire tags are for set/new/attr/call arguments. Discover them offline with `wsync commands types`.
+- Choose exactly one source input. `--source-file -` also reads stdin. Source file paths are relative to the shell working directory. Leading comments (including --!strict) are accepted by --source; file/stdin avoids shell quoting and argument length limits.
+- `eval` is request/response against one connected Studio session and carries the standard 5 second remote-op timeout. `wsync exec` is the fire-and-forget broadcast form and acknowledges queuing only.
+- Use within the user-authorized task scope. A timeout or execution/encoding failure can follow earlier mutations; inspect affected state before retrying, and use the operation receipt when provided.
 
 ---
 
@@ -1800,7 +1847,7 @@ Serializes the project tree into a Roblox place or model file, optionally rebuil
 **Usage**
 
 ```sh
-wsync build [--project <path>] [-o|--output <file>] [-w|--watch] [-s|--sourcemap] [-p|--plugin] [-x|--xml] [--ts] [--raw]
+wsync build [--project <path>] [-o|--output <file>] [-w|--watch] [-s|--sourcemap] [-p|--plugin] [-x|--xml] [--ts]
 ```
 
 **Examples**
@@ -1820,6 +1867,7 @@ wsync build --project . --plugin --xml
 - `--watch` stays in the foreground and rebuilds off the internal change bus; add `--sourcemap` to keep the sourcemap regenerated alongside each build.
 - `--ts` enables the roblox-ts passthrough for TypeScript projects.
 - The output is a build artifact, not a sync surface: writing it back into the project does not push anything to Studio.
+- --project and the positional project path are alternatives; supplying both is an error. Output file paths stay relative to cwd.
 
 ---
 
@@ -1830,7 +1878,7 @@ Writes a Rojo-style sourcemap of the project tree for luau-lsp and other editor 
 **Usage**
 
 ```sh
-wsync sourcemap [--project <path>] [-o|--output <file>] [-w|--watch] [--non-scripts] [--raw]
+wsync sourcemap [<project> [<session>] | --project <path>] [-o|--output <file>] [-w|--watch] [--non-scripts] [-A|--async]
 ```
 
 **Examples**
@@ -1843,11 +1891,12 @@ wsync sourcemap --project . --watch --non-scripts
 
 **Notes**
 
-- Requires a project. It serializes from the tree without a daemon or Studio plugin connection.
-- The default output is `sourcemap.json` in the project root; `--output` redirects it.
-- Only script-backed instances are emitted by default and Rojo-style pruning drops branches that back no files. `--non-scripts` emits every instance in the tree instead.
-- `--watch` stays in the foreground and rewrites the file from the internal change bus on every tree change.
-- `wsync lint` consumes this file; `wsync repair sourcemap` is the maintenance path that rebuilds it once from disk when it is missing or stale.
+- Requires a project. It serializes the filesystem projection without a daemon or Studio plugin connection.
+- Without --output, the sourcemap JSON is printed to stdout. Use --output sourcemap.json to create the file consumed by editor tooling.
+- Only script-backed instances and their ancestors are emitted by default. --non-scripts includes non-script instances.
+- --watch regenerates on each tree change, printing another JSON value to stdout or rewriting --output. It stays in the foreground unless --async or the run_async configuration is enabled.
+- --project is the named alternative to the first positional project path. To supply a legacy session identifier, use the positional form: wsync sourcemap <project> <session> --watch. Do not provide both project forms.
+- wsync repair sourcemap is the maintenance path to rebuild a missing or stale sourcemap once.
 
 ---
 
@@ -1855,19 +1904,19 @@ wsync sourcemap --project . --watch --non-scripts
 
 ### `wsync update`
 
-Updates the WSync CLI, Studio plugin, and project templates from the published releases.
+Updates selected WSync components: CLI/plugin from releases and templates from the embedded bundle.
 
 **Usage**
 
 ```sh
-wsync update [cli|plugin|templates|all] [--force] [--raw]
+wsync update [cli|plugin|templates|all] [-f|--force]
 ```
 
 **Subcommands**
 
 - `cli` — safety `replaces-local-binary`, requires `network`
 - `plugin` — safety `writes-local-files`, requires `network`, `roblox-plugin-directory`
-- `templates` — safety `writes-local-files`, requires `network`
+- `templates` — safety `writes-local-files`, requires nothing
 - `all` — safety `replaces-local-binary`, requires `network`, `roblox-plugin-directory`
 
 **Examples**
@@ -1876,17 +1925,16 @@ wsync update [cli|plugin|templates|all] [--force] [--raw]
 wsync update
 wsync update cli --force
 wsync update plugin
-wsync update templates --raw
+wsync update templates
 ```
 
 **Notes**
 
-- Defaults to `all`. Installed versions are tracked in `~/.wsync/update.toml`.
-- `cli` replaces the self-installed binary in `~/.wsync/bin`. A package-managed install is refused with the package manager's own upgrade command instead of being overwritten.
-- `--force` reinstalls the current version and skips the already-up-to-date short-circuit.
-- A passive check runs at most hourly and only prints a notice; `check_updates` disables it and `auto_update` makes it apply without asking.
-- `plugin` writes to the Roblox Studio plugins directory and requires a Studio restart. `templates` refreshes `~/.wsync/templates/` under the `update_templates` config option.
-- Binary, plugin, protocol number, and generated docs are released together from one commit; update them as a set rather than individually when a protocol number changes.
+- Default mode is all: it updates the CLI and includes the plugin/templates according to install_plugin and update_templates configuration. Explicit plugin or templates mode selects that component regardless of those all-mode switches.
+- CLI and plugin updates request GitHub releases. Template updates use the templates embedded in this CLI and do not need a release download.
+- --force bypasses WSync version guards and attempts the selected updates even when recorded versions appear current. Version bookkeeping is stored in ~/.wsync/update.toml.
+- Update output is human-readable; --raw is not implemented. Studio must reload the changed plugin file or restart before using it.
+- Use a matching CLI/plugin build when the protocol changes. An update command is an explicit mutation, not an offline version check.
 
 ---
 
@@ -1956,19 +2004,18 @@ Opens the WSync documentation site in the default browser.
 **Usage**
 
 ```sh
-wsync doc [--raw]
+wsync doc
 ```
 
 **Examples**
 
 ```sh
 wsync doc
-wsync doc --raw
 ```
 
 **Notes**
 
-- Prints the documentation URL and hands it to the system handler; `--raw` prints the URL as JSON and opens nothing.
-- For the command surface itself, `wsync commands` serves the same generated registry offline and is the right tool for agents and for machines without a browser.
+- Opens https://github.com/Pugbread/wsync with the system browser and prints the URL. Browser launch failure is a command error.
+- For offline command documentation without opening a browser, use wsync commands <command>, wsync commands --compact, or wsync commands types.
 
 ---

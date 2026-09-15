@@ -1,7 +1,7 @@
 //! Search: `query`, `find`, `find-attr` (query.json, find.json,
 //! find-attr.json).
 //!
-//! `query` has no `--raw`: `--format json` *is* its machine-readable form
+//! `query --raw` aliases `--format json`, its machine-readable form
 //! (query.json pins that shape), while `paths`/`classes` are line formats
 //! that report truncation on stderr instead of in the payload.
 //!
@@ -48,7 +48,7 @@ pub struct Query {
 	selector: String,
 
 	/// Project this property onto every match (repeatable)
-	#[arg(long = "prop", value_name = "NAME")]
+	#[arg(long = "prop", visible_alias = "props", value_name = "NAME")]
 	props: Vec<String>,
 
 	/// Include each match's attributes
@@ -60,18 +60,23 @@ pub struct Query {
 	tags: bool,
 
 	/// Maximum matches to return (1-10000, validated before the request)
-	#[arg(long, value_name = "N", default_value = "5000", value_parser = clap::value_parser!(u32).range(1..=10000))]
+	#[arg(long, value_name = "N", default_value = "200", value_parser = clap::value_parser!(u32).range(1..=10000))]
 	limit: u32,
 
 	/// Output format
 	#[arg(long, value_enum, default_value = "json")]
 	format: Format,
+
+	/// Print JSON (alias for --format json)
+	#[arg(long, conflicts_with = "format")]
+	raw: bool,
 }
 
 impl Query {
 	pub fn main(self) -> Result<()> {
-		// `--limit` is range-checked by the parser, so an out-of-range value
-		// never reaches the network (query.json: CLI-side limit validation)
+		let _ = self.raw; // JSON is already the default; clap guards conflicting formats.
+					// `--limit` is range-checked by the parser, so an out-of-range value
+					// never reaches the network (query.json: CLI-side limit validation)
 		let client = Client::connect(&self.targeting)?;
 
 		let args = json!({
@@ -160,6 +165,7 @@ impl Find {
 
 /// Find live Studio instances carrying a named attribute
 #[derive(Parser)]
+#[command(after_help = crate::cli::value_schema::help())]
 pub struct FindAttr {
 	#[command(flatten)]
 	targeting: Targeting,
@@ -170,7 +176,7 @@ pub struct FindAttr {
 
 	/// Attribute value as a JSON literal or tagged value; bare text that is
 	/// not valid JSON is taken as a string
-	#[arg(long, value_name = "JSON")]
+	#[arg(long, value_name = "JSON", allow_hyphen_values = true)]
 	value: Option<String>,
 
 	/// Scope the search to this subtree (default: the whole DataModel)
@@ -184,8 +190,6 @@ pub struct FindAttr {
 
 impl FindAttr {
 	pub fn main(self) -> Result<()> {
-		let client = Client::connect(&self.targeting)?;
-
 		let mut args = json!({
 			"name": self.name,
 			"under": self.under.clone().unwrap_or_default(),
@@ -193,8 +197,10 @@ impl FindAttr {
 
 		if let Some(literal) = &self.value {
 			args["value"] = parse_literal(literal);
+			crate::cli::value_schema::validate_cli(&args["value"], self.raw)?;
 		}
 
+		let client = Client::connect(&self.targeting)?;
 		let value = client.value("find_by_attr", args, self.raw)?;
 
 		report_matches(&value, self.raw, self.under.as_deref())

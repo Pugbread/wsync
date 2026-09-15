@@ -110,6 +110,7 @@ winsafe = { version = "0.0.26", features = ["user"] }
 anyhow = "1.0.102"
 
 [dev-dependencies]
+shell-words = "1.1.0"
 approx = "0.5.1"
 tokio-tungstenite = "0.24.0"
 tempfile = "3.14.0"

@@ -9,6 +9,6 @@
     "wsync status --project . --raw"
   ],
   "notes": [
-    "Useful as the first live check before making further CLI calls; `wsync context` and `wsync status --raw` are the canonical opening pair for an agent."
+    "Use when the task needs current daemon/plugin health or a failed live operation needs diagnosis. Existing fresh context often makes another status call unnecessary; there is no mandatory context/status startup pair."
   ]
 }

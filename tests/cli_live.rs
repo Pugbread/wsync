@@ -3,16 +3,13 @@
 //! plugin on the WebSocket, so discovery, the `POST /request` hop, `--raw`
 //! shapes, and exit codes are exercised end to end rather than mocked.
 //!
-//! Three fixtures carry the file:
+//! Two fixtures carry the file:
 //!
 //! * `Sandbox` — an isolated `$HOME` and state dir, so a test run never
 //!   touches the developer's `~/.wsync` and never reaches the network;
 //! * `spawn_plugin` — a WS client in the plugin slot that answers `request`
 //!   frames from a per-test responder (including "never answer", for the
-//!   timeout path);
-//! * `spawn_stub` — a ~40-line HTTP responder for the `/review` (and legacy
-//!   `/choice`) surfaces, so the CLI shapes are pinned without staging a full
-//!   Studio-first apply.
+//!   timeout path).
 
 mod common;
 
@@ -20,8 +17,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::{
 	fs,
-	io::{BufRead, BufReader, Read, Write},
-	net::{TcpListener, TcpStream},
+	net::TcpListener,
 	path::Path,
 	process::{Command, Output},
 	sync::Arc,
@@ -98,15 +94,6 @@ fn raw_json(output: &Output) -> Value {
 		.unwrap_or_else(|| panic!("no stdout to parse as JSON; stderr was:\n{}", stderr(output)));
 
 	serde_json::from_str(line).unwrap_or_else(|err| panic!("stdout is not JSON ({err}): {line}"))
-}
-
-/// Every NDJSON line a `--raw` listing prints on stdout
-fn raw_lines(output: &Output) -> Vec<Value> {
-	stdout(output)
-		.lines()
-		.filter(|line| !line.trim().is_empty())
-		.map(|line| serde_json::from_str(line).unwrap_or_else(|err| panic!("stdout is not NDJSON ({err}): {line}")))
-		.collect()
 }
 
 /// What the fake plugin does with one `request` frame
@@ -208,99 +195,6 @@ fn table_responder(entries: Vec<(&'static str, Value)>) -> Responder {
 		Some((_, value)) => Answer::Value(value.clone()),
 		None => Answer::Failure("UNKNOWN_OP", "the fake plugin does not implement this op"),
 	})
-}
-
-/// `GET /hello` body for a stub daemon claiming to serve `project_file`, so
-/// the CLI's identity check passes
-fn stub_hello(project_file: &Path) -> String {
-	json!({
-		"name": "wsync-fixture",
-		"version": "0.1.0",
-		"protocol": 1,
-		"project": project_file.to_string_lossy(),
-		"canonicalProject": project_file.to_string_lossy(),
-		"bootId": "stub-boot",
-		"pid": 1,
-		"port": 0,
-		"managedBy": "test",
-	})
-	.to_string()
-}
-
-/// A minimal HTTP/1.1 responder for endpoints the real daemon build does not
-/// serve yet. Routes are keyed `"<METHOD> <path>"`, ignoring the query string
-fn spawn_stub(routes: Vec<(&'static str, u16, String)>) -> u16 {
-	let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-	let port = listener.local_addr().unwrap().port();
-
-	thread::spawn(move || {
-		for stream in listener.incoming() {
-			let Ok(stream) = stream else {
-				continue;
-			};
-
-			serve_once(stream, &routes);
-		}
-	});
-
-	port
-}
-
-fn serve_once(mut stream: TcpStream, routes: &[(&'static str, u16, String)]) {
-	let mut reader = BufReader::new(stream.try_clone().unwrap());
-	let mut request_line = String::new();
-
-	if reader.read_line(&mut request_line).is_err() {
-		return;
-	}
-
-	let mut content_length = 0usize;
-
-	loop {
-		let mut header = String::new();
-
-		if reader.read_line(&mut header).is_err() || header.trim().is_empty() {
-			break;
-		}
-
-		if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
-			content_length = value.trim().parse().unwrap_or(0);
-		}
-	}
-
-	if content_length > 0 {
-		// Drain the body so the client sees a clean response, not a reset
-		let mut body = vec![0; content_length];
-		reader.read_exact(&mut body).ok();
-	}
-
-	let mut parts = request_line.split_whitespace();
-	let method = parts.next().unwrap_or("GET").to_owned();
-	let path = parts.next().unwrap_or("/").split('?').next().unwrap_or("/").to_owned();
-	let route_key = format!("{method} {path}");
-
-	// Unrouted paths mirror the real daemon, which redirects unknown routes
-	// to `/` instead of answering 404
-	let (status, body) = routes
-		.iter()
-		.find(|(route, _, _)| *route == route_key)
-		.map(|(_, status, body)| (*status, body.clone()))
-		.unwrap_or((307, String::new()));
-
-	let reason = match status {
-		200 => "OK",
-		307 => "Temporary Redirect",
-		409 => "Conflict",
-		_ => "Not Found",
-	};
-
-	let response = format!(
-		"HTTP/1.1 {status} {reason}\r\nLocation: /\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-		body.len()
-	);
-
-	stream.write_all(response.as_bytes()).ok();
-	stream.flush().ok();
 }
 
 /// A port nothing listens on, for the checks that must fail before any
@@ -819,11 +713,6 @@ fn a_silent_plugin_trips_the_five_second_remote_timeout() {
 		"the remote deadline fired early ({elapsed:?}) — the 5 s default is not being sent"
 	);
 }
-
-// ---------------------------------------------------------------------------
-// Conflict / decision surface
-// ---------------------------------------------------------------------------
-
 
 // ---------------------------------------------------------------------------
 // source --disk (no daemon involved)

@@ -215,7 +215,7 @@ local function awaitQuietStudio(timeoutSec: number): boolean
 end
 
 --- Resolve a live context of the active generation or raise NOT_FOUND.
-local function requireContext(contextName: Any): (Jobs.Context, Link, Jobs.Job)
+local function requireContext(contextName: Any, jobId: string?): (Jobs.Context, Link, Jobs.Job)
 	requireAvailable()
 
 	if type(contextName) ~= "string" or contextName == "" then
@@ -223,6 +223,10 @@ local function requireContext(contextName: Any): (Jobs.Context, Link, Jobs.Job)
 	end
 
 	pruneDeadContexts()
+
+	if jobId ~= nil and registry.latestJobId ~= jobId then
+		error(Error.new(Error.CONFLICT, `refusing stale playtest generation {jobId}; current job is {registry.latestJobId or "none"}`), 0)
+	end
 
 	local context = Jobs.liveContext(registry, contextName)
 
@@ -234,6 +238,10 @@ local function requireContext(contextName: Any): (Jobs.Context, Link, Jobs.Job)
 			),
 			0
 		)
+	end
+
+	if context.jobId ~= registry.latestJobId or (jobId ~= nil and context.jobId ~= jobId) then
+		error(Error.new(Error.CONFLICT, `playtest context '{contextName}' belongs to a different generation`), 0)
 	end
 
 	local link = links[context.runtimeId]
@@ -254,8 +262,8 @@ end
 --- One request/response round-trip to a live context. Raises TIMEOUT when
 --- the runtime does not answer in time, or a typed error carrying whatever
 --- the runtime reported.
-local function request(contextName: string, op: string, args: { [string]: Any }, timeoutSec: number): Any
-	local context, link, job = requireContext(contextName)
+local function request(contextName: string, op: string, args: { [string]: Any }, timeoutSec: number, jobId: string?): Any
+	local context, link, job = requireContext(contextName, jobId)
 
 	requestCounter += 1
 
@@ -320,7 +328,7 @@ end
 
 --- Resolve a `{inline}` / `{ref}` result package into its envelope table,
 --- fetching pinned envelopes in bounded, SHA-256-verified parts.
-local function resolveEnvelope(contextName: string, package: Any): { [string]: Any }
+local function resolveEnvelope(contextName: string, package: Any, jobId: string): { [string]: Any }
 	if type(package) ~= "table" then
 		error(Error.new(Error.PLUGIN_ERROR, "the runtime returned an invalid result package"), 0)
 	end
@@ -358,7 +366,7 @@ local function resolveEnvelope(contextName: string, package: Any): { [string]: A
 				id = resultId,
 				offset = offset,
 				maxLen = LIMITS.resultChunkBytes,
-			}, math.max(1, math.min(remaining, 10)))
+			}, math.max(1, math.min(remaining, 10)), jobId)
 
 			local data = Base64.decode(tostring((part :: Any).data or ""))
 
@@ -372,7 +380,7 @@ local function resolveEnvelope(contextName: string, package: Any): { [string]: A
 	end)
 
 	pcall(function()
-		request(contextName, "result_close", { id = resultId }, 2)
+		request(contextName, "result_close", { id = resultId }, 2, jobId)
 	end)
 
 	if not okTransfer then
@@ -639,7 +647,7 @@ local function handleCompletionFrame(job: Jobs.Job, context: Jobs.Context, body:
 				return body.inline
 			end
 
-			return resolveEnvelope(contextName, { ref = body.ref })
+			return resolveEnvelope(contextName, { ref = body.ref }, job.id)
 		end)
 
 		resolveCompletion(job, contextName, frameType, resultKey, okFetch, envelope)
@@ -1515,7 +1523,7 @@ end
 
 --- `playtest_wait`: block until ≥ minimum contexts are ready. TIMEOUT on the
 --- deadline; CONFLICT when the job ends first.
-function Playtest.waitForContexts(minimum: number, timeoutMs: number, jobId: string?): { [string]: Any }
+function Playtest.waitForContexts(minimum: number, timeoutMs: number, jobId: string?, contextName: string?): { [string]: Any }
 	requireAvailable()
 
 	local job = Jobs.resolveJob(registry, jobId)
@@ -1527,18 +1535,28 @@ function Playtest.waitForContexts(minimum: number, timeoutMs: number, jobId: str
 	local deadline = os.clock() + timeoutMs / 1000
 
 	while true do
+		if registry.latestJobId ~= job.id then
+			error(Error.new(Error.CONFLICT, `the playtest generation changed while waiting for job {job.id}`), 0)
+		end
 		pruneDeadContexts()
 
 		local contexts = Jobs.contextsOf(registry, job.id)
 
-		if #contexts >= minimum then
+		local targetReady = false
+		if contextName ~= nil then
+			for _, context in contexts do
+				if context.name == contextName and context.ready == true then targetReady = true end
+			end
+		end
+
+		if (contextName ~= nil and targetReady) or (contextName == nil and #contexts >= minimum) then
 			local ready = table.create(#contexts)
 
 			for index, context in contexts do
 				ready[index] = context.name
 			end
 
-			return { ready = ready, contexts = contexts }
+			return { jobId = job.id, ready = ready, contexts = contexts }
 		end
 
 		if not Jobs.isActiveStatus(job.status) then
@@ -1550,7 +1568,7 @@ function Playtest.waitForContexts(minimum: number, timeoutMs: number, jobId: str
 
 		if os.clock() >= deadline then
 			error(
-				Error.new(Error.TIMEOUT, `timed out waiting for {minimum} playtest context(s) ({#contexts} ready)`),
+				Error.new(Error.TIMEOUT, `timed out waiting for {contextName or tostring(minimum) .. " playtest context(s)"} ({#contexts} ready in job {job.id})`),
 				0
 			)
 		end
@@ -1581,39 +1599,40 @@ function Playtest.stop(jobId: string?, force: boolean, reason: string?): { [stri
 end
 
 --- `playtest_exec`: run one source in a context and return its envelope.
-function Playtest.exec(contextName: string, source: string, identity: string, timeoutMs: number): { [string]: Any }
+function Playtest.exec(contextName: string, source: string, identity: string, timeoutMs: number, jobId: string?): { [string]: Any }
+	local _, _, job = requireContext(contextName, jobId)
 	local timeoutSec = timeoutMs / 1000
 
 	local package = request(contextName, "exec", {
 		source = source,
 		identity = identity,
 		timeoutSec = timeoutSec,
-	}, timeoutSec + 10)
+	}, timeoutSec + 10, job.id)
 
-	return resolveEnvelope(contextName, package)
+	return resolveEnvelope(contextName, package, job.id)
 end
 
 --- `playtest_logs`: the runtime DataModel's log ring slice.
-function Playtest.logs(contextName: string, sinceSeq: number?, limit: number?): Any
-	return request(contextName, "logs", { sinceSeq = sinceSeq, limit = limit }, 10)
+function Playtest.logs(contextName: string, sinceSeq: number?, limit: number?, jobId: string?): Any
+	return request(contextName, "logs", { sinceSeq = sinceSeq, limit = limit }, 10, jobId)
 end
 
 --- `playtest_ui`: resolved UI records from a PlayClient.
-function Playtest.ui(contextName: string, filters: { [string]: Any }): Any
-	return request(contextName, "ui", filters, 15)
+function Playtest.ui(contextName: string, filters: { [string]: Any }, jobId: string?): Any
+	return request(contextName, "ui", filters, 15, jobId)
 end
 
 --- `playtest_input`: validated virtual input in a PlayClient.
-function Playtest.input(contextName: string, actions: Any, timeoutMs: number): Any
+function Playtest.input(contextName: string, actions: Any, timeoutMs: number, jobId: string?): Any
 	return request(contextName, "input", {
 		actions = actions,
 		timeoutMs = timeoutMs,
-	}, timeoutMs / 1000 + 10)
+	}, timeoutMs / 1000 + 10, jobId)
 end
 
 --- `playtest_request`: the raw escape hatch.
-function Playtest.rawRequest(contextName: string, op: string, args: { [string]: Any }, timeoutSec: number): Any
-	return request(contextName, op, args, timeoutSec)
+function Playtest.rawRequest(contextName: string, op: string, args: { [string]: Any }, timeoutSec: number, jobId: string?): Any
+	return request(contextName, op, args, timeoutSec, jobId)
 end
 
 --- `playtest_screenshot`: trigger one CaptureScreenshot in the PlayClient and
@@ -1622,8 +1641,8 @@ end
 --- PNG off disk. This is what makes playtest capture work at all:
 --- CreateEditableImageAsync cannot decode a temp texture id in a running
 --- DataModel, so the render/readback path is a dead end there.
-function Playtest.screenshot(contextName: string): { [string]: Any }
-	local context = (requireContext(contextName))
+function Playtest.screenshot(contextName: string, jobId: string?): { [string]: Any }
+	local context = (requireContext(contextName, jobId))
 
 	if context.role ~= "client" then
 		error(
@@ -1635,7 +1654,7 @@ function Playtest.screenshot(contextName: string): { [string]: Any }
 		)
 	end
 
-	local result = request(contextName, "screenshot", {}, 30)
+	local result = request(contextName, "screenshot", {}, 30, context.jobId)
 
 	if type(result) ~= "table" then
 		error(Error.new(Error.PLUGIN_ERROR, "the runtime returned an invalid screenshot ack"), 0)
@@ -1650,8 +1669,8 @@ end
 --- copies it out before the engine deletes it (same hand-off as
 --- `playtest_screenshot`, which is the only way out: the file path API is
 --- RobloxScriptSecurity and the VideoCapture object is opaque).
-function Playtest.video(contextName: string, seconds: number): { [string]: Any }
-	local context = (requireContext(contextName))
+function Playtest.video(contextName: string, seconds: number, jobId: string?): { [string]: Any }
+	local context = (requireContext(contextName, jobId))
 
 	if context.role ~= "client" then
 		error(
@@ -1666,7 +1685,7 @@ function Playtest.video(contextName: string, seconds: number): { [string]: Any }
 	-- The runtime may retry a cold start several times, then records for
 	-- `seconds`, then waits for the encoder — so the reply legitimately arrives
 	-- long after the request. Budgeted for the worst case, not the common one.
-	local result = request(contextName, "video_capture", { seconds = seconds }, seconds + 150)
+	local result = request(contextName, "video_capture", { seconds = seconds }, seconds + 150, context.jobId)
 
 	if type(result) ~= "table" then
 		error(Error.new(Error.PLUGIN_ERROR, "the runtime returned an invalid video ack"), 0)
@@ -1681,9 +1700,10 @@ end
 --- registry.
 function Playtest.capture(
 	contextName: string,
-	options: { [string]: Any }?
+	options: { [string]: Any }?,
+	jobId: string?
 ): { pixels: buffer, width: number, height: number, sha256: string }
-	local context = (requireContext(contextName))
+	local context = (requireContext(contextName, jobId))
 
 	if context.role ~= "client" then
 		error(
@@ -1707,7 +1727,7 @@ function Playtest.capture(
 		return math.max(1, left)
 	end
 
-	local prepared = request(contextName, "capture_prepare", { options = options }, math.min(60, remaining()))
+	local prepared = request(contextName, "capture_prepare", { options = options }, math.min(60, remaining()), context.jobId)
 
 	if type(prepared) ~= "table" then
 		error(Error.new(Error.PLUGIN_ERROR, "the runtime returned invalid capture metadata"), 0)
@@ -1730,7 +1750,7 @@ function Playtest.capture(
 		or #sha256 ~= 64
 	then
 		pcall(function()
-			request(contextName, "capture_close", { captureId = captureId }, 2)
+			request(contextName, "capture_close", { captureId = captureId }, 2, context.jobId)
 		end)
 		error(Error.new(Error.PLUGIN_ERROR, "the runtime returned invalid bounded RGBA capture metadata"), 0)
 	end
@@ -1744,7 +1764,7 @@ function Playtest.capture(
 				captureId = captureId,
 				offset = offset,
 				maxLen = LIMITS.captureChunkBytes,
-			}, math.min(20, remaining()))
+			}, math.min(20, remaining()), context.jobId)
 
 			local data = Base64.decode(tostring((chunk :: Any).data or ""))
 
@@ -1758,7 +1778,7 @@ function Playtest.capture(
 	end)
 
 	pcall(function()
-		request(contextName, "capture_close", { captureId = captureId }, 2)
+		request(contextName, "capture_close", { captureId = captureId }, 2, context.jobId)
 	end)
 
 	if not okTransfer then

@@ -26,6 +26,7 @@ type WatcherImpl = {
 	listen: (self: Watcher) -> Types.WatcherEvent,
 	restart: (self: Watcher, instances: { Instance }) -> (),
 	__connectEvents: (self: Watcher, instance: Instance) -> (),
+	__disconnectEvents: (self: Watcher, instance: Instance) -> (),
 	__watchTag: (self: Watcher, tag: string) -> (),
 	__unwatchTag: (self: Watcher, tag: string) -> (),
 	__onAdded: (self: Watcher, instance: Instance) -> (),
@@ -117,6 +118,11 @@ function Watcher:__connectEvents(instance)
 		return
 	end
 
+	-- Wiring is idempotent: an instance that arrives here already wired
+	-- (re-added while its subtree was still connected) must not end up with
+	-- two sets of connections, one of them unreachable by `stop`
+	self:__disconnectEvents(instance)
+
 	local connections = {}
 	local isValue = instance:IsA("ValueBase")
 
@@ -158,6 +164,18 @@ function Watcher:__connectEvents(instance)
 
 	for _, child in instance:GetChildren() do
 		self:__connectEvents(child)
+	end
+end
+
+function Watcher:__disconnectEvents(instance)
+	local connections = self.connections[instance]
+
+	if connections then
+		for _, connection in connections do
+			connection:Disconnect()
+		end
+
+		self.connections[instance] = nil
 	end
 end
 
@@ -215,14 +233,14 @@ function Watcher:__onChanged(instance, property)
 end
 
 function Watcher:__onRemoved(instance)
-	local connections = self.connections[instance]
+	-- The subtree leaves with it: a detached (not destroyed) instance keeps
+	-- its connections alive, and a descendant edited while detached would
+	-- otherwise report a change on an instance the tree no longer tracks.
+	-- Re-adding the same objects wires them again from the top
+	self:__disconnectEvents(instance)
 
-	if connections then
-		for _, connection in connections do
-			connection:Disconnect()
-		end
-
-		self.connections[instance] = nil
+	for _, descendant in instance:GetDescendants() do
+		self:__disconnectEvents(descendant)
 	end
 
 	self.signal:Fire({

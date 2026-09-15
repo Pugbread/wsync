@@ -15,6 +15,8 @@
     "`exec` is fire-and-forget: the daemon delivers one `execute` frame to every connected client and no value comes back. `wsync eval` is the request/response form and is what to use when the result matters.",
     "Because it broadcasts, every connected place runs the code. Scope work with `wsync eval` when only one session should be touched.",
     "`--focus` raises the Roblox Studio window before the code runs.",
-    "The broadcast is recorded in `writes.log` like other Studio mutations. Inspect the source first and confirm user intent before running it."
+    "With --project, the daemon identity must match the canonical project and boot; --port never overrides that check. Legacy positional session/--host targeting remains available.",
+    "Success acknowledges that the daemon queued the broadcast. It does not prove the code ran or completed. HTTP/transport failures exit nonzero; a lost reply may follow execution, so inspect state before retrying. --raw exposes queued and completion:unknown.",
+    "Use within existing task authorization. --standalone fails explicitly and points to playtest run; it is not implemented."
   ]
 }

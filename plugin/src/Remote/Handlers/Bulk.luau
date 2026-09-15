@@ -47,6 +47,9 @@ export type Session = {
 	-- Remote -> Core require
 	snapshotProperties: (instance: Instance, skipProperties: { [string]: boolean }?) -> { [string]: any },
 	shouldSyncProperties: (instance: Instance) -> boolean,
+	-- The exclusion rule (SyncScope: `AvoidSync` / `--!ignoresync`),
+	-- injected for the same reason
+	isExcluded: (instance: Instance) -> boolean,
 }
 
 local Bulk = {}
@@ -244,6 +247,14 @@ local function buildPod(instance: Instance, state: WalkState, forcedRefHex: stri
 		-- for the Studio → disk pull. Folders pass even when scriptless. The
 		-- explicitly requested root always answers (the daemon chose its
 		-- ref); the sources map is unaffected either way.
+		return nil
+	end
+
+	if forcedRefHex == nil and state.session.isExcluded(instance) then
+		-- `AvoidSync` / `--!ignoresync` (SyncScope): the instance and its
+		-- subtree stay in Studio — nothing of it is pulled, so nothing of it
+		-- lands on disk and none of its bytes count against the transfer
+		-- bounds
 		return nil
 	end
 

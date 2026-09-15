@@ -6,9 +6,12 @@
   "usage": "wsync find-attr [--project <path>] [--port <port>] --name <attribute> [--under <studio-path>] [--value <json>] [--raw]",
   "examples": [
     "wsync find-attr --project . --name Health --under Workspace",
-    "wsync find-attr --project . --name Color --value '{\"__type\":\"Color3\",\"r\":1,\"g\":0,\"b\":0}'"
+    "wsync find-attr --project . --name Color --value '{\"__type\":\"Color3\",\"r\":1,\"g\":0,\"b\":0}'",
+    "wsync find-attr --project . --name SpawnOffset --value '{\"__type\":\"Vector3\",\"x\":0,\"y\":5,\"z\":0}'"
   ],
   "notes": [
-    "`--value` uses the same JSON literal and tagged-value codec as `wsync set --value`."
+    "`--value` uses the same JSON literal and tagged-value codec as `wsync set --value`.",
+    "Offline value schemas and copyable examples for every supported type: `wsync commands types`; narrow with `wsync commands types Vector3` or `wsync commands types Color3`. The live JSON wire format uses the exact `__type` key and lowercase component fields; arrays, constructor strings, and sidecar `{Vector3:[...]}` shapes are not equivalent.",
+    "Codec support does not imply attribute compatibility: Roblox SetAttribute supports only its attribute datatypes. Instance references, buffers, and output-only markers are not valid attribute values."
   ]
 }

@@ -120,7 +120,9 @@ pub fn start_daemon(control_token: Option<&str>) -> TestDaemon {
 	};
 
 	let (ready_tx, ready_rx) = mpsc::channel();
-	let server = Server::new(core, "localhost", 0, identity);
+	// Every fake daemon is hermetic, including mutation audits. Tests must
+	// never append fake Studio writes to the developer's real state dir.
+	let server = Server::new(core, "localhost", 0, identity).with_state_dir(root.join("state"));
 
 	let handle = thread::spawn(move || {
 		let ready = Box::new(move |port: u16| {

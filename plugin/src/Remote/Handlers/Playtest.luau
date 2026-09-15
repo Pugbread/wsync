@@ -136,7 +136,8 @@ function PlaytestOps.ops.playtest_wait(args: Args, _ctx)
 		Playtest.LIMITS.waitDefaultTimeoutMs
 	)
 
-	return Playtest.waitForContexts(minimum, timeoutMs, optionalJobId(args.jobId))
+	local context = if args.context ~= nil then validateContext(args.context) else nil
+	return Playtest.waitForContexts(minimum, timeoutMs, optionalJobId(args.jobId), context)
 end
 
 --- `playtest_stop {jobId?, force?, reason?}` → `{ok}`.
@@ -195,7 +196,7 @@ function PlaytestOps.ops.playtest_exec(args: Args, ctx)
 		PlaytestOps.LIMITS.execDefaultTimeoutMs
 	)
 
-	local envelope = Playtest.exec(context, args.source :: string, identity :: string, timeoutMs)
+	local envelope = Playtest.exec(context, args.source :: string, identity :: string, timeoutMs, optionalJobId(args.jobId))
 
 	ctx.audit({ op = "playtest_exec", target = context, identity = identity, bytes = #(args.source :: string) })
 
@@ -205,6 +206,7 @@ function PlaytestOps.ops.playtest_exec(args: Args, ctx)
 
 	if envelope.ok == true then
 		response.value = envelope.value
+		response.results = envelope.results
 		response.count = envelope.count
 		response.truncated = envelope.truncated
 	else
@@ -225,7 +227,7 @@ function PlaytestOps.ops.playtest_logs(args: Args, _ctx)
 	local sinceSeq = optionalInt(args.sinceSeq, "sinceSeq", 0, MAX_SEQ, 0)
 	local limit = optionalInt(args.limit, "limit", 1, 500, 200)
 
-	return Playtest.logs(context, sinceSeq, limit)
+	return Playtest.logs(context, sinceSeq, limit, optionalJobId(args.jobId))
 end
 
 --- `playtest_ui {context, class?, name?, root?, limit?}` → resolved
@@ -260,7 +262,7 @@ function PlaytestOps.ops.playtest_ui(args: Args, _ctx)
 
 	filters.limit = optionalInt(args.limit, "limit", 1, 2000, 500)
 
-	return Playtest.ui(context, filters)
+	return Playtest.ui(context, filters, optionalJobId(args.jobId))
 end
 
 --- `playtest_input {context, actions, timeoutMs?}` → `{ok, performed}`:
@@ -274,7 +276,7 @@ function PlaytestOps.ops.playtest_input(args: Args, ctx)
 	local plan = InputActions.validate(args.actions, args.timeoutMs)
 	local timeoutMs = InputActions.validateTimeout(args.timeoutMs)
 
-	local result = Playtest.input(context, args.actions, timeoutMs)
+	local result = Playtest.input(context, args.actions, timeoutMs, optionalJobId(args.jobId))
 
 	ctx.audit({ op = "playtest_input", target = context, count = #plan.actions })
 
@@ -297,7 +299,7 @@ function PlaytestOps.ops.playtest_capture(args: Args, _ctx)
 		invalid("options must be an object")
 	end
 
-	local pulled = Playtest.capture(context, args.options)
+	local pulled = Playtest.capture(context, args.options, optionalJobId(args.jobId))
 
 	return Capture.adopt(pulled.pixels, pulled.width, pulled.height)
 end
@@ -310,7 +312,7 @@ end
 function PlaytestOps.ops.playtest_screenshot(args: Args, _ctx)
 	local context = validateContext(args.context)
 
-	return Playtest.screenshot(context)
+	return Playtest.screenshot(context, optionalJobId(args.jobId))
 end
 
 --- `playtest_video {context, seconds?}` → `{ok, started, result, seconds}`:
@@ -320,7 +322,7 @@ function PlaytestOps.ops.playtest_video(args: Args, _ctx)
 	local context = validateContext(args.context)
 	local seconds = optionalInt(args.seconds, "seconds", 1, 30, 10)
 
-	return Playtest.video(context, seconds)
+	return Playtest.video(context, seconds, optionalJobId(args.jobId))
 end
 
 --- `playtest_run_start {script, clientScript?, context, mode, players, args,
@@ -391,7 +393,7 @@ function PlaytestOps.ops.playtest_request(args: Args, ctx)
 	local timeoutMs = optionalInt(args.timeoutMs, "timeoutMs", 100, 120000, 15000)
 
 	local value =
-		Playtest.rawRequest(context, args.op :: string, (args.args :: { [string]: any }?) or {}, timeoutMs / 1000)
+		Playtest.rawRequest(context, args.op :: string, (args.args :: { [string]: any }?) or {}, timeoutMs / 1000, optionalJobId(args.jobId))
 
 	ctx.audit({ op = "playtest_request", target = context, prop = args.op })
 

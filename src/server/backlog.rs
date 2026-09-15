@@ -315,7 +315,13 @@ impl BacklogStore {
 
 	pub fn to_json(&self) -> Value {
 		let now = now_seconds();
-		let entries = self.list();
+		// Inspection must not delete stored content. Expired entries are hidden
+		// here; load and mutation paths retain responsibility for maintenance.
+		let entries: Vec<Entry> = lock!(self.entries)
+			.iter()
+			.filter(|entry| entry.expires_at() > now)
+			.cloned()
+			.collect();
 
 		json!({
 			"total": entries.len(),
@@ -431,10 +437,29 @@ pub async fn restore(State(state): State<AppState>, body: Bytes) -> Response {
 				"ok": true,
 				"path": entry.path,
 				"restoredTo": path.to_string_lossy(),
+				"meta": {
+					"completion": "unknown",
+					"retrySafe": false,
+					"diskRestored": true,
+					"studioSyncConfirmed": false,
+					"recovery": "The disk copy completed; the filesystem watcher delivers it to Studio asynchronously. Verify Studio state before repeating the restore.",
+				},
 			}))
 			.into_response()
 		}
-		Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err}")),
+		Err(err) => (
+			StatusCode::INTERNAL_SERVER_ERROR,
+			Json(json!({
+				"ok": false,
+				"error": format!("{err}"),
+				"meta": {
+					"completion": "unknown",
+					"retrySafe": false,
+					"recovery": "Restoring may have copied some disk content; inspect the target and backlog entry before retrying.",
+				},
+			})),
+		)
+			.into_response(),
 	}
 }
 
@@ -467,4 +492,23 @@ pub async fn drop_entry(State(state): State<AppState>, body: Bytes) -> Response 
 	});
 
 	Json(json!({ "ok": true, "dropped": 1 })).into_response()
+}
+
+#[cfg(test)]
+mod inspection_tests {
+	use super::*;
+
+	#[test]
+	fn inspecting_expired_backlog_hides_entries_without_deleting_content() {
+		let workspace = tempfile::tempdir().unwrap();
+		let store = BacklogStore::load(workspace.path());
+		let source = workspace.path().join("Example.luau");
+		fs::write(&source, "return 42").unwrap();
+		let entry = store.capture("Example.luau", &source, Reason::Conflict).unwrap();
+		let original_index = fs::read(store.index_path()).unwrap();
+		lock!(store.entries)[0].captured_at = now_seconds() - ENTRY_TTL_SECONDS - 1;
+		assert_eq!(store.to_json()["total"], 0);
+		assert_eq!(fs::read_to_string(store.stored_path(&entry)).unwrap(), "return 42");
+		assert_eq!(fs::read(store.index_path()).unwrap(), original_index);
+	}
 }

@@ -82,6 +82,21 @@ function Tree:removeById(id: Types.Ref): Instance?
 	return instance
 end
 
+--- Untrack an instance together with everything under it. The entry for a
+--- removed instance is never the only one that dies with it: its
+--- descendants' files go from disk in the same removal, and if the very same
+--- objects come back later — a reparent is remove-then-add, an Undo
+--- restores them — they must read as new, or the addition that re-syncs
+--- them skips every still-tracked child and lands without them. Returns the
+--- instance's ref when it was tracked.
+function Tree:removeSubtree(instance: Instance): Types.Ref?
+	for _, descendant in instance:GetDescendants() do
+		self:removeByInstance(descendant)
+	end
+
+	return self:removeByInstance(instance)
+end
+
 function Tree:insertMeta(id: Types.Ref, meta: Types.Meta)
 	self.metaMap[buffer.tostring(id)] = meta
 end

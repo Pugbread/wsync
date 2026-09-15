@@ -1,7 +1,7 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 
-use crate::{config::Config, updater, wsync_error, wsync_info};
+use crate::{config::Config, updater, wsync_info};
 
 /// Forcefully update WSync components if available
 #[derive(Parser)]
@@ -25,13 +25,8 @@ impl Update {
 			UpdateMode::Templates => (false, false, true),
 		};
 
-		match updater::manual_update(cli, plugin, templates, self.force) {
-			Ok(updated) => {
-				if !updated {
-					wsync_info!("Everything is up to date!");
-				}
-			}
-			Err(err) => wsync_error!("Failed to update WSync: {}", err),
+		if !updater::manual_update(cli, plugin, templates, self.force).context("Failed to update WSync")? {
+			wsync_info!("Everything is up to date!");
 		}
 
 		Ok(())

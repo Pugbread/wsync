@@ -21,7 +21,6 @@ use common::{
 };
 
 const SETTLE: Duration = Duration::from_millis(600);
-const STUDIO_ONLY_REF: &str = "ffffffffffffffffffffffffffffffff";
 
 /// Fresh refs for instances that exist only in the fake Studio
 const EXTRA_REF: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

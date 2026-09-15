@@ -1,28 +1,24 @@
 use env_logger::WriteStyle;
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use puffin_http::Server;
 use std::{
 	env,
 	io::{self, IsTerminal},
 	mem::ManuallyDrop,
 	process::ExitCode,
-	thread,
 };
 
-use wsync::{cli::Cli, config::Config, crash_handler, installer, logger, stats, updater, wsync_error};
+use wsync::{cli::Cli, config::Config, crash_handler, logger, wsync_error};
 
 const PROFILER_ADDRESS: &str = "localhost:8888";
 
 fn main() -> ExitCode {
 	crash_handler::hook();
 
-	let config_kind = Config::load();
-	let config = Config::new().clone();
-
-	let is_managed = installer::is_managed();
-	let installation = installer::verify(config.install_plugin);
-
+	// Clap handles help, version and usage errors before configuration or
+	// installation has any opportunity to touch disk or the network.
 	let cli = Cli::new();
+	let config_kind = Config::load();
 
 	let yes = cli.yes();
 	let backtrace = cli.backtrace();
@@ -52,26 +48,9 @@ fn main() -> ExitCode {
 		Err(err) => error!("Failed to load config file: {err}"),
 	}
 
-	match installation {
-		Ok(()) => info!("WSync installation verified successfully!"),
-		Err(err) => warn!("Failed to verify WSync installation: {err}"),
-	}
-
-	let handle = thread::spawn(move || {
-		if !is_managed && config.check_updates {
-			match updater::check_for_updates(config.install_plugin, config.update_templates, !config.auto_update) {
-				Ok(()) => info!("Update check completed successfully!"),
-				Err(err) => warn!("Update check failed: {err}"),
-			}
-		}
-
-		// Stats are local-only counters in WSync (the Argon upload path was
-		// removed), so tracking no longer depends on `share_stats`
-		match stats::track() {
-			Ok(()) => info!("Stat tracker initialized successfully!"),
-			Err(err) => warn!("Failed to initialize stat tracker: {err}"),
-		}
-	});
+	// Maintenance belongs to explicit install/update commands. Starting it
+	// for every command made offline help fail in restricted environments and
+	// allowed an optional updater panic to invalidate a successful operation.
 
 	if cfg!(debug_assertions) && cli.profile() {
 		match Server::new(PROFILER_ADDRESS) {
@@ -98,9 +77,6 @@ fn main() -> ExitCode {
 			ExitCode::FAILURE
 		}
 	};
-
-	handle.join().ok();
-	stats::save().ok();
 
 	exit_code
 }

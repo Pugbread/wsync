@@ -58,14 +58,6 @@ fn push_update(id: &str, source: &str) -> String {
 	.to_string()
 }
 
-fn push_removal(id: &str) -> String {
-	json!({
-		"type": "push",
-		"ops": { "additions": [], "updates": [], "removals": [id] },
-	})
-	.to_string()
-}
-
 async fn push_result(plugin: &mut WsClient) -> Value {
 	wait_for_frame(plugin, Duration::from_secs(10), |frame| frame["type"] == "push-result")
 		.await
@@ -81,18 +73,6 @@ async fn conflicts(daemon: &TestDaemon) -> Vec<Value> {
 		.unwrap();
 
 	body["conflicts"].as_array().unwrap().clone()
-}
-
-async fn resolve(daemon: &TestDaemon, id: &str, keep: &str) -> (reqwest::StatusCode, Value) {
-	let response = reqwest::Client::new()
-		.post(daemon.http("/resolve"))
-		.json(&json!({ "id": id, "keep": keep, "choice": keep }))
-		.send()
-		.await
-		.unwrap();
-
-	let status = response.status();
-	(status, response.json().await.unwrap())
 }
 
 /// Polls a file until its content matches, tolerating the async write path
@@ -224,8 +204,3 @@ async fn an_unknown_backlog_entry_is_refused() {
 	assert_eq!(status, 404);
 	assert_eq!(body["ok"], false);
 }
-
-
-
-
-

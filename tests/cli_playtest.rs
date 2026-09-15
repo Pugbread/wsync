@@ -346,6 +346,7 @@ fn echo_plugin(daemon: &TestDaemon, name: &'static str) -> CliJournal {
 		daemon,
 		name,
 		Arc::new(|op, args| match op {
+			"playtest_start" => CliAnswer::Value(json!({ "jobId": "echo-job", "status": "starting" })),
 			op if op.starts_with("playtest_") => CliAnswer::Value(json!({ "echo": op, "args": args })),
 			_ => CliAnswer::Failure("UNKNOWN_OP", "the fake plugin does not implement this op"),
 		}),

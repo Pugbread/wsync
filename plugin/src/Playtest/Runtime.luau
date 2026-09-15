@@ -49,6 +49,7 @@ local Renderer = require(WSync.Remote.Capture)
 local Protocol = require(script.Parent.Protocol)
 local RateLimiter = require(script.Parent.RateLimiter)
 local InputActions = require(script.Parent.InputActions)
+local ResultEnvelope = require(script.Parent.ResultEnvelope)
 
 local LIMITS = Protocol.LIMITS
 
@@ -313,63 +314,13 @@ local function encodeValue(value: Any): (boolean, Any)
 	end)
 end
 
---- Build the result envelope for a packed `xpcall` result
---- (`{ok, valueOrFailure, ...}` from table.pack). Multi-value returns encode
---- as an array with an explicit count so `return nil` stays distinguishable.
+--- Build one lossless result envelope using a shared codec budget. Dense
+--- indexed slots preserve nil and multi-return values across JSON transports.
 local function buildEnvelope(packed: { n: number, [number]: Any }): { [string]: Any }
-	-- `table.pack` records the count in `n`, but a result that crossed a
-	-- BindableEvent arrives as a copy of the table with that key gone: Roblox
-	-- carries the array part and drops the string key. Recover the count here,
-	-- at the one place both the exec and playscript paths pass through, rather
-	-- than doing arithmetic on a nil — which is what made every `playtest exec`
-	-- fail with "attempt to perform arithmetic (sub) on nil and number".
-	local total = packed.n or #packed
-
-	if packed[1] == true then
-		local count = total - 1
-		local envelope: { [string]: Any } = { ok = true, count = count }
-
-		if count == 1 then
-			local okEncode, encoded = encodeValue(packed[2])
-
-			if not okEncode then
-				return { ok = false, error = capText(`result encoding failed: {tostring(encoded)}`, MAX_ERROR_BYTES) }
-			end
-
-			envelope.value = encoded
-		elseif count > 1 then
-			local values = table.create(count)
-
-			for index = 1, count do
-				values[index] = packed[index + 1]
-			end
-
-			local okEncode, encoded = encodeValue(values)
-
-			if not okEncode then
-				return { ok = false, error = capText(`result encoding failed: {tostring(encoded)}`, MAX_ERROR_BYTES) }
-			end
-
-			envelope.value = encoded
-		end
-
-		return envelope
-	end
-
-	local failure = packed[2]
-
-	if type(failure) == "table" and failure.message ~= nil then
-		return {
-			ok = false,
-			error = capText(tostring(failure.message), MAX_ERROR_BYTES),
-			traceback = capText(tostring(failure.traceback or failure.message), MAX_TRACEBACK_BYTES),
-		}
-	end
-
-	return {
-		ok = false,
-		error = capText(tostring(failure), MAX_ERROR_BYTES),
-	}
+	local budget = Codec.newBudget()
+	return ResultEnvelope.build(packed, function(value)
+		return Codec.encode(value, budget)
+	end)
 end
 
 --- Enforce the pinned 1 MiB envelope cap: an oversized success value is
@@ -600,7 +551,7 @@ local EXEC_WRAPPER_TAIL = table.concat({
 	"local __packed = table.pack(xpcall(__wsync_run, function(errorValue)",
 	"\treturn { message = tostring(errorValue), traceback = debug.traceback(tostring(errorValue), 2) }",
 	"end))",
-	"__event:Fire(__packed)",
+	"__event:Fire(__packed, __packed.n)",
 }, "\n")
 
 --- Execute one source through a temporary runner and return the packed
@@ -623,13 +574,13 @@ local function executeSource(
 	local finished = false
 	local packedResult: { n: number, [number]: Any }? = nil
 
-	local function finish(packed: Any)
+	local function finish(packed: Any, transportedCount: Any?)
 		if finished then
 			return
 		end
 
 		finished = true
-		packedResult = packed
+		packedResult = ResultEnvelope.restore(packed, transportedCount)
 		doneEvent:Fire()
 	end
 
@@ -1211,35 +1162,8 @@ local function bridgeCall(agent: Agent, runner: Runner, action: string, ...: Any
 
 		return true
 	elseif action == "__return" then
-		local packed = arguments[1]
-
-		if type(packed) ~= "table" then
-			return finishRunner(agent, runner, false, "playscript returned an invalid result envelope")
-		end
-
-		if packed[1] == true then
-			-- Every returned value is preserved (multi-return encodes as an
-			-- array with an explicit count)
-			if packed.n == nil then
-				packed.n = #packed
-			end
-
-			return finishRunnerWithEnvelope(agent, runner, buildEnvelope(packed))
-		end
-
-		local failure = packed[2]
-
-		if type(failure) == "table" then
-			return finishRunner(
-				agent,
-				runner,
-				false,
-				tostring(failure.message or "playscript failed"),
-				tostring(failure.traceback or failure.message or "playscript failed")
-			)
-		end
-
-		return finishRunner(agent, runner, false, failure, tostring(failure))
+		local packed = ResultEnvelope.restore(arguments[1], arguments[2])
+		return finishRunnerWithEnvelope(agent, runner, buildEnvelope(packed))
 	end
 
 	error(`unknown playscript bridge action: {action}`, 0)
@@ -1278,7 +1202,7 @@ local PLAYSCRIPT_WRAPPER_TAIL = table.concat({
 	"local __packed = table.pack(xpcall(__wsync_run, function(errorValue)",
 	"\treturn { message = tostring(errorValue), traceback = debug.traceback(tostring(errorValue), 2) }",
 	"end))",
-	'__bridge:Invoke("__return", __packed)',
+	'__bridge:Invoke("__return", __packed, __packed.n)',
 }, "\n")
 
 --- Install a playscript runner from a coordinator boot frame. Boot frames

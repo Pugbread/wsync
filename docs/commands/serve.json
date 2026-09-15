@@ -2,18 +2,19 @@
   "name": "serve",
   "title": "wsync serve",
   "category": "Daemon",
-  "description": "Runs the local HTTP/WebSocket daemon that bridges the Studio plugin, filesystem watcher, and CLI in the foreground.",
-  "usage": "wsync serve --project <path> [--port <port>] [--projects-root <path>] [--sourcemap] [--ts] [--game-id <id>] [--group-id <id>] [--place-id <id>]...",
+  "description": "Runs a local HTTP/WebSocket server with filesystem watching, optionally in an asynchronous child process.",
+  "usage": "wsync serve [<project> [<session>] | --project <path>] [-H|--host <host>] [-P|--port <port>] [--sourcemap] [--ts] [-A|--async]",
   "examples": [
     "wsync serve --project . --port 7978",
     "wsync serve --project . --sourcemap",
-    "wsync serve --project . --port 7978 --game-id 1234567890"
+    "wsync serve . dev-session --port 7978 --async"
   ],
   "notes": [
-    "`serve` stays in the foreground for launchd, systemd, Task Scheduler, containers, or development terminals.",
-    "For an ordinary CLI-managed background process, use `wsync daemon start` instead.",
-    "The port defaults to 7978 and, with `scan_ports` enabled, auto-scans upward to `port_scan_max` for the first free port. Each serve registers a session in `~/.wsync/sessions.toml` so `wsync stop` can end it.",
-    "`--sourcemap` keeps a sourcemap regenerated from the live tree for as long as the daemon runs; `--ts` enables the roblox-ts passthrough.",
-    "`--projects-root` advertises the authenticated Studio project initializer and constrains creation to one direct child below that canonical directory. Omit it for ordinary manual daemons."
+    "Runs in the foreground unless --async or the run_async configuration is enabled. --async spawns a WSync child process.",
+    "--project is the named alternative to the positional project. Use the positional form when also supplying a session identifier; both project forms together are rejected.",
+    "Host/port come from explicit flags, then the project, then configuration. With scan_ports enabled, a busy port scans upward to port_scan_max. The process registers in ~/.wsync/sessions.toml for wsync stop.",
+    "--sourcemap keeps sourcemap.json regenerated from the live tree. --ts enables the roblox-ts watcher.",
+    "For the project lifecycle record and manager authentication, use wsync daemon start. That command also stays in the current process while serving; launch it through your process manager when background operation is needed.",
+    "Serve does not accept game/group/place metadata flags. Configure project metadata in the project file or use wsync daemon start --game-id/--group-id/--place-id."
   ]
 }

@@ -1,25 +1,25 @@
-use axum::{extract::State, response::Json};
+use axum::{
+	extract::{Path, State},
+	response::Json,
+};
 use log::trace;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 use crate::{
 	constants::{PROTOCOL_VERSION, REQUEST_DEFAULT_TIMEOUT_MS, REQUEST_MAX_TIMEOUT_MS},
+	daemon,
 	server::{
-		ops,
+		operation, ops,
 		ws::frames::{codes, OpError, ServerFrame},
 		AppState,
 	},
 };
 
-/// The audit `source` recorded for HTTP `/request` callers (the CLI surface;
-/// WS-originated requests would carry their client's role instead)
-const HTTP_REQUEST_SOURCE: &str = "cli";
-
-/// `POST /request` body: a one-shot remote op from the CLI or an agent.
-/// Daemon-side ops (`path`, `meta`, `where`) are answered locally; everything
-/// else is routed to the connected Studio plugin over WS `request`/`response`
+/// Remote requests may name an operation and pin the daemon identity observed
+/// during discovery. Older clients can omit the additive fields.
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Request {
@@ -27,130 +27,216 @@ pub struct Request {
 	#[serde(default)]
 	args: Option<Value>,
 	timeout_ms: Option<u64>,
+	operation_id: Option<String>,
+	expected_project: Option<String>,
+	expected_boot_id: Option<String>,
 }
 
-fn reply(ok: bool, payload: (&'static str, Value), op: &str, started: Instant) -> Json<Value> {
-	let (key, value) = payload;
+struct Reply {
+	op: String,
+	operation_id: String,
+	request_id: u32,
+	started: Instant,
+}
 
+impl Reply {
+	fn value(&self, value: Value) -> Json<Value> {
+		self.make(true, ("value", value), "completed", None)
+	}
+
+	fn error(&self, code: &str, message: &str, completion: &'static str) -> Json<Value> {
+		self.make(
+			false,
+			("error", json!({ "code": code, "message": message })),
+			completion,
+			None,
+		)
+	}
+
+	fn make(
+		&self,
+		ok: bool,
+		payload: (&str, Value),
+		completion: &'static str,
+		plugin_meta: Option<Value>,
+	) -> Json<Value> {
+		let (key, value) = payload;
+		let mut body = json!({
+			"ok": ok,
+			key: value,
+			"meta": {
+				"op": self.op,
+				"durationMs": self.started.elapsed().as_millis() as u64,
+				"protocol": PROTOCOL_VERSION,
+				"operationId": self.operation_id,
+				"requestId": self.request_id,
+				"completion": completion,
+				"completionScope": "requestedEffects",
+				"retrySafe": completion == "notStarted",
+				"statusPath": format!("/operations/{}", self.operation_id),
+			},
+		});
+		if let Some(meta) = plugin_meta {
+			body["meta"]["plugin"] = meta;
+		}
+		if ok && operation::acknowledgement_only(Some(&self.op)) {
+			body["meta"]["acknowledged"] = json!(true);
+			if let Some(job_id) = body.pointer("/value/jobId").cloned() {
+				body["meta"]["jobId"] = job_id;
+				body["meta"]["nextCheck"] = json!("Read playtest_status or playtest_run_poll for this job; operation receipts do not track background job completion.");
+			} else {
+				body["meta"]["nextCheck"] = json!("Studio accepted the request; inspect Studio state/output to confirm its effects before repeating it.");
+			}
+		}
+		if !ok && completion != "notStarted" {
+			body["meta"]["recovery"] = json!("Inspect the operation receipt and affected Studio state before retrying; the failed command may have applied changes.");
+		}
+		Json(body)
+	}
+}
+
+/// Read-only, bounded receipt lookup. Missing means unknown: receipts expire,
+/// can be evicted, and do not survive a daemon restart.
+pub async fn status(State(state): State<AppState>, Path(operation_id): Path<String>) -> Json<Value> {
+	let receipt = state.ws.operation_receipt(&operation_id);
 	Json(json!({
-		"ok": ok,
-		key: value,
-		"meta": {
-			"op": op,
-			"durationMs": started.elapsed().as_millis() as u64,
-			"protocol": PROTOCOL_VERSION,
-		},
+		"ok": true,
+		"found": receipt.is_some(),
+		"receipt": receipt,
+		"bootId": state.identity.boot_id,
+		"retention": { "maxReceipts": 256, "seconds": 600, "durable": false },
+		"missingMeans": "unknown; the operation may have run before receipt expiry, eviction, or a daemon restart",
 	}))
-}
-
-fn error_reply(code: &str, message: &str, op: &str, started: Instant) -> Json<Value> {
-	reply(
-		false,
-		("error", json!({ "code": code, "message": message })),
-		op,
-		started,
-	)
 }
 
 pub async fn main(State(state): State<AppState>, Json(request): Json<Request>) -> Json<Value> {
 	trace!("Received request: request (op {})", request.op);
+	let op = request.op;
+	let operation_id = request.operation_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+	let reply = Reply {
+		op: op.clone(),
+		operation_id: operation_id.clone(),
+		request_id: state.ws.next_request_id(),
+		started: Instant::now(),
+	};
 
-	let started = Instant::now();
-	let op = request.op.clone();
-
-	if op.is_empty() {
-		return error_reply(codes::INVALID_ARGUMENT, "op must be a non-empty string", &op, started);
+	if op.is_empty() || op.len() > 128 {
+		return reply.error(codes::INVALID_ARGUMENT, "op must contain 1–128 bytes", "notStarted");
+	}
+	if Uuid::parse_str(&operation_id).is_err() {
+		return reply.error(codes::INVALID_ARGUMENT, "operationId must be a UUID", "notStarted");
 	}
 
-	let args = request.args.unwrap_or_else(|| json!({}));
-
-	// Daemon-side ops answer from the live tree and never touch the plugin,
-	// so they work with no Studio connected (registry contracts path/meta/where)
-	if let Some(result) = ops::try_answer(&state.core, &op, &args) {
-		return match result {
-			Ok(value) => reply(true, ("value", value), &op, started),
-			Err((code, message)) => error_reply(code, &message, &op, started),
-		};
+	if request
+		.expected_boot_id
+		.as_ref()
+		.is_some_and(|boot| boot != &state.identity.boot_id)
+	{
+		return reply.error(
+			codes::CONFLICT,
+			"Daemon restarted after discovery; reconnect and verify the project before sending this operation",
+			"notStarted",
+		);
 	}
-
+	if let Some(expected) = request.expected_project {
+		let actual = daemon::canonical_project(&state.core.project().path);
+		if actual.as_ref().ok() != Some(&expected) {
+			return reply.error(
+				codes::CONFLICT,
+				"Daemon project does not match the project verified during discovery",
+				"notStarted",
+			);
+		}
+	}
+	if !state.ws.begin_operation(reply.request_id, &operation_id, &op) {
+		// Do not call this notStarted: the earlier use of this ID may already
+		// have mutated Studio. Clients must consult that receipt.
+		return reply.error(
+			codes::CONFLICT,
+			"operationId already has a receipt; inspect it before creating a new operation",
+			"unknown",
+		);
+	}
+	let fail_before_send = |code: &str, message: &str| {
+		state.ws.finish_operation(reply.request_id, "notStarted", Some(code));
+		reply.error(code, message, "notStarted")
+	};
 	let timeout_ms = match request.timeout_ms {
 		None => REQUEST_DEFAULT_TIMEOUT_MS,
-		Some(0) => {
-			return error_reply(codes::INVALID_ARGUMENT, "timeoutMs must be at least 1", &op, started);
-		}
-		// Values above the cap are clamped rather than rejected
+		Some(0) => return fail_before_send(codes::INVALID_ARGUMENT, "timeoutMs must be at least 1"),
 		Some(ms) => ms.min(REQUEST_MAX_TIMEOUT_MS),
 	};
+	let args = request.args.unwrap_or_else(|| json!({}));
 
+	if let Some(result) = ops::try_answer(&state.core, &op, &args) {
+		return match result {
+			Ok(value) => {
+				state.ws.finish_operation(reply.request_id, "completed", None);
+				reply.value(value)
+			}
+			Err((code, message)) => fail_before_send(code, &message),
+		};
+	}
 	let plugin = match state.ws.plugin_frames() {
 		Ok(frames) => frames,
-		Err(reason) => return error_reply(codes::PLUGIN_ERROR, reason, &op, started),
+		Err(reason) => return fail_before_send(codes::PLUGIN_ERROR, reason),
 	};
-
-	let request_id = state.ws.next_request_id();
-	let receiver = state.ws.register_request(request_id);
-
+	let receiver = state.ws.register_request(reply.request_id);
 	let frame = ServerFrame::Request {
-		request_id,
+		request_id: reply.request_id,
 		op: op.clone(),
 		args,
 		timeout_ms,
 	};
-
 	if plugin.try_send(frame.to_text()).is_err() {
-		state.ws.abort_request(request_id);
-
-		return error_reply(
+		state.ws.abort_request(reply.request_id);
+		return fail_before_send(
 			codes::PLUGIN_ERROR,
-			"Plugin outbound queue is overloaded or the plugin disconnected",
-			&op,
-			started,
+			"Plugin outbound queue is overloaded or the plugin disconnected before dispatch",
 		);
 	}
 
 	match tokio::time::timeout(Duration::from_millis(timeout_ms), receiver).await {
-		// Plugin answered
 		Ok(Ok(response)) => {
-			// Every response that reports a Studio mutation lands in the
-			// audit log (Design §6.4/§11), success or failure alike
-			if let Some(meta) = response.meta.as_ref() {
-				if meta.get("mutation").and_then(Value::as_bool) == Some(true) {
-					state.audit.record(&op, response.ok, HTTP_REQUEST_SOURCE, meta);
-				}
-			}
-
+			let completion = operation::completion(&response, Some(&op));
 			if response.ok {
-				reply(true, ("value", response.value.unwrap_or(Value::Null)), &op, started)
+				reply.make(
+					true,
+					("value", response.value.unwrap_or(Value::Null)),
+					completion,
+					response.meta,
+				)
 			} else {
 				let error = response.error.unwrap_or_else(|| OpError {
 					code: codes::PLUGIN_ERROR.to_owned(),
 					message: "Plugin reported failure without error detail".to_owned(),
 				});
-
-				reply(
+				reply.make(
 					false,
 					("error", json!({ "code": error.code, "message": error.message })),
-					&op,
-					started,
+					completion,
+					response.meta,
 				)
 			}
 		}
-		// Plugin disconnected while the request was pending
-		Ok(Err(_)) => error_reply(
-			codes::PLUGIN_ERROR,
-			"Studio plugin disconnected before answering",
-			&op,
-			started,
-		),
-		// Deadline elapsed
+		Ok(Err(_)) => {
+			state
+				.ws
+				.finish_operation(reply.request_id, "unknown", Some(codes::PLUGIN_ERROR));
+			reply.error(
+				codes::PLUGIN_ERROR,
+				"Studio plugin disconnected before answering; execution may have started or completed",
+				"unknown",
+			)
+		}
 		Err(_) => {
-			state.ws.abort_request(request_id);
-
-			error_reply(
+			state.ws.abort_request(reply.request_id);
+			// Do not overwrite a racing or later plugin receipt. No response
+			// by the deadline means unknown completion, never rollback.
+			reply.error(
 				codes::TIMEOUT,
-				&format!("No plugin response within {timeout_ms} ms"),
-				&op,
-				started,
+				&format!("No plugin response within {timeout_ms} ms; execution may have started or completed"),
+				"unknown",
 			)
 		}
 	}

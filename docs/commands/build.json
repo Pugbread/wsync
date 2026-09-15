@@ -3,7 +3,7 @@
   "title": "wsync build",
   "category": "Build & sourcemap",
   "description": "Serializes the project tree into a Roblox place or model file, optionally rebuilding on every change.",
-  "usage": "wsync build [--project <path>] [-o|--output <file>] [-w|--watch] [-s|--sourcemap] [-p|--plugin] [-x|--xml] [--ts] [--raw]",
+  "usage": "wsync build [--project <path>] [-o|--output <file>] [-w|--watch] [-s|--sourcemap] [-p|--plugin] [-x|--xml] [--ts]",
   "examples": [
     "wsync build --project .",
     "wsync build --project . --output ./build/game.rbxl",
@@ -16,6 +16,7 @@
     "`--plugin` writes the built model into the local Roblox Studio plugins directory instead of the project, which is how a `plugin` template is tested.",
     "`--watch` stays in the foreground and rebuilds off the internal change bus; add `--sourcemap` to keep the sourcemap regenerated alongside each build.",
     "`--ts` enables the roblox-ts passthrough for TypeScript projects.",
-    "The output is a build artifact, not a sync surface: writing it back into the project does not push anything to Studio."
+    "The output is a build artifact, not a sync surface: writing it back into the project does not push anything to Studio.",
+    "--project and the positional project path are alternatives; supplying both is an error. Output file paths stay relative to cwd."
   ]
 }

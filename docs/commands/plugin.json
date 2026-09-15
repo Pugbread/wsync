@@ -2,17 +2,16 @@
   "name": "plugin",
   "title": "wsync plugin",
   "category": "Project setup",
-  "description": "Installs, removes, or verifies the WSync Roblox Studio plugin in the local Studio plugins directory.",
+  "description": "Installs or removes a local WSync Studio plugin file.",
   "subcommands": [
     "install",
-    "uninstall",
-    "status"
+    "uninstall"
   ],
   "subcommandMetadata": {
     "install": {
       "safety": "writes-local-files",
       "requires": [
-        "bundled-plugin",
+        "local-plugin-source",
         "roblox-plugin-directory"
       ]
     },
@@ -21,26 +20,19 @@
       "requires": [
         "roblox-plugin-directory"
       ]
-    },
-    "status": {
-      "safety": "read-only",
-      "requires": [
-        "bundled-plugin",
-        "roblox-plugin-directory"
-      ]
     }
   },
-  "usage": "wsync plugin <install|uninstall|status> [--source <WSync.rbxm>] [--plugin-dir <path>] [--raw]",
+  "usage": "wsync plugin [install|uninstall] [<destination-path>]",
   "examples": [
     "wsync plugin install",
-    "wsync plugin status --raw",
-    "wsync plugin uninstall --raw",
-    "wsync plugin install --source ./plugin/WSync.rbxm --plugin-dir ./scratch-plugins --raw"
+    "wsync plugin uninstall",
+    "wsync plugin install ./scratch-plugins/WSync.rbxm"
   ],
   "notes": [
-    "`install` atomically writes `WSync.rbxm`; `status` compares the installed copy with the bundle by SHA-256 and reports whether the installed plugin's protocol matches this CLI's.",
-    "The default destination is ~/Documents/Roblox/Plugins on macOS and LocalAppData/Roblox/Plugins on Windows.",
-    "Install candidates are resolved next to the binary first, then in the desktop app resources; with no bundled copy available, `install` falls back to downloading the matching published release asset.",
-    "Installation removes stale `WSync.lua` and `WSync.luau` copies and reports that Studio must be restarted."
+    "Default mode is install. The optional second positional argument is the destination file or directory, not a source plugin.",
+    "Installation searches plugin/WSync.rbxm relative to the working directory, then WSync.rbxm next to the CLI binary, then the binary-embedded plugin. If no source exists it returns an error; this command does not download one.",
+    "With no destination, Roblox Studio installation discovery chooses the local plugins directory. Directory destinations receive WSync.rbxm; smart_paths also interprets extensionless destinations.",
+    "Install creates destination parent directories and writes the plugin file. Uninstall removes that selected file and returns a filesystem error if it is absent.",
+    "No status subcommand or --raw/--source/--plugin-dir flags are implemented. Use the destination positional argument for a custom install location. Reload plugins or restart Studio to load a changed plugin file."
   ]
 }

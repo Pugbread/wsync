@@ -1662,6 +1662,9 @@ fn a_batch_raw_line_carries_the_parallel_results() {
 	assert!(!output.status.success(), "a partial batch exited zero");
 
 	let value = assert_leads_with_ok(&output);
+	assert_eq!(value["ok"], false);
+	assert_eq!(value["meta"]["completion"], "partial");
+	assert!(value["meta"]["operationId"].is_string());
 
 	assert_eq!(value["total"], 2);
 	assert_eq!(value["applied"], 1);

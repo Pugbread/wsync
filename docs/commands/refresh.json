@@ -11,7 +11,7 @@
   "notes": [
     "Updates `wsync.md`, `AGENTS.md`, `CLAUDE.md`, and `.codex/config.toml` while preserving project notes outside the generated marker blocks. Marker blocks owned by other tools are left untouched.",
     "The generated docs also regenerate automatically on every plugin connect.",
-    "The generated content is templated from the live project config: the sync-scope statement, synced-roots list, and filesystem-conventions table are rendered from the project's actual tree and sync rules, including custom `syncRules` and `OnlyCodeMode`, so the steering never describes a scope this project does not have.",
-    "When Wally is enabled or a `wally.toml` is present, the regenerated `AGENTS.md` block embeds the resolved Wally settings and package config."
+    "AGENTS.md contains a concise generated contract (at most 8 KiB) linking the detailed wsync.md project reference. Actual project mappings and active sync rules remain in that reference.",
+    "User notes and foreign marker blocks are preserved. Oversized AGENTS.md files trigger an instruction-budget warning; WSync never truncates notes. `wsync context` exposes size and warning metadata."
   ]
 }

@@ -3,13 +3,16 @@
   "title": "wsync eval",
   "category": "Live writes",
   "description": "Executes Luau source inside Studio through the plugin sandbox and returns the result.",
-  "usage": "wsync eval [--project <path>] [--port <port>] --source <luau> [--raw]",
+  "usage": "wsync eval [--project <path>] [--port <port>] (--source <luau> | --source-file <file> | --stdin) [--raw]",
   "examples": [
-    "wsync eval --project . --source 'return #game.Workspace:GetChildren()'"
+    "wsync eval --project . --source 'return Vector3.new(1, 2, 3)'",
+    "wsync eval --project . --source-file ./scripts/probe.luau --raw",
+    "wsync eval --project . --stdin --raw"
   ],
   "notes": [
-    "Use `return ...` when you need a returned value.",
-    "`eval` is request/response against one connected Studio session and carries the standard 5 second remote-op timeout. `wsync exec` is the fire-and-forget broadcast form and returns no value.",
-    "This is the broadest escape hatch; ask before using it for mutations."
+    "Use `return ...` when you need a returned value. Native Roblox globals such as Vector3.new, Color3.fromRGB, CFrame.new, UDim2.new, Enum, and Instance.new are available in Studio execution; the JSON wire tags are for set/new/attr/call arguments. Discover them offline with `wsync commands types`.",
+    "Choose exactly one source input. `--source-file -` also reads stdin. Source file paths are relative to the shell working directory. Leading comments (including --!strict) are accepted by --source; file/stdin avoids shell quoting and argument length limits.",
+    "`eval` is request/response against one connected Studio session and carries the standard 5 second remote-op timeout. `wsync exec` is the fire-and-forget broadcast form and acknowledges queuing only.",
+    "Use within the user-authorized task scope. A timeout or execution/encoding failure can follow earlier mutations; inspect affected state before retrying, and use the operation receipt when provided."
   ]
 }

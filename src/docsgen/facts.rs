@@ -13,6 +13,7 @@
 
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::{
 	collections::{BTreeMap, BTreeSet},
 	path::Path,
@@ -377,11 +378,13 @@ pub enum Safety {
 }
 
 /// Commands whose category does not imply their tier
-const SAFETY_EXCEPTIONS: [(&str, Safety); 6] = [
+const SAFETY_EXCEPTIONS: [(&str, Safety); 7] = [
 	// Reads Studio, writes only WSync's own private clipboard
-	("copy", Safety::ReadOnly),
+	("copy", Safety::Mutating),
 	// Renders into a file the caller names; changes nothing in Studio
-	("capture", Safety::ReadOnly),
+	("capture", Safety::Mutating),
+	// Exports files despite living in Live inspection.
+	("snapshot", Safety::Mutating),
 	// Negotiation only
 	("capabilities", Safety::ReadOnly),
 	// Listing parked conflicts changes nothing
@@ -413,6 +416,8 @@ pub struct CommandFact {
 	pub usage: String,
 	pub examples: Vec<String>,
 	pub subcommands: Vec<String>,
+	/// Registry effects for individual subcommands; families may mix reads and writes.
+	pub subcommand_effects: BTreeMap<String, String>,
 	/// False when the registry documents the command but this build does not
 	/// implement it yet
 	pub shipped: bool,
@@ -420,6 +425,13 @@ pub struct CommandFact {
 
 impl CommandFact {
 	pub fn safety(&self) -> Safety {
+		if !self.subcommand_effects.is_empty() {
+			return if self.subcommand_effects.values().all(|effect| effect == "read-only") {
+				Safety::ReadOnly
+			} else {
+				Safety::Mutating
+			};
+		}
 		if let Some((_, safety)) = SAFETY_EXCEPTIONS.iter().find(|(name, _)| *name == self.name) {
 			return *safety;
 		}
@@ -466,12 +478,21 @@ struct RawCommand {
 	examples: Vec<String>,
 	#[serde(default)]
 	subcommands: Vec<String>,
+	#[serde(default, rename = "subcommandMetadata")]
+	subcommand_metadata: BTreeMap<String, RawSubcommand>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSubcommand {
+	#[serde(default)]
+	safety: String,
 }
 
 /// The generated command registry, as the docs consume it
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistryFacts {
 	pub schema_version: u32,
+	pub fingerprint: String,
 	pub categories: Vec<String>,
 	/// Registry order, which the generator keeps stable
 	order: Vec<String>,
@@ -500,6 +521,11 @@ impl RegistryFacts {
 					usage: command.usage,
 					examples: command.examples,
 					subcommands: command.subcommands,
+					subcommand_effects: command
+						.subcommand_metadata
+						.into_iter()
+						.map(|(name, metadata)| (name, metadata.safety))
+						.collect(),
 					shipped: true,
 				},
 			);
@@ -507,6 +533,7 @@ impl RegistryFacts {
 
 		Ok(Self {
 			schema_version: raw.schema_version,
+			fingerprint: format!("sha256:{:x}", Sha256::digest(json.as_bytes())),
 			categories: raw.categories,
 			order,
 			commands,

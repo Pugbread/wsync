@@ -5,10 +5,13 @@
   "description": "Invokes a method on a live Studio instance and prints the returned value.",
   "usage": "wsync call [--project <path>] [--port <port>] --path <studio-path> --method <MethodName> [--args <json-array>] [--raw]",
   "examples": [
-    "wsync call --project . --path Workspace/Folder --method FindFirstChild --args '[\"Box\"]'"
+    "wsync call --project . --path Workspace/Folder --method FindFirstChild --args '[\"Box\"]'",
+    "wsync call --project . --path Workspace/Box --method PivotTo --args '[{\"__type\":\"CFrame\",\"components\":[0,5,0]}]'"
   ],
   "notes": [
     "`--args` is a JSON array using the same tagged-value codec as `wsync set --value`.",
-    "Treat methods with side effects as writes; successful calls are audited."
+    "Treat methods with side effects as writes; successful calls are audited.",
+    "Offline value schemas and copyable examples for every supported type: `wsync commands types`; narrow with `wsync commands types Vector3` or `wsync commands types Color3`. The live JSON wire format uses the exact `__type` key and lowercase component fields; arrays, constructor strings, and sidecar `{Vector3:[...]}` shapes are not equivalent.",
+    "Content has no JSON input tag: use native `Content.fromUri(...)` in `eval`/`exec` for Content properties, or an available legacy string property. Native Roblox datatype globals are already available there; no extra sandbox permission is needed for Vector3/Color3/CFrame constructors."
   ]
 }

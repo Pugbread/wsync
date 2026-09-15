@@ -15,7 +15,7 @@ use std::{collections::HashMap, fs, time::Duration};
 
 use common::{
 	child_ref_in, connect_client, get_json, post_json, scratch_project_scoped, service_ref, source_claims,
-	spawn_fake_plugin, start_daemon, start_daemon_in, wait_for_frame, FakePlugin, FakePluginScript, TestDaemon,
+	spawn_fake_plugin, start_daemon_in, wait_for_frame, FakePlugin, FakePluginScript, TestDaemon,
 };
 
 const SETTLE: Duration = Duration::from_millis(600);
@@ -27,7 +27,6 @@ const BOOT_REF: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa3";
 const UI_REF: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa4";
 const MAIN_REF: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa5";
 const PART_REF: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa6";
-const STUDIO_ONLY_REF: &str = "ffffffffffffffffffffffffffffffff";
 
 const DISK_HELLO: &str = "return \"disk hello\"\n";
 const STUDIO_HELLO: &str = "return \"studio hello\"\n";
@@ -249,7 +248,14 @@ async fn studio_first_connect_applies_and_leaves_a_disk_review() {
 		.root
 		.join(".wsync-backups")
 		.join("backlog")
-		.join(entries.iter().find(|entry| entry["path"] == "src/ReplicatedStorage/Hello.luau").unwrap()["id"].as_str().unwrap())
+		.join(
+			entries
+				.iter()
+				.find(|entry| entry["path"] == "src/ReplicatedStorage/Hello.luau")
+				.unwrap()["id"]
+				.as_str()
+				.unwrap(),
+		)
 		.join("src/ReplicatedStorage/Hello.luau");
 
 	assert_eq!(fs::read_to_string(&stored).unwrap(), DISK_HELLO);
@@ -273,8 +279,6 @@ async fn studio_first_connect_applies_and_leaves_a_disk_review() {
 	assert_eq!(event["total"], 2);
 	assert_eq!(event["added"], 2);
 }
-
-
 
 #[tokio::test]
 async fn a_daemon_restart_keeps_the_pending_review_answerable() {
@@ -342,4 +346,3 @@ async fn a_daemon_restart_keeps_the_pending_review_answerable() {
 	let (_, backlog) = get_json(&daemon, "/backlog").await;
 	assert_eq!(backlog["entries"].as_array().unwrap().len(), 1);
 }
-

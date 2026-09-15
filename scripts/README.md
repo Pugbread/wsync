@@ -113,6 +113,32 @@ node scripts/check-luau-bytecode.mjs
 node scripts/check-luau-bytecode.mjs --luau-compile /path/to/luau-compile --require-compiler
 ```
 
+## `check-plugin-syncback.mjs`
+
+Runs the plugin's live-syncback core outside Studio. The Watcher, ReadProcessor
+and Tree decide which files a Studio move or delete removes from disk, and a
+wrong decision there is data loss — the reparent bug this check was written
+for pushed a moved folder without its children while the removal it followed
+deleted their files. None of that logic needs Studio: each scenario under
+`plugin/tests/*.luau` runs the *real* modules over a fake DataModel
+(`plugin/tests/harness/fakes.luau`) with the standalone `luau` binary. The
+require-free modules already load that way; the impure ones are loaded through
+`loadstring` with their own `script` and `require`
+(`plugin/tests/harness/loader.luau`), so `require(WSync.Types)` resolves through
+module refs instead of a DataModel. Log, Config, Dom, the Signal package and the
+Roblox globals are stubbed; everything else a scenario touches is the shipped
+source. A scenario fails by calling `error`, and its output is reported
+verbatim.
+
+The runner is resolved in order: `--luau <path>`, `$LUAU`, `luau` on `PATH`, and
+otherwise a loud SKIP with exit 0 (`--require-luau` turns that into a failure).
+CI takes `luau` from the same pinned release zip as `luau-compile`.
+
+```sh
+node scripts/check-plugin-syncback.mjs
+node scripts/check-plugin-syncback.mjs --keep     # keep the generated files to inspect
+```
+
 ## `check-release-identity.mjs`
 
 Design 8.5 and 10.5 state the same rule from two directions: everything in a
@@ -217,3 +243,23 @@ downloaded artifact, and only then does `publish` draft a GitHub release with
 the `tauri-cli` pin is re-asserted after installation so it holds whichever
 install path ran. Without a signing key the desktop build still happens, is
 labelled a prerelease, and publishes no `latest.json`.
+
+## Agent-interface regressions
+
+- `node scripts/check-value-codec.mjs --require-luau` checks the canonical
+  `docs/value-types.json` against the embedded Luau schema and executes the real
+  codec with Roblox constructor stand-ins. Use `--write` after changing the
+  catalog to regenerate its embedded schema; commit both source changes.
+- `node scripts/check-playtest-results.mjs --require-luau` exercises the actual
+  runner source wrappers, result envelope builder, and payload cap. It covers
+  nil/multiple returns and large results without requiring a Studio session.
+- `cargo test --test command_examples` parses every documented WSync example
+  through Clap without executing it, including the WSync segment of pipelines.
+- `cargo test --test cli_efficiency --test runtime_contract --test cli_playtest_identity`
+  covers historical command failures, safe source exports, target identity,
+  operation receipts, and playtest generation guards using temporary local
+  daemons and fake Studio clients. Local loopback permission is required.
+
+These checks prove the CLI/transport and isolated Luau behavior. They do not
+replace native Roblox integration testing when changing a datatype constructor
+or Studio API.

@@ -114,6 +114,18 @@ function Processor:hydrate(snapshot: Types.Snapshot, instance: Instance)
 			end
 
 			if child.Name == snapshotChild.name and child.ClassName == snapshotChild.class then
+				if ReadProcessor.isExcluded(child) then
+					-- `AvoidSync` / `--!ignoresync` (SyncScope): the instance
+					-- is never paired with its file. Unpaired, the file is
+					-- disk-only to the diff — Studio-first moves it to the
+					-- backlog — and the instance stays untracked, so nothing
+					-- it does reaches disk. Marked so removing the marker
+					-- brings it back; a same-named sibling without one may
+					-- still claim the file
+					self.read:markExcluded(child)
+					continue
+				end
+
 				self:hydrate(snapshotChild, child)
 				hydrated[index] = true
 				break
@@ -229,6 +241,11 @@ function Processor:diff(snapshot: Types.Snapshot, parent: Types.Ref, clientPrior
 			end)
 
 			changes:join(self:diff(childSnapshot, snapshot.id, clientPriority))
+		elseif ReadProcessor.isExcluded(child) then
+			-- `AvoidSync` / `--!ignoresync` (SyncScope): not Studio-only
+			-- content for the daemon to write out — the instance is in
+			-- Studio alone on purpose
+			self.read:markExcluded(child)
 		else
 			-- A Studio-only child. On code scope that means "the daemon writes
 			-- it to disk", never "delete it from Studio", so whether Roblox
@@ -250,6 +267,25 @@ function Processor:diff(snapshot: Types.Snapshot, parent: Types.Ref, clientPrior
 	end
 
 	return changes
+end
+
+--- Apply daemon changes to Studio, then hold the exclusion line on what
+--- arrived: the write processor tracks whatever it creates or updates, and an
+--- arrival carrying `AvoidSync` or `--!ignoresync` (SyncScope) must not stay
+--- tracked — it would sync both ways until its next marker edit in Studio.
+--- The marker itself is what the daemon sent, so the untracking is silent:
+--- no removal goes back, the file just becomes a stale copy (disk-only at
+--- the next connect, where Studio-first moves it to the backlog).
+function Processor:applyChanges(changes: Types.Changes, initial: boolean?)
+	self.write:applyChanges(changes, initial)
+
+	for _, snapshot in changes.additions do
+		self.read:excludeArrivals(self.tree:getInstance(snapshot.id))
+	end
+
+	for _, snapshot in changes.updates do
+		self.read:excludeArrivals(self.tree:getInstance(snapshot.id))
+	end
 end
 
 function Processor:reverseChanges(changes: Types.Changes): Types.Changes

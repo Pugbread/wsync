@@ -11,7 +11,12 @@ use tokio::sync::{mpsc, oneshot, watch};
 use uuid::Uuid;
 
 use super::frames::{shutdown, Event, ResponseFrame, ServerFrame};
-use crate::{constants::LONGPOLL_EVICT_AFTER, core::queue::Queue, lock};
+use crate::{
+	constants::LONGPOLL_EVICT_AFTER,
+	core::queue::Queue,
+	lock,
+	server::operation::{self, Receipt, Receipts},
+};
 
 /// Reason attached to a server-initiated close of one WS connection; the
 /// connection task turns it into a typed `shutdown` frame before closing
@@ -76,6 +81,7 @@ pub struct WsState {
 	next_watcher_id: AtomicU64,
 	next_request_id: AtomicU32,
 	pending: Mutex<HashMap<u32, oneshot::Sender<ResponseFrame>>>,
+	receipts: Mutex<Receipts>,
 }
 
 impl WsState {
@@ -86,6 +92,7 @@ impl WsState {
 			next_watcher_id: AtomicU64::new(1),
 			next_request_id: AtomicU32::new(1),
 			pending: Mutex::new(HashMap::new()),
+			receipts: Mutex::new(Receipts::default()),
 		}
 	}
 
@@ -225,6 +232,22 @@ impl WsState {
 
 	// Request/response router
 
+	pub fn begin_operation(&self, request_id: u32, operation_id: &str, op: &str) -> bool {
+		lock!(self.receipts).begin(request_id, operation_id, op)
+	}
+
+	pub fn finish_operation(&self, request_id: u32, completion: &'static str, error_code: Option<&str>) {
+		lock!(self.receipts).finish(request_id, completion, error_code);
+	}
+
+	pub fn operation_receipt(&self, operation_id: &str) -> Option<Receipt> {
+		lock!(self.receipts).get(operation_id)
+	}
+
+	pub fn operation_name(&self, request_id: u32) -> Option<String> {
+		lock!(self.receipts).op(request_id)
+	}
+
 	pub fn next_request_id(&self) -> u32 {
 		loop {
 			let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
@@ -249,6 +272,15 @@ impl WsState {
 
 	/// Routes a plugin `response` frame to the pending `POST /request` caller
 	pub fn resolve_request(&self, response: ResponseFrame) {
+		// Retain late completion evidence even when the HTTP caller already
+		// timed out. A timeout cancels waiting, not execution in Studio.
+		if let Some(op) = self.operation_name(response.request_id) {
+			self.finish_operation(
+				response.request_id,
+				operation::completion(&response, Some(&op)),
+				response.error.as_ref().map(|error| error.code.as_str()),
+			);
+		}
 		let sender = lock!(self.pending).remove(&response.request_id);
 
 		match sender {

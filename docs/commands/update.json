@@ -2,7 +2,7 @@
   "name": "update",
   "title": "wsync update",
   "category": "Tool management",
-  "description": "Updates the WSync CLI, Studio plugin, and project templates from the published releases.",
+  "description": "Updates selected WSync components: CLI/plugin from releases and templates from the embedded bundle.",
   "subcommands": [
     "cli",
     "plugin",
@@ -25,9 +25,7 @@
     },
     "templates": {
       "safety": "writes-local-files",
-      "requires": [
-        "network"
-      ]
+      "requires": []
     },
     "all": {
       "safety": "replaces-local-binary",
@@ -37,19 +35,18 @@
       ]
     }
   },
-  "usage": "wsync update [cli|plugin|templates|all] [--force] [--raw]",
+  "usage": "wsync update [cli|plugin|templates|all] [-f|--force]",
   "examples": [
     "wsync update",
     "wsync update cli --force",
     "wsync update plugin",
-    "wsync update templates --raw"
+    "wsync update templates"
   ],
   "notes": [
-    "Defaults to `all`. Installed versions are tracked in `~/.wsync/update.toml`.",
-    "`cli` replaces the self-installed binary in `~/.wsync/bin`. A package-managed install is refused with the package manager's own upgrade command instead of being overwritten.",
-    "`--force` reinstalls the current version and skips the already-up-to-date short-circuit.",
-    "A passive check runs at most hourly and only prints a notice; `check_updates` disables it and `auto_update` makes it apply without asking.",
-    "`plugin` writes to the Roblox Studio plugins directory and requires a Studio restart. `templates` refreshes `~/.wsync/templates/` under the `update_templates` config option.",
-    "Binary, plugin, protocol number, and generated docs are released together from one commit; update them as a set rather than individually when a protocol number changes."
+    "Default mode is all: it updates the CLI and includes the plugin/templates according to install_plugin and update_templates configuration. Explicit plugin or templates mode selects that component regardless of those all-mode switches.",
+    "CLI and plugin updates request GitHub releases. Template updates use the templates embedded in this CLI and do not need a release download.",
+    "--force bypasses WSync version guards and attempts the selected updates even when recorded versions appear current. Version bookkeeping is stored in ~/.wsync/update.toml.",
+    "Update output is human-readable; --raw is not implemented. Studio must reload the changed plugin file or restart before using it.",
+    "Use a matching CLI/plugin build when the protocol changes. An update command is an explicit mutation, not an offline version check."
   ]
 }

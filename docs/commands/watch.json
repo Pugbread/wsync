@@ -3,14 +3,17 @@
   "title": "wsync watch",
   "category": "Live diagnostics",
   "description": "Streams raw daemon WebSocket frames for debugging sync traffic.",
-  "usage": "wsync watch [--project <path>] [--port <port>] [--compact]",
+  "usage": "wsync watch [<project> | --project <path>] [-P|--port <port>] [--compact] [--raw]",
   "examples": [
     "wsync watch",
     "wsync watch --project .",
-    "wsync watch --compact"
+    "wsync watch --compact",
+    "wsync watch --project . --raw"
   ],
   "notes": [
-    "Connects as a `watch` role client and prints `wsync/1` JSON text frames as they pass: `sync`, `push`, `event`, `request`, `response`, and lifecycle frames.",
-    "Use this for debugging daemon/plugin traffic; `wsync tail` is better for Studio output."
+    "Connects to the daemon WebSocket as a watch-role client and prints received event/lifecycle frames. Protocol heartbeat ping/pong messages are handled internally.",
+    "Without --port, it discovers the daemon port from the project runtime record, then the project file, then configuration. --project and the positional project are alternatives.",
+    "--raw suppresses the status banner and prints NDJSON frames. --compact prints one-line human summaries; combining it with --raw still selects summaries.",
+    "Use this for daemon/plugin events; wsync logs or wsync tail are the tools for Studio output."
   ]
 }

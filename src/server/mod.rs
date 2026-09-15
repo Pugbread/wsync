@@ -34,6 +34,7 @@ mod home;
 pub mod lifecycle;
 mod msgpack;
 mod open;
+pub mod operation;
 pub mod ops;
 mod read;
 pub mod request;
@@ -288,6 +289,10 @@ impl Server {
 			.route("/hello", get(hello::main).fallback(Self::default_redirect))
 			.route("/ws", get(ws::handler).fallback(Self::default_redirect))
 			.route("/request", post(request::main).fallback(Self::default_redirect))
+			.route(
+				"/operations/:operation_id",
+				get(request::status).fallback(Self::default_redirect),
+			)
 			.route(
 				"/resolve",
 				get(resolve::list)

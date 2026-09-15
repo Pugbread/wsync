@@ -13,8 +13,8 @@
 //! - Bytes outside the block are never touched. Line endings, trailing
 //!   whitespace and blank runs in user notes survive verbatim.
 //! - Re-rendering with unchanged inputs produces a byte-identical file.
-//! - A file with no block gets one appended; a missing file gets a preamble
-//!   plus the block.
+//! - Detailed reference blocks remain in place; always-loaded contracts use
+//!   `upsert_first` so long notes cannot hide the generated instructions.
 //! - Duplicate blocks (an older writer, a bad merge) collapse to one.
 //! - An unterminated start marker is dropped rather than swallowing whatever
 //!   follows it, so user text below a truncated write is never deleted.
@@ -24,7 +24,7 @@ use std::cmp::Reverse;
 
 /// The full generated tool reference inside `wsync.md`
 pub const PROJECT_MEMORY: &str = "wsync:project-memory";
-/// The embedded copy inside `AGENTS.md`
+/// The concise generated contract inside `AGENTS.md`
 pub const AGENT_CONTEXT: &str = "wsync:agent-context";
 /// The `@AGENTS.md` import inside `CLAUDE.md`
 pub const AGENTS_INCLUDE: &str = "wsync:agents-include";
@@ -167,4 +167,32 @@ pub fn upsert(existing: Option<&str>, marker: &str, body: &str, preamble: &str) 
 	}
 
 	text
+}
+
+/// Put a frequently loaded contract first so preserved long notes cannot hide it
+/// beyond a client's byte limit. Every byte outside owned marker spans keeps its
+/// relative order. Existing separators are reused, so the next render is stable.
+pub fn upsert_first(existing: Option<&str>, marker: &str, body: &str, preamble: &str) -> String {
+	let generated = block(marker, body);
+	let Some(existing) = existing else {
+		return if preamble.is_empty() {
+			format!("{generated}\n")
+		} else {
+			format!("{generated}\n\n{}\n", preamble.trim_matches('\n'))
+		};
+	};
+	let (blocks, orphans) = scan(existing, marker);
+	let mut spans: Vec<Span> = blocks.into_iter().chain(orphans).collect();
+	spans.sort_by_key(|(start, _)| Reverse(*start));
+	let mut notes = existing.to_owned();
+	for (start, end) in spans {
+		notes.replace_range(start..end, "");
+	}
+	if notes.is_empty() {
+		format!("{generated}\n")
+	} else if notes.starts_with('\n') || notes.starts_with("\r\n") {
+		format!("{generated}{notes}")
+	} else {
+		format!("{generated}\n\n{notes}")
+	}
 }

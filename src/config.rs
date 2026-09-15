@@ -62,13 +62,13 @@ pub struct Config {
 	/// Build using XML format by default
 	pub build_xml: bool,
 
-	/// Check for new WSync releases on startup
+	/// Legacy compatibility setting; startup never checks for updates (use `wsync update`)
 	pub check_updates: bool,
-	/// Automatically install WSync updates if available
+	/// Legacy compatibility setting; updates require an explicit `wsync update` command
 	pub auto_update: bool,
-	/// Install Roblox plugin locally and keep it updated
+	/// Include the Roblox plugin when running `wsync update all`
 	pub install_plugin: bool,
-	/// Update default project templates when available
+	/// Include default project templates when running `wsync update all`
 	pub update_templates: bool,
 
 	/// Use Rojo namespace by default

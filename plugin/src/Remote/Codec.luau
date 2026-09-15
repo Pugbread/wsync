@@ -86,6 +86,35 @@ function Codec._injectGlobals(overrides: { [string]: any })
 	end
 end
 
+-- BEGIN GENERATED VALUE SCHEMAS (scripts/check-value-codec.mjs --write)
+local VALUE_SCHEMAS: { [string]: any } = {
+	["Vector2"] = {["schema"]={["type"]="object",["properties"]={["__type"]={["const"]="Vector2"},["x"]={["type"]="number"},["y"]={["type"]="number"}},["required"]={"__type","x","y"},["additionalProperties"]=false},["decode"]=true,["example"]="{\"__type\":\"Vector2\",\"x\":1,\"y\":2}",["notes"]="Components are finite numbers."},
+	["Vector3"] = {["schema"]={["type"]="object",["properties"]={["__type"]={["const"]="Vector3"},["x"]={["type"]="number"},["y"]={["type"]="number"},["z"]={["type"]="number"}},["required"]={"__type","x","y","z"},["additionalProperties"]=false},["decode"]=true,["example"]="{\"__type\":\"Vector3\",\"x\":1,\"y\":2,\"z\":3}",["notes"]="Components are finite numbers."},
+	["Vector2int16"] = {["schema"]={["type"]="object",["properties"]={["__type"]={["const"]="Vector2int16"},["x"]={["type"]="number"},["y"]={["type"]="number"}},["required"]={"__type","x","y"},["additionalProperties"]=false},["decode"]=true,["example"]="{\"__type\":\"Vector2int16\",\"x\":1,\"y\":2}",["notes"]="Finite numeric inputs are passed to Roblox. Stored components are signed 16-bit integers [-32768,32767]; the constructor rounds non-integers down and out-of-range values may overflow. The codec preserves constructor behavior rather than rejecting these inputs; read back the property to see normalization."},
+	["Vector3int16"] = {["schema"]={["type"]="object",["properties"]={["__type"]={["const"]="Vector3int16"},["x"]={["type"]="number"},["y"]={["type"]="number"},["z"]={["type"]="number"}},["required"]={"__type","x","y","z"},["additionalProperties"]=false},["decode"]=true,["example"]="{\"__type\":\"Vector3int16\",\"x\":1,\"y\":2,\"z\":3}",["notes"]="Finite numeric inputs are passed to Roblox. Stored components are signed 16-bit integers [-32768,32767]; the constructor rounds non-integers down and out-of-range values may overflow. The codec preserves constructor behavior rather than rejecting these inputs; read back the property to see normalization."},
+	["CFrame"] = {["schema"]={["type"]="object",["properties"]={["__type"]={["const"]="CFrame"},["components"]={["type"]="array",["items"]={["type"]="number"},["allowedLengths"]={3,12}}},["required"]={"__type","components"},["additionalProperties"]=false},["decode"]=true,["example"]="{\"__type\":\"CFrame\",\"components\":[0,5,0]}",["notes"]="3 components are x,y,z position; 12 components are x,y,z,r00,r01,r02,r10,r11,r12,r20,r21,r22. Encoding always emits 12. Rotation matrices are passed to the Roblox constructor."},
+	["Color3"] = {["schema"]={["type"]="object",["properties"]={["__type"]={["const"]="Color3"},["r"]={["type"]="number"},["g"]={["type"]="number"},["b"]={["type"]="number"}},["required"]={"__type","r","g","b"},["additionalProperties"]=false},["decode"]=true,["example"]="{\"__type\":\"Color3\",\"r\":1,\"g\":0.5,\"b\":0}",["notes"]="RGB channels use the 0–1 scale (divide 0–255 RGB values by 255). Finite channels are passed unchanged to Color3.new; this codec does not divide or clamp them."},
+	["BrickColor"] = {["schema"]={["type"]="object",["properties"]={["__type"]={["const"]="BrickColor"},["name"]={["type"]="string"}},["required"]={"__type","name"},["additionalProperties"]=false},["decode"]=true,["example"]="{\"__type\":\"BrickColor\",\"name\":\"Bright red\"}",["notes"]="Use a Roblox BrickColor name. The engine may normalize unknown names to its fallback palette color."},
+	["EnumItem"] = {["schema"]={["type"]="object",["properties"]={["__type"]={["const"]="EnumItem"},["enum"]={["type"]="string"},["name"]={["type"]="string"},["value"]={["type"]="number"}},["required"]={"__type","enum","name"},["additionalProperties"]=false},["decode"]=true,["example"]="{\"__type\":\"EnumItem\",\"enum\":\"Enum.Material\",\"name\":\"Neon\"}",["notes"]="The Enum. prefix is optional. enum/name are resolved by Studio; unknown enums or members fail. Optional numeric value is output metadata and ignored on decode."},
+	["UDim"] = {["schema"]={["type"]="object",["properties"]={["__type"]={["const"]="UDim"},["scale"]={["type"]="number"},["offset"]={["type"]="number"}},["required"]={"__type","scale","offset"},["additionalProperties"]=false},["decode"]=true,["example"]="{\"__type\":\"UDim\",\"scale\":0.5,\"offset\":10}",["notes"]="Finite scale/offset values are passed to Roblox. Offset is stored as an integer; read back the property for engine normalization."},
+	["UDim2"] = {["schema"]={["type"]="object",["properties"]={["__type"]={["const"]="UDim2"},["x"]={["type"]="object",["properties"]={["scale"]={["type"]="number"},["offset"]={["type"]="number"}},["required"]={"scale","offset"},["additionalProperties"]=false},["y"]={["type"]="object",["properties"]={["scale"]={["type"]="number"},["offset"]={["type"]="number"}},["required"]={"scale","offset"},["additionalProperties"]=false}},["required"]={"__type","x","y"},["additionalProperties"]=false},["decode"]=true,["example"]="{\"__type\":\"UDim2\",\"x\":{\"scale\":1,\"offset\":-20},\"y\":{\"scale\":0,\"offset\":48}}",["notes"]="x/y are untagged {scale,offset} objects, not arrays or nested UDim tags. Offsets are numeric inputs stored as integers by Roblox; read back normalization."},
+	["NumberRange"] = {["schema"]={["type"]="object",["properties"]={["__type"]={["const"]="NumberRange"},["min"]={["type"]="number"},["max"]={["type"]="number"}},["required"]={"__type","min","max"},["additionalProperties"]=false},["decode"]=true,["example"]="{\"__type\":\"NumberRange\",\"min\":1,\"max\":5}",["notes"]="min must be <= max."},
+	["Rect"] = {["schema"]={["type"]="object",["properties"]={["__type"]={["const"]="Rect"},["min"]={["type"]="object",["properties"]={["x"]={["type"]="number"},["y"]={["type"]="number"}},["required"]={"x","y"},["additionalProperties"]=false},["max"]={["type"]="object",["properties"]={["x"]={["type"]="number"},["y"]={["type"]="number"}},["required"]={"x","y"},["additionalProperties"]=false}},["required"]={"__type","min","max"},["additionalProperties"]=false},["decode"]=true,["example"]="{\"__type\":\"Rect\",\"min\":{\"x\":0,\"y\":0},\"max\":{\"x\":100,\"y\":50}}",["notes"]=""},
+	["NumberSequence"] = {["schema"]={["type"]="object",["properties"]={["__type"]={["const"]="NumberSequence"},["keypoints"]={["type"]="array",["items"]={["type"]="object",["properties"]={["time"]={["type"]="number",["minimum"]=0,["maximum"]=1},["value"]={["type"]="number"},["envelope"]={["type"]="number",["minimum"]=0}},["required"]={"time","value"},["additionalProperties"]=false},["minItems"]=2,["maxItems"]=20}},["required"]={"__type","keypoints"},["additionalProperties"]=false},["decode"]=true,["example"]="{\"__type\":\"NumberSequence\",\"keypoints\":[{\"time\":0,\"value\":0,\"envelope\":0},{\"time\":1,\"value\":1,\"envelope\":0}]}",["notes"]="2–20 keypoints, first time=0, last time=1, nondecreasing time order. envelope defaults to 0 and must be nonnegative."},
+	["ColorSequence"] = {["schema"]={["type"]="object",["properties"]={["__type"]={["const"]="ColorSequence"},["keypoints"]={["type"]="array",["items"]={["type"]="object",["properties"]={["time"]={["type"]="number",["minimum"]=0,["maximum"]=1},["color"]={["type"]="object",["properties"]={["r"]={["type"]="number"},["g"]={["type"]="number"},["b"]={["type"]="number"}},["required"]={"r","g","b"},["additionalProperties"]=false}},["required"]={"time","color"},["additionalProperties"]=false},["minItems"]=2,["maxItems"]=20}},["required"]={"__type","keypoints"},["additionalProperties"]=false},["decode"]=true,["example"]="{\"__type\":\"ColorSequence\",\"keypoints\":[{\"time\":0,\"color\":{\"r\":1,\"g\":0,\"b\":0}},{\"time\":1,\"color\":{\"r\":0,\"g\":0,\"b\":1}}]}",["notes"]="2–20 keypoints, first time=0, last time=1, nondecreasing time order. color is an untagged {r,g,b} object on the 0–1 RGB scale."},
+	["Font"] = {["schema"]={["type"]="object",["properties"]={["__type"]={["const"]="Font"},["family"]={["type"]="string"},["weight"]={["type"]="string",["enum"]={"Thin","ExtraLight","Light","Regular","Medium","SemiBold","Bold","ExtraBold","Heavy"}},["style"]={["type"]="string",["enum"]={"Normal","Italic"}}},["required"]={"__type","family","weight","style"},["additionalProperties"]=false},["decode"]=true,["example"]="{\"__type\":\"Font\",\"family\":\"rbxasset://fonts/families/SourceSansPro.json\",\"weight\":\"Regular\",\"style\":\"Normal\"}",["notes"]=""},
+	["Faces"] = {["schema"]={["type"]="object",["properties"]={["__type"]={["const"]="Faces"},["top"]={["type"]="boolean"},["bottom"]={["type"]="boolean"},["left"]={["type"]="boolean"},["right"]={["type"]="boolean"},["front"]={["type"]="boolean"},["back"]={["type"]="boolean"}},["required"]={"__type"},["additionalProperties"]=false},["decode"]=true,["example"]="{\"__type\":\"Faces\",\"top\":true,\"front\":true}",["notes"]="Omitted face flags default to false. Provided flags must be booleans."},
+	["Axes"] = {["schema"]={["type"]="object",["properties"]={["__type"]={["const"]="Axes"},["x"]={["type"]="boolean"},["y"]={["type"]="boolean"},["z"]={["type"]="boolean"}},["required"]={"__type"},["additionalProperties"]=false},["decode"]=true,["example"]="{\"__type\":\"Axes\",\"x\":true,\"y\":true,\"z\":false}",["notes"]="Omitted axis flags default to false. Provided flags must be booleans."},
+	["PhysicalProperties"] = {["schema"]={["type"]="object",["properties"]={["__type"]={["const"]="PhysicalProperties"},["density"]={["type"]="number"},["friction"]={["type"]="number"},["elasticity"]={["type"]="number"},["frictionWeight"]={["type"]="number"},["elasticityWeight"]={["type"]="number"},["acousticAbsorption"]={["type"]="number"}},["required"]={"__type","density","friction","elasticity"},["additionalProperties"]=false},["decode"]=true,["example"]="{\"__type\":\"PhysicalProperties\",\"density\":1,\"friction\":0.5,\"elasticity\":0,\"frictionWeight\":1,\"elasticityWeight\":1}",["notes"]="Weights default to 1. Finite inputs are passed through; Roblox clamps density to [0.0001,100], friction to [0,2], elasticity to [0,1], weights to [0,100], and optional acousticAbsorption to [0,1]. acousticAbsorption requires a Studio version supporting the sixth constructor argument; encoding includes it only when available. Read back the property for normalized values."},
+	["InstancePath"] = {["schema"]={["type"]="object",["properties"]={["__type"]={["const"]="InstancePath"},["path"]={["type"]="string"},["class"]={["type"]="string"},["rooted"]={["const"]=true}},["required"]={"__type","path"},["additionalProperties"]=false},["decode"]=true,["example"]="{\"__type\":\"InstancePath\",\"path\":\"Workspace/Box\"}",["notes"]="path resolves an existing instance; empty path means DataModel. class is ignored metadata. Output may carry rooted:false for an unparented instance; that value cannot be resolved or written back."},
+	["Number"] = {["schema"]={["type"]="object",["properties"]={["__type"]={["const"]="Number"},["value"]={["type"]="string",["enum"]={"nan","inf","-inf"}}},["required"]={"__type","value"},["additionalProperties"]=false},["decode"]=true,["example"]="{\"__type\":\"Number\",\"value\":\"inf\"}",["notes"]="Non-finite scalar numbers only. Property/method-specific restrictions still apply."},
+	["BinaryString"] = {["schema"]={["type"]="object",["properties"]={["__type"]={["const"]="BinaryString"},["base64"]={["type"]="string",["format"]="base64"},["bytes"]={["type"]="integer",["minimum"]=0,["maximum"]=4194304}},["required"]={"__type","base64"},["additionalProperties"]=false},["decode"]=true,["example"]="{\"__type\":\"BinaryString\",\"base64\":\"aGk=\",\"bytes\":2}",["notes"]="base64 is strict padded RFC 4648. Optional bytes metadata must match decoded length. BinaryString decodes to a raw Luau string; Buffer decodes to a Luau buffer. Valid UTF-8 strings may encode back as plain JSON strings."},
+	["Buffer"] = {["schema"]={["type"]="object",["properties"]={["__type"]={["const"]="Buffer"},["base64"]={["type"]="string",["format"]="base64"},["bytes"]={["type"]="integer",["minimum"]=0,["maximum"]=4194304}},["required"]={"__type","base64"},["additionalProperties"]=false},["decode"]=true,["example"]="{\"__type\":\"Buffer\",\"base64\":\"aGk=\",\"bytes\":2}",["notes"]="base64 is strict padded RFC 4648. Optional bytes metadata must match decoded length. BinaryString decodes to a raw Luau string; Buffer decodes to a Luau buffer."},
+	["Unencodable"] = {["schema"]={["type"]="object",["properties"]={["__type"]={["const"]="Unencodable"},["luauType"]={["type"]="string"},["display"]={["type"]="string"}},["required"]={"__type","luauType","display"},["additionalProperties"]=false},["decode"]=false,["example"]="{\"__type\":\"Unencodable\",\"luauType\":\"Content\",\"display\":\"Content\"}",["notes"]="Output-only diagnostic marker for unsupported native values. Construct these natively with eval/exec; do not send this marker as input."},
+	["Skipped"] = {["schema"]={["type"]="object",["properties"]={["__type"]={["const"]="Skipped"},["reason"]={["type"]="string"}},["required"]={"__type","reason"},["additionalProperties"]=false},["decode"]=false,["example"]="{\"__type\":\"Skipped\",\"reason\":\"read skipped\"}",["notes"]="Output-only property-inspection marker; fields may vary by reader. Never valid as an input value."},
+}
+-- END GENERATED VALUE SCHEMAS
+
 local instanceCodec: InstanceCodec? = nil
 
 --- Install the Instance <-> path bridge (done once by Remote/init). Kept as
@@ -261,6 +290,9 @@ local function base64Decode(encoded: string): string
 		end
 
 		local chunk = values[1] * 262144 + values[2] * 4096 + values[3] * 64 + values[4]
+		if (padding == 2 and values[2] % 16 ~= 0) or (padding == 1 and values[3] % 4 ~= 0) then
+			invalid("malformed base64 payload: nonzero padding bits")
+		end
 		local a = math.floor(chunk / 65536) % 256
 		local b = math.floor(chunk / 256) % 256
 		local c = chunk % 256
@@ -317,8 +349,8 @@ end
 --------------------------------------------------------------------------------
 
 local function expectNumber(value: any, field: string): number
-	if type(value) ~= "number" then
-		invalid(`field '{field}' must be a number`)
+	if type(value) ~= "number" or value ~= value or math.abs(value) == math.huge then
+		invalid(`field '{field}' must be a finite number`)
 	end
 
 	return value
@@ -338,6 +370,136 @@ local function expectTable(value: any, field: string): { [any]: any }
 	end
 
 	return value
+end
+
+--- Copyable wire guidance shared by decode failures and property-write errors.
+--- `kind` is a typeof result (Instance maps to the InstancePath wire tag).
+function Codec.describe(kind: string): string
+	local tag = if kind == "Instance" then "InstancePath" else kind
+	local entry = VALUE_SCHEMAS[tag]
+	if entry ~= nil then
+		if not entry.decode then
+			return `{tag} is output-only; construct the native value in eval/exec instead`
+		end
+		return `Run wsync commands types {tag}. Expected {tag} JSON, e.g. {entry.example}. {entry.notes}`
+	end
+	if kind == "Content" then
+		return "Content has no JSON input tag; use Content.fromUri(\"rbxassetid://123\") natively in eval/exec, or an available legacy string property. Run wsync commands types Content"
+	end
+	return `Expected {kind}; run wsync commands types for the live JSON value contract`
+end
+
+-- These schema keywords are generated from docs/value-types.json. Keep this
+-- interpreter and src/cli/value_schema.rs equivalent; tests execute examples
+-- and malformed inputs against the real decoder, not just a schema mock.
+local function validateSchema(value: any, schema: any, path: string)
+	if schema.const ~= nil and value ~= schema.const then
+		invalid(`{path} must be {tostring(schema.const)}`)
+	end
+	if schema.enum ~= nil and table.find(schema.enum, value) == nil then
+		invalid(`{path} must be one of {table.concat(schema.enum, ", ")}`)
+	end
+	local kind = schema.type
+	if kind == "number" or kind == "integer" then
+		local number = expectNumber(value, path)
+		if kind == "integer" and number % 1 ~= 0 then
+			invalid(`{path} must be an integer`)
+		end
+		if schema.minimum ~= nil and number < schema.minimum then
+			invalid(`{path} must be >= {schema.minimum}`)
+		end
+		if schema.maximum ~= nil and number > schema.maximum then
+			invalid(`{path} must be <= {schema.maximum}`)
+		end
+	elseif kind == "string" or kind == "boolean" then
+		if type(value) ~= kind then
+			invalid(`{path} must be a {kind}`)
+		end
+	elseif kind == "array" then
+		expectTable(value, path)
+		local count = 0
+		for key in value do
+			count += 1
+			if type(key) ~= "number" or key % 1 ~= 0 or key < 1 or key > #value then
+				invalid(`{path} must be a dense array`)
+			end
+		end
+		if count ~= #value then
+			invalid(`{path} must be a dense array`)
+		end
+		if schema.minItems ~= nil and count < schema.minItems then
+			invalid(`{path} must contain at least {schema.minItems} entries`)
+		end
+		if schema.maxItems ~= nil and count > schema.maxItems then
+			invalid(`{path} must contain at most {schema.maxItems} entries`)
+		end
+		if schema.allowedLengths ~= nil and table.find(schema.allowedLengths, count) == nil then
+			invalid(`{path} must contain 3 or 12 entries`)
+		end
+		for index, item in value do
+			validateSchema(item, schema.items, `{path}[{index}]`)
+		end
+	elseif kind == "object" then
+		expectTable(value, path)
+		for _, field in schema.required do
+			if value[field] == nil then
+				invalid(`{path}.{field} is required`)
+			end
+		end
+		for field, item in value do
+			local child = schema.properties[field]
+			if child == nil then
+				invalid(`{path}.{tostring(field)} is not a supported field`)
+			end
+			validateSchema(item, child, `{path}.{tostring(field)}`)
+		end
+	end
+end
+
+-- Tagged fields previously bypassed codec budgets, including strings and
+-- arbitrarily large nested arrays. Charge their raw shape before constructors
+-- allocate anything. This also rejects cycles in caller-supplied Luau tags.
+local function chargePayload(value: any, depth: number, budget: Budget)
+	chargeDepth(depth)
+	chargeNode(budget)
+	if type(value) == "string" then
+		chargeString(budget, #value)
+	elseif type(value) == "table" then
+		if budget.seen[value] then
+			invalid("value contains a table cycle")
+		end
+		budget.seen[value] = true
+		local count = 0
+		for _, item in value do
+			count += 1
+			if count > Codec.LIMITS.maxTableEntries then
+				invalid(`table exceeds the {Codec.LIMITS.maxTableEntries}-entry codec budget`)
+			end
+			chargePayload(item, depth + 1, budget)
+		end
+		budget.seen[value] = nil
+	end
+end
+
+local function validateRelations(value: any, tag: string)
+	if tag == "NumberRange" and value.min > value.max then
+		invalid("NumberRange.min must be <= max")
+	elseif tag == "NumberSequence" or tag == "ColorSequence" then
+		local points = value.keypoints
+		if points[1].time ~= 0 or points[#points].time ~= 1 then
+			invalid(`{tag}.keypoints must start at time 0 and end at time 1`)
+		end
+		for index = 2, #points do
+			if points[index].time < points[index - 1].time then
+				invalid(`{tag}.keypoints must be in nondecreasing time order`)
+			end
+		end
+	elseif tag == "Buffer" or tag == "BinaryString" then
+		local bytes = #base64Decode(value.base64)
+		if value.bytes ~= nil and value.bytes ~= bytes then
+			invalid(`{tag}.bytes must equal decoded byte length {bytes}`)
+		end
+	end
 end
 
 --------------------------------------------------------------------------------
@@ -456,7 +618,7 @@ local function encodeValue(value: any, depth: number, budget: Budget): any
 	elseif kind == "Axes" then
 		return { __type = "Axes", x = value.X, y = value.Y, z = value.Z }
 	elseif kind == "PhysicalProperties" then
-		return {
+		local encoded = {
 			__type = "PhysicalProperties",
 			density = value.Density,
 			friction = value.Friction,
@@ -464,6 +626,15 @@ local function encodeValue(value: any, depth: number, budget: Budget): any
 			frictionWeight = value.FrictionWeight,
 			elasticityWeight = value.ElasticityWeight,
 		}
+		-- Older Studio versions expose only five components. Preserve the
+		-- newer acoustic field when present without breaking older runtimes.
+		local okAcoustic, acoustic = pcall(function()
+			return value.AcousticAbsorption
+		end)
+		if okAcoustic and type(acoustic) == "number" then
+			encoded.acousticAbsorption = acoustic
+		end
+		return encoded
 	elseif kind == "Instance" then
 		-- Never serialize Instances (safety rule) — encode the Studio path
 		local codec = instanceCodec
@@ -787,6 +958,16 @@ local TAG_DECODERS: { [string]: (tag: { [any]: any }) -> any } = {
 	end,
 
 	PhysicalProperties = function(tag)
+		if tag.acousticAbsorption ~= nil then
+			return rt.PhysicalProperties.new(
+				expectNumber(tag.density, "PhysicalProperties.density"),
+				expectNumber(tag.friction, "PhysicalProperties.friction"),
+				expectNumber(tag.elasticity, "PhysicalProperties.elasticity"),
+				expectNumber(tag.frictionWeight or 1, "PhysicalProperties.frictionWeight"),
+				expectNumber(tag.elasticityWeight or 1, "PhysicalProperties.elasticityWeight"),
+				expectNumber(tag.acousticAbsorption, "PhysicalProperties.acousticAbsorption")
+			)
+		end
 		return rt.PhysicalProperties.new(
 			expectNumber(tag.density, "PhysicalProperties.density"),
 			expectNumber(tag.friction, "PhysicalProperties.friction"),
@@ -844,11 +1025,43 @@ function decodeValue(value: any, depth: number, budget: Budget): any
 		local decoder = TAG_DECODERS[tag]
 
 		if decoder == nil then
-			invalid(`unknown __type tag '{tag}'`)
+			invalid(`unknown __type tag '{tag}'; run wsync commands types. {Codec.describe(tag)}`)
 			error("unreachable")
 		end
 
-		return decoder(value)
+		local entry = VALUE_SCHEMAS[tag]
+		if entry == nil or not entry.decode then
+			invalid(`{tag} is output-only and cannot be decoded; run wsync commands types {tag}`)
+		end
+
+		budget.seen[value] = true
+		local count = 0
+		for _, item in value do
+			count += 1
+			if count > Codec.LIMITS.maxTableEntries then
+				invalid(`table exceeds the {Codec.LIMITS.maxTableEntries}-entry codec budget`)
+			end
+			chargePayload(item, depth + 1, budget)
+		end
+		budget.seen[value] = nil
+
+		local ok, decoded = pcall(function()
+			validateSchema(value, entry.schema, tag)
+			validateRelations(value, tag)
+			return decoder(value)
+		end)
+		if not ok then
+			if type(decoded) == "table" and decoded.__remoteError == true then
+				if decoded.code ~= "INVALID_ARGUMENT" then
+					error(decoded, 0) -- preserve unresolved InstancePath / plugin errors
+				end
+				invalid(`{decoded.message}. {Codec.describe(tag)}`)
+			end
+			-- Roblox constructors can throw even for well-shaped fields (enum
+			-- availability, invalid fonts, engine-specific value constraints).
+			invalid(`invalid {tag}: {tostring(decoded)}. {Codec.describe(tag)}`)
+		end
+		return decoded
 	end
 
 	-- Plain table: recurse with the same budgets. JSON cannot produce cycles,

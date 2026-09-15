@@ -176,10 +176,14 @@ function Core:run(): Promise.Promise
 		Log.trace("Initializing processor..")
 
 		local changes = self.processor:init(snapshot, initialSyncPriority)
+		local excluded = self.processor.read:excludedCount()
 
 		Log.stage(
 			`Connect: initial diff — {#changes.additions} additions, `
 				.. `{#changes.updates} updates, {#changes.removals} removals`
+				.. if excluded > 0
+					then `, {excluded} kept in Studio ({SyncScope.AVOID_SYNC_ATTRIBUTE} / {SyncScope.IGNORE_DIRECTIVE})`
+					else ""
 		)
 
 		if self.status ~= Core.Status.Connecting then
@@ -207,7 +211,7 @@ function Core:run(): Promise.Promise
 
 				if initialSyncPriority == "Server" then
 					self:__verifyChanges(changes, true):expect()
-					self.processor.write:applyChanges(changes, true)
+					self.processor:applyChanges(changes, true)
 				elseif changes:total() > 0 then
 					local reversed = self.processor:reverseChanges(changes)
 					transport:write(reversed):expect()
@@ -464,7 +468,7 @@ function Core:__dispatchMessage(kind: Types.MessageKind, data: any)
 			divergence:primeRemovals(data)
 		end
 
-		self.processor.write:applyChanges(data)
+		self.processor:applyChanges(data)
 		self.lastSync = os.clock()
 
 		self.__sync(kind, data)
@@ -539,6 +543,9 @@ function Core:__attachBulkSession()
 		-- exact live-sync property semantics (Design §7.4-A)
 		snapshotProperties = ReadProcessor.snapshotProperties,
 		shouldSyncProperties = ReadProcessor.shouldSyncProperties,
+		-- ...and the exclusion rule (`AvoidSync` / `--!ignoresync`), so a
+		-- pull leaves out exactly what live syncback leaves out
+		isExcluded = ReadProcessor.isExcluded,
 	})
 end
 
@@ -944,32 +951,12 @@ function Core:__startSyncbackLoop()
 				continue
 			end
 
-			local kind = event.kind
-			local changes = Changes.new()
+			Log.trace("Received event:", event.kind)
 
-			Log.trace("Received event:", kind)
-
-			if kind == "Add" then
-				local snapshot = self.processor.read:onAdd(event.instance)
-
-				if snapshot then
-					changes:add(snapshot)
-				end
-			elseif kind == "Change" then
-				local snapshot = self.processor.read:onChange(event.instance, event.property)
-
-				if snapshot then
-					changes:update(snapshot)
-				end
-			elseif kind == "Remove" then
-				local id = self.processor.read:onRemove(event.instance)
-
-				if id then
-					changes:remove(id)
-				end
-			end
-
-			aggregateChanges:join(changes, true)
+			-- Event → changes lives on the read processor (ReadProcessor.onEvent)
+			-- so the mapping is exercised by the syncback scenarios outside
+			-- Studio (scripts/check-plugin-syncback.mjs)
+			aggregateChanges:join(self.processor.read:onEvent(event), true)
 		end
 
 		resolve()

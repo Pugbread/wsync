@@ -3,17 +3,19 @@
   "title": "wsync commands",
   "category": "Command registry",
   "description": "Prints generated command docs as JSON, either as a compact LLM index, one command entry, or the full registry.",
-  "usage": "wsync commands [command-name] [--compact]",
+  "usage": "wsync commands [command [subcommand...]] [--compact | --full] [--project <path>]",
   "examples": [
-    "wsync commands --compact",
-    "wsync commands get",
-    "wsync commands resolve",
-    "wsync commands upload --compact"
+    "wsync commands",
+    "wsync commands attr ls",
+    "wsync commands monetization gamepass list",
+    "wsync commands types Vector3",
+    "wsync commands types Color3",
+    "wsync commands --full"
   ],
   "notes": [
-    "This is the LLM-facing replacement for scraping `--help` text.",
-    "Prefer `--compact` for choosing between command families. Prefer `wsync commands <name>` for the exact usage of the command about to be run.",
-    "Plain `wsync commands` prints the full registry and should be reserved for explicit full-doc requests.",
-    "The output is embedded verbatim from `docs/client-commands.generated.json`, which is rebuilt from `docs/commands/*.json`. The desktop Docs view and the published docs render the same bundle."
+    "Defaults to a compact offline index; --compact remains an alias for index mode. --full explicitly prints the complete embedded registry.",
+    "Focused command lookup accepts nested paths and reports current parser help plus exact subcommand effects. --project is accepted for consistency and never causes discovery to connect to Studio.",
+    "`wsync commands types [TypeName]` provides offline JSON value schemas, field names, constraints and examples. Type lookup is case-insensitive.",
+    "The compact index includes CLI version, build commit/dirty identity, schema version and SHA-256 fingerprints of the embedded command and value catalogs. No network is required."
   ]
 }

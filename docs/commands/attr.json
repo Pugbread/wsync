@@ -38,11 +38,15 @@
   "examples": [
     "wsync attr set --project . --path Workspace/Box --name Speed --value 12.5",
     "wsync attr rm --project . --path Workspace/Box --name Speed",
-    "wsync attr ls --project . --path Workspace/Box"
+    "wsync attr ls --project . --path Workspace/Box",
+    "wsync attr set --project . --path Workspace/Box --name SpawnOffset --value '{\"__type\":\"Vector3\",\"x\":0,\"y\":5,\"z\":0}'"
   ],
   "notes": [
     "`attr ls` is read-only; `attr set` and `attr rm` are written to `writes.log`.",
     "`--value` uses the same JSON literal and tagged-value codec as `wsync set --value`.",
-    "Attributes on projected instances sync back to their `.data.json` sidecar. Setting the boolean `AvoidSync` attribute to true excludes that subtree from sync in both directions, including divergence comparison."
+    "Attributes on projected instances sync back to their `.data.json` sidecar. Setting the boolean `AvoidSync` attribute to `true` keeps that instance and its subtree in Studio: the plugin pushes a removal (its files leave disk, as for a deletion in Studio), and from then on nothing under it is written to disk, pushed over from disk, or counted by the connect-time comparison. Removing the attribute syncs the subtree back. The daemon never reads the attribute from a sidecar; a disk-side exclusion is `ignoreGlobs`.",
+    "Offline value schemas and copyable examples for every supported type: `wsync commands types`; narrow with `wsync commands types Vector3` or `wsync commands types Color3`. The live JSON wire format uses the exact `__type` key and lowercase component fields; arrays, constructor strings, and sidecar `{Vector3:[...]}` shapes are not equivalent.",
+    "Color3 r/g/b use the 0–1 scale, not 0–255. For RGB(255,128,0), use {\"__type\":\"Color3\",\"r\":1,\"g\":0.5019607843137255,\"b\":0}. Vector3 uses {\"__type\":\"Vector3\",\"x\":1,\"y\":2,\"z\":3}.",
+    "Codec support does not imply attribute compatibility: Roblox SetAttribute supports only its attribute datatypes. Instance references, buffers, and output-only markers are not valid attribute values."
   ]
 }

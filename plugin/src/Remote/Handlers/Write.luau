@@ -102,6 +102,19 @@ local function applyProperty(instance: Instance, prop: string, decoded: any)
 		error(Error.new(Error.NOT_FOUND, `property '{prop}' is not a member of class {instance.ClassName}`), 0)
 	end
 
+	if code == Error.INVALID_ARGUMENT then
+		-- Reading the property's current datatype turns "unable to cast Table
+		-- to Vector3" into a complete, copyable correction on the first error.
+		local okRead, current = pcall(function()
+			return (instance :: any)[prop]
+		end)
+		if okRead and current ~= nil then
+			message ..= ". " .. Codec.describe(typeof(current))
+		else
+			message ..= ". Run wsync commands types for accepted tagged JSON values"
+		end
+	end
+
 	error(Error.new(code, message), 0)
 end
 

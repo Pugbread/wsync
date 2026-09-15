@@ -1,0 +1,1022 @@
+{
+  "version": 1,
+  "title": "WSync live JSON value codec",
+  "usage": "wsync commands types [TypeName]",
+  "description": "The live command wire format uses __type objects. It is distinct from .data.json/.model.json serialization. JSON primitives, arrays and objects are recursive; null represents nil. Property/method/attribute compatibility remains enforced by Studio.",
+  "limits": {
+    "maxDepth": 64,
+    "maxNodes": 20000,
+    "maxTableEntries": 10000,
+    "maxStringBytes": 4194304
+  },
+  "notes": [
+    "Tagged numeric components must be finite; use the Number tag only for a scalar nan/inf/-inf.",
+    "Attributes accept only the datatypes supported by Roblox SetAttribute; codec support does not make every type a valid attribute.",
+    "Read a current property with wsync get --raw for the actual tagged representation.",
+    "Native Roblox globals (Vector3, Color3, CFrame, Content, etc.) already exist in wsync eval/exec. Host filesystem/process sandbox permissions do not control this wire format."
+  ],
+  "nativeOnly": [
+    {
+      "name": "Content",
+      "encode": false,
+      "decode": false,
+      "exampleLuau": "Content.fromUri(\"rbxassetid://123\")",
+      "notes": "Content has no input tag. Use a native constructor in eval/exec for a Content property, or use the legacy string property where the Roblox API exposes one. Content returned through this codec becomes Unencodable; URI/object-backed contents are not serialized."
+    },
+    {
+      "name": "other Roblox datatypes",
+      "notes": "Only the tags listed in types are supported. For example Ray, TweenInfo, DateTime and sequence keypoint values outside a sequence currently return Unencodable. Native constructors can be used in eval/exec."
+    }
+  ],
+  "types": [
+    {
+      "name": "Vector2",
+      "encode": true,
+      "decode": true,
+      "example": {
+        "__type": "Vector2",
+        "x": 1,
+        "y": 2
+      },
+      "schema": {
+        "type": "object",
+        "properties": {
+          "__type": {
+            "const": "Vector2"
+          },
+          "x": {
+            "type": "number"
+          },
+          "y": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "__type",
+          "x",
+          "y"
+        ],
+        "additionalProperties": false
+      },
+      "notes": "Components are finite numbers."
+    },
+    {
+      "name": "Vector3",
+      "encode": true,
+      "decode": true,
+      "example": {
+        "__type": "Vector3",
+        "x": 1,
+        "y": 2,
+        "z": 3
+      },
+      "schema": {
+        "type": "object",
+        "properties": {
+          "__type": {
+            "const": "Vector3"
+          },
+          "x": {
+            "type": "number"
+          },
+          "y": {
+            "type": "number"
+          },
+          "z": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "__type",
+          "x",
+          "y",
+          "z"
+        ],
+        "additionalProperties": false
+      },
+      "notes": "Components are finite numbers."
+    },
+    {
+      "name": "Vector2int16",
+      "encode": true,
+      "decode": true,
+      "example": {
+        "__type": "Vector2int16",
+        "x": 1,
+        "y": 2
+      },
+      "schema": {
+        "type": "object",
+        "properties": {
+          "__type": {
+            "const": "Vector2int16"
+          },
+          "x": {
+            "type": "number"
+          },
+          "y": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "__type",
+          "x",
+          "y"
+        ],
+        "additionalProperties": false
+      },
+      "notes": "Finite numeric inputs are passed to Roblox. Stored components are signed 16-bit integers [-32768,32767]; the constructor rounds non-integers down and out-of-range values may overflow. The codec preserves constructor behavior rather than rejecting these inputs; read back the property to see normalization.",
+      "storageRange": {
+        "minimum": -32768,
+        "maximum": 32767
+      }
+    },
+    {
+      "name": "Vector3int16",
+      "encode": true,
+      "decode": true,
+      "example": {
+        "__type": "Vector3int16",
+        "x": 1,
+        "y": 2,
+        "z": 3
+      },
+      "schema": {
+        "type": "object",
+        "properties": {
+          "__type": {
+            "const": "Vector3int16"
+          },
+          "x": {
+            "type": "number"
+          },
+          "y": {
+            "type": "number"
+          },
+          "z": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "__type",
+          "x",
+          "y",
+          "z"
+        ],
+        "additionalProperties": false
+      },
+      "notes": "Finite numeric inputs are passed to Roblox. Stored components are signed 16-bit integers [-32768,32767]; the constructor rounds non-integers down and out-of-range values may overflow. The codec preserves constructor behavior rather than rejecting these inputs; read back the property to see normalization.",
+      "storageRange": {
+        "minimum": -32768,
+        "maximum": 32767
+      }
+    },
+    {
+      "name": "CFrame",
+      "encode": true,
+      "decode": true,
+      "example": {
+        "__type": "CFrame",
+        "components": [
+          0,
+          5,
+          0
+        ]
+      },
+      "schema": {
+        "type": "object",
+        "properties": {
+          "__type": {
+            "const": "CFrame"
+          },
+          "components": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "allowedLengths": [
+              3,
+              12
+            ]
+          }
+        },
+        "required": [
+          "__type",
+          "components"
+        ],
+        "additionalProperties": false
+      },
+      "notes": "3 components are x,y,z position; 12 components are x,y,z,r00,r01,r02,r10,r11,r12,r20,r21,r22. Encoding always emits 12. Rotation matrices are passed to the Roblox constructor."
+    },
+    {
+      "name": "Color3",
+      "encode": true,
+      "decode": true,
+      "example": {
+        "__type": "Color3",
+        "r": 1,
+        "g": 0.5,
+        "b": 0
+      },
+      "schema": {
+        "type": "object",
+        "properties": {
+          "__type": {
+            "const": "Color3"
+          },
+          "r": {
+            "type": "number"
+          },
+          "g": {
+            "type": "number"
+          },
+          "b": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "__type",
+          "r",
+          "g",
+          "b"
+        ],
+        "additionalProperties": false
+      },
+      "notes": "RGB channels use the 0–1 scale (divide 0–255 RGB values by 255). Finite channels are passed unchanged to Color3.new; this codec does not divide or clamp them."
+    },
+    {
+      "name": "BrickColor",
+      "encode": true,
+      "decode": true,
+      "example": {
+        "__type": "BrickColor",
+        "name": "Bright red"
+      },
+      "schema": {
+        "type": "object",
+        "properties": {
+          "__type": {
+            "const": "BrickColor"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "__type",
+          "name"
+        ],
+        "additionalProperties": false
+      },
+      "notes": "Use a Roblox BrickColor name. The engine may normalize unknown names to its fallback palette color."
+    },
+    {
+      "name": "EnumItem",
+      "encode": true,
+      "decode": true,
+      "example": {
+        "__type": "EnumItem",
+        "enum": "Enum.Material",
+        "name": "Neon"
+      },
+      "schema": {
+        "type": "object",
+        "properties": {
+          "__type": {
+            "const": "EnumItem"
+          },
+          "enum": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "value": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "__type",
+          "enum",
+          "name"
+        ],
+        "additionalProperties": false
+      },
+      "notes": "The Enum. prefix is optional. enum/name are resolved by Studio; unknown enums or members fail. Optional numeric value is output metadata and ignored on decode."
+    },
+    {
+      "name": "UDim",
+      "encode": true,
+      "decode": true,
+      "example": {
+        "__type": "UDim",
+        "scale": 0.5,
+        "offset": 10
+      },
+      "schema": {
+        "type": "object",
+        "properties": {
+          "__type": {
+            "const": "UDim"
+          },
+          "scale": {
+            "type": "number"
+          },
+          "offset": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "__type",
+          "scale",
+          "offset"
+        ],
+        "additionalProperties": false
+      },
+      "notes": "Finite scale/offset values are passed to Roblox. Offset is stored as an integer; read back the property for engine normalization."
+    },
+    {
+      "name": "UDim2",
+      "encode": true,
+      "decode": true,
+      "example": {
+        "__type": "UDim2",
+        "x": {
+          "scale": 1,
+          "offset": -20
+        },
+        "y": {
+          "scale": 0,
+          "offset": 48
+        }
+      },
+      "schema": {
+        "type": "object",
+        "properties": {
+          "__type": {
+            "const": "UDim2"
+          },
+          "x": {
+            "type": "object",
+            "properties": {
+              "scale": {
+                "type": "number"
+              },
+              "offset": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "scale",
+              "offset"
+            ],
+            "additionalProperties": false
+          },
+          "y": {
+            "type": "object",
+            "properties": {
+              "scale": {
+                "type": "number"
+              },
+              "offset": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "scale",
+              "offset"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "__type",
+          "x",
+          "y"
+        ],
+        "additionalProperties": false
+      },
+      "notes": "x/y are untagged {scale,offset} objects, not arrays or nested UDim tags. Offsets are numeric inputs stored as integers by Roblox; read back normalization."
+    },
+    {
+      "name": "NumberRange",
+      "encode": true,
+      "decode": true,
+      "example": {
+        "__type": "NumberRange",
+        "min": 1,
+        "max": 5
+      },
+      "schema": {
+        "type": "object",
+        "properties": {
+          "__type": {
+            "const": "NumberRange"
+          },
+          "min": {
+            "type": "number"
+          },
+          "max": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "__type",
+          "min",
+          "max"
+        ],
+        "additionalProperties": false
+      },
+      "notes": "min must be <= max."
+    },
+    {
+      "name": "Rect",
+      "encode": true,
+      "decode": true,
+      "example": {
+        "__type": "Rect",
+        "min": {
+          "x": 0,
+          "y": 0
+        },
+        "max": {
+          "x": 100,
+          "y": 50
+        }
+      },
+      "schema": {
+        "type": "object",
+        "properties": {
+          "__type": {
+            "const": "Rect"
+          },
+          "min": {
+            "type": "object",
+            "properties": {
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "additionalProperties": false
+          },
+          "max": {
+            "type": "object",
+            "properties": {
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "__type",
+          "min",
+          "max"
+        ],
+        "additionalProperties": false
+      },
+      "notes": ""
+    },
+    {
+      "name": "NumberSequence",
+      "encode": true,
+      "decode": true,
+      "example": {
+        "__type": "NumberSequence",
+        "keypoints": [
+          {
+            "time": 0,
+            "value": 0,
+            "envelope": 0
+          },
+          {
+            "time": 1,
+            "value": 1,
+            "envelope": 0
+          }
+        ]
+      },
+      "schema": {
+        "type": "object",
+        "properties": {
+          "__type": {
+            "const": "NumberSequence"
+          },
+          "keypoints": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "time": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "value": {
+                  "type": "number"
+                },
+                "envelope": {
+                  "type": "number",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "time",
+                "value"
+              ],
+              "additionalProperties": false
+            },
+            "minItems": 2,
+            "maxItems": 20
+          }
+        },
+        "required": [
+          "__type",
+          "keypoints"
+        ],
+        "additionalProperties": false
+      },
+      "notes": "2–20 keypoints, first time=0, last time=1, nondecreasing time order. envelope defaults to 0 and must be nonnegative."
+    },
+    {
+      "name": "ColorSequence",
+      "encode": true,
+      "decode": true,
+      "example": {
+        "__type": "ColorSequence",
+        "keypoints": [
+          {
+            "time": 0,
+            "color": {
+              "r": 1,
+              "g": 0,
+              "b": 0
+            }
+          },
+          {
+            "time": 1,
+            "color": {
+              "r": 0,
+              "g": 0,
+              "b": 1
+            }
+          }
+        ]
+      },
+      "schema": {
+        "type": "object",
+        "properties": {
+          "__type": {
+            "const": "ColorSequence"
+          },
+          "keypoints": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "time": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "color": {
+                  "type": "object",
+                  "properties": {
+                    "r": {
+                      "type": "number"
+                    },
+                    "g": {
+                      "type": "number"
+                    },
+                    "b": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "r",
+                    "g",
+                    "b"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "required": [
+                "time",
+                "color"
+              ],
+              "additionalProperties": false
+            },
+            "minItems": 2,
+            "maxItems": 20
+          }
+        },
+        "required": [
+          "__type",
+          "keypoints"
+        ],
+        "additionalProperties": false
+      },
+      "notes": "2–20 keypoints, first time=0, last time=1, nondecreasing time order. color is an untagged {r,g,b} object on the 0–1 RGB scale."
+    },
+    {
+      "name": "Font",
+      "encode": true,
+      "decode": true,
+      "example": {
+        "__type": "Font",
+        "family": "rbxasset://fonts/families/SourceSansPro.json",
+        "weight": "Regular",
+        "style": "Normal"
+      },
+      "schema": {
+        "type": "object",
+        "properties": {
+          "__type": {
+            "const": "Font"
+          },
+          "family": {
+            "type": "string"
+          },
+          "weight": {
+            "type": "string",
+            "enum": [
+              "Thin",
+              "ExtraLight",
+              "Light",
+              "Regular",
+              "Medium",
+              "SemiBold",
+              "Bold",
+              "ExtraBold",
+              "Heavy"
+            ]
+          },
+          "style": {
+            "type": "string",
+            "enum": [
+              "Normal",
+              "Italic"
+            ]
+          }
+        },
+        "required": [
+          "__type",
+          "family",
+          "weight",
+          "style"
+        ],
+        "additionalProperties": false
+      },
+      "notes": ""
+    },
+    {
+      "name": "Faces",
+      "encode": true,
+      "decode": true,
+      "example": {
+        "__type": "Faces",
+        "top": true,
+        "front": true
+      },
+      "schema": {
+        "type": "object",
+        "properties": {
+          "__type": {
+            "const": "Faces"
+          },
+          "top": {
+            "type": "boolean"
+          },
+          "bottom": {
+            "type": "boolean"
+          },
+          "left": {
+            "type": "boolean"
+          },
+          "right": {
+            "type": "boolean"
+          },
+          "front": {
+            "type": "boolean"
+          },
+          "back": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "__type"
+        ],
+        "additionalProperties": false
+      },
+      "notes": "Omitted face flags default to false. Provided flags must be booleans."
+    },
+    {
+      "name": "Axes",
+      "encode": true,
+      "decode": true,
+      "example": {
+        "__type": "Axes",
+        "x": true,
+        "y": true,
+        "z": false
+      },
+      "schema": {
+        "type": "object",
+        "properties": {
+          "__type": {
+            "const": "Axes"
+          },
+          "x": {
+            "type": "boolean"
+          },
+          "y": {
+            "type": "boolean"
+          },
+          "z": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "__type"
+        ],
+        "additionalProperties": false
+      },
+      "notes": "Omitted axis flags default to false. Provided flags must be booleans."
+    },
+    {
+      "name": "PhysicalProperties",
+      "encode": true,
+      "decode": true,
+      "example": {
+        "__type": "PhysicalProperties",
+        "density": 1,
+        "friction": 0.5,
+        "elasticity": 0,
+        "frictionWeight": 1,
+        "elasticityWeight": 1
+      },
+      "schema": {
+        "type": "object",
+        "properties": {
+          "__type": {
+            "const": "PhysicalProperties"
+          },
+          "density": {
+            "type": "number"
+          },
+          "friction": {
+            "type": "number"
+          },
+          "elasticity": {
+            "type": "number"
+          },
+          "frictionWeight": {
+            "type": "number"
+          },
+          "elasticityWeight": {
+            "type": "number"
+          },
+          "acousticAbsorption": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "__type",
+          "density",
+          "friction",
+          "elasticity"
+        ],
+        "additionalProperties": false
+      },
+      "notes": "Weights default to 1. Finite inputs are passed through; Roblox clamps density to [0.0001,100], friction to [0,2], elasticity to [0,1], weights to [0,100], and optional acousticAbsorption to [0,1]. acousticAbsorption requires a Studio version supporting the sixth constructor argument; encoding includes it only when available. Read back the property for normalized values."
+    },
+    {
+      "name": "InstancePath",
+      "encode": true,
+      "decode": true,
+      "example": {
+        "__type": "InstancePath",
+        "path": "Workspace/Box"
+      },
+      "schema": {
+        "type": "object",
+        "properties": {
+          "__type": {
+            "const": "InstancePath"
+          },
+          "path": {
+            "type": "string"
+          },
+          "class": {
+            "type": "string"
+          },
+          "rooted": {
+            "const": true
+          }
+        },
+        "required": [
+          "__type",
+          "path"
+        ],
+        "additionalProperties": false
+      },
+      "notes": "path resolves an existing instance; empty path means DataModel. class is ignored metadata. Output may carry rooted:false for an unparented instance; that value cannot be resolved or written back."
+    },
+    {
+      "name": "Number",
+      "encode": true,
+      "decode": true,
+      "example": {
+        "__type": "Number",
+        "value": "inf"
+      },
+      "schema": {
+        "type": "object",
+        "properties": {
+          "__type": {
+            "const": "Number"
+          },
+          "value": {
+            "type": "string",
+            "enum": [
+              "nan",
+              "inf",
+              "-inf"
+            ]
+          }
+        },
+        "required": [
+          "__type",
+          "value"
+        ],
+        "additionalProperties": false
+      },
+      "notes": "Non-finite scalar numbers only. Property/method-specific restrictions still apply."
+    },
+    {
+      "name": "BinaryString",
+      "encode": true,
+      "decode": true,
+      "example": {
+        "__type": "BinaryString",
+        "base64": "aGk=",
+        "bytes": 2
+      },
+      "schema": {
+        "type": "object",
+        "properties": {
+          "__type": {
+            "const": "BinaryString"
+          },
+          "base64": {
+            "type": "string",
+            "format": "base64"
+          },
+          "bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4194304
+          }
+        },
+        "required": [
+          "__type",
+          "base64"
+        ],
+        "additionalProperties": false
+      },
+      "notes": "base64 is strict padded RFC 4648. Optional bytes metadata must match decoded length. BinaryString decodes to a raw Luau string; Buffer decodes to a Luau buffer. Valid UTF-8 strings may encode back as plain JSON strings."
+    },
+    {
+      "name": "Buffer",
+      "encode": true,
+      "decode": true,
+      "example": {
+        "__type": "Buffer",
+        "base64": "aGk=",
+        "bytes": 2
+      },
+      "schema": {
+        "type": "object",
+        "properties": {
+          "__type": {
+            "const": "Buffer"
+          },
+          "base64": {
+            "type": "string",
+            "format": "base64"
+          },
+          "bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4194304
+          }
+        },
+        "required": [
+          "__type",
+          "base64"
+        ],
+        "additionalProperties": false
+      },
+      "notes": "base64 is strict padded RFC 4648. Optional bytes metadata must match decoded length. BinaryString decodes to a raw Luau string; Buffer decodes to a Luau buffer."
+    },
+    {
+      "name": "Unencodable",
+      "encode": true,
+      "decode": false,
+      "example": {
+        "__type": "Unencodable",
+        "luauType": "Content",
+        "display": "Content"
+      },
+      "schema": {
+        "type": "object",
+        "properties": {
+          "__type": {
+            "const": "Unencodable"
+          },
+          "luauType": {
+            "type": "string"
+          },
+          "display": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "__type",
+          "luauType",
+          "display"
+        ],
+        "additionalProperties": false
+      },
+      "notes": "Output-only diagnostic marker for unsupported native values. Construct these natively with eval/exec; do not send this marker as input."
+    },
+    {
+      "name": "Skipped",
+      "encode": false,
+      "decode": false,
+      "example": {
+        "__type": "Skipped",
+        "reason": "read skipped"
+      },
+      "schema": {
+        "type": "object",
+        "properties": {
+          "__type": {
+            "const": "Skipped"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "__type",
+          "reason"
+        ],
+        "additionalProperties": false
+      },
+      "notes": "Output-only property-inspection marker; fields may vary by reader. Never valid as an input value."
+    }
+  ],
+  "attributeTypes": [
+    "string",
+    "boolean",
+    "number",
+    "UDim",
+    "UDim2",
+    "BrickColor",
+    "Color3",
+    "Vector2",
+    "Vector3",
+    "CFrame",
+    "NumberSequence",
+    "ColorSequence",
+    "NumberRange",
+    "Rect",
+    "Font"
+  ],
+  "references": [
+    "https://create.roblox.com/docs/studio/properties#instance-attributes",
+    "https://create.roblox.com/docs/reference/engine/datatypes/Color3",
+    "https://create.roblox.com/docs/reference/engine/datatypes/NumberSequence",
+    "https://create.roblox.com/docs/reference/engine/datatypes/ColorSequence",
+    "https://create.roblox.com/docs/reference/engine/datatypes/PhysicalProperties",
+    "https://create.roblox.com/docs/reference/engine/datatypes/Vector3int16",
+    "https://create.roblox.com/docs/reference/engine/datatypes/UDim",
+    "https://create.roblox.com/docs/reference/engine/datatypes/NumberSequenceKeypoint"
+  ]
+}

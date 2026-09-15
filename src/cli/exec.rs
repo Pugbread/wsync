@@ -1,17 +1,33 @@
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 use reqwest::{blocking::Client, header::CONTENT_TYPE};
 use serde::Serialize;
-use std::{fs, path::Path};
+use std::{
+	fs,
+	path::{Path, PathBuf},
+	time::Duration,
+};
 
-use crate::{ext::PathExt, sessions, wsync_error, wsync_info};
+use crate::{
+	cli::client::{self, Targeting},
+	ext::PathExt,
+	sessions, wsync_info,
+};
 
 /// Execute Luau code in Roblox Studio (requires running session)
 #[derive(Parser)]
 pub struct Exec {
 	/// Luau code to execute (can be file path)
-	#[arg()]
+	#[arg(allow_hyphen_values = true)]
 	code: String,
+
+	/// Bind the broadcast to this project's daemon
+	#[arg(long, value_name = "PATH", conflicts_with_all = ["session", "host", "standalone"])]
+	project: Option<PathBuf>,
+
+	/// Print queue acknowledgement as JSON; execution is fire-and-forget
+	#[arg(long)]
+	raw: bool,
 
 	/// Session identifier
 	#[arg()]
@@ -47,48 +63,65 @@ impl Exec {
 		};
 
 		if self.standalone {
-			// TODO: Implement standalone mode
-			wsync_error!("Standalone mode is not implemented yet!");
-		} else if let Some(session) = sessions::get(self.session, self.host, self.port)? {
-			let address = session.get_address().or_else(|| {
-				sessions::get_all()
-					.unwrap_or_default()
-					.into_iter()
-					.find_map(|(_, session)| session.get_address())
-			});
-
-			if let Some(address) = address {
-				let url = format!("{address}/exec");
-
-				let body = rmp_serde::to_vec(&Request {
-					code: code.to_owned(),
-					focus: if cfg!(not(target_os = "windows")) {
-						self.focus
-					} else {
-						false
-					},
-				})?;
-
-				let response = Client::default()
-					.post(url)
-					.header(CONTENT_TYPE, "application/msgpack")
-					.body(body)
-					.send();
-
-				match response {
-					Ok(_) => wsync_info!("Code executed successfully!"),
-					Err(err) => wsync_error!("Code execution failed: {}", err),
-				}
-
-				#[cfg(target_os = "windows")]
-				if self.focus {
-					crate::studio::focus(None)?;
-				}
-			} else {
-				wsync_error!("Code execution failed: running session does not have an address");
-			}
+			bail!("--standalone is not implemented; use `playtest run` for a managed test or `eval` in a connected Studio");
+		}
+		let (address, expected_project, expected_boot_id) = if let Some(project) = self.project {
+			let live = client::Client::connect(&Targeting {
+				project: Some(project),
+				port: self.port,
+			})?;
+			(
+				format!("http://localhost:{}", live.port()),
+				live.target.canonical.clone(),
+				Some(live.hello.boot_id.clone()),
+			)
 		} else {
-			wsync_error!("Code execution failed: no running session was found");
+			let session = sessions::get(self.session, self.host, self.port)?
+				.context("No running session was found; pass --project <path> to select a daemon")?;
+			(
+				session.get_address().context("The selected session has no address")?,
+				None,
+				None,
+			)
+		};
+		let body = rmp_serde::to_vec_named(&Request {
+			code,
+			focus: self.focus && !cfg!(target_os = "windows"),
+			expected_project,
+			expected_boot_id,
+		})?;
+		let response = Client::builder()
+			.no_proxy()
+			.timeout(Duration::from_secs(10))
+			.redirect(reqwest::redirect::Policy::none())
+			.build()?
+			.post(format!("{address}/exec"))
+			.header(CONTENT_TYPE, "application/msgpack")
+			.body(body)
+			.send()
+			.and_then(reqwest::blocking::Response::error_for_status);
+		if let Err(error) = response {
+			if self.raw {
+				client::print_json(
+					&serde_json::json!({"ok":false,"error":{"code":"EXEC_DELIVERY_FAILED","message":error.to_string()},"meta":{"completion":"unknown","retrySafe":false}}),
+				);
+			}
+			bail!("Exec delivery failed: {error}. Execution may have started; inspect affected state before retrying");
+		}
+		if self.raw {
+			client::print_json(
+				&serde_json::json!({"ok":true,"queued":true,"meta":{"completion":"unknown","retrySafe":false}}),
+			);
+		} else {
+			wsync_info!(
+				"Code queued for broadcast. Execution is not confirmed; use `wsync eval` when you need a result."
+			);
+		}
+		#[cfg(target_os = "windows")]
+		if self.focus {
+			if let Err(error) = crate::studio::focus(None) {
+				crate::wsync_warn!("Code was queued, but Studio could not be focused: {error}");
+			}
 		}
 
 		Ok(())
@@ -96,7 +129,12 @@ impl Exec {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Request {
 	code: String,
 	focus: bool,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	expected_project: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	expected_boot_id: Option<String>,
 }

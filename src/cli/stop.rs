@@ -156,7 +156,11 @@ impl Stop {
 		if let Some(address) = session.get_address() {
 			let url = format!("{address}/stop");
 
-			match Client::new().post(url).send() {
+			match Client::builder()
+				.no_proxy()
+				.build()
+				.and_then(|client| client.post(url).send())
+			{
 				Ok(response) if response.status().is_success() => {
 					wsync_info!("Stopped WSync session with address: {}", address.bold());
 					Outcome::Stopped

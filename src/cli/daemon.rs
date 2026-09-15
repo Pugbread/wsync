@@ -204,6 +204,7 @@ struct Hello {
 
 fn probe_hello(port: u16) -> Result<Hello> {
 	let response = reqwest::blocking::Client::builder()
+		.no_proxy()
 		.timeout(PROBE_TIMEOUT)
 		.build()?
 		.get(format!("http://localhost:{port}/hello"))
@@ -755,7 +756,10 @@ fn stop_daemon(context: &ProjectContext, timeout: Duration) -> Result<StopOutcom
 
 	// Exact boot verified: graceful, authenticated /stop first
 	let deadline = Instant::now() + timeout;
-	let client = reqwest::blocking::Client::builder().timeout(PROBE_TIMEOUT).build()?;
+	let client = reqwest::blocking::Client::builder()
+		.no_proxy()
+		.timeout(PROBE_TIMEOUT)
+		.build()?;
 	let body = match &record.control_token {
 		Some(token) => json!({ "bootId": record.boot_id, "token": token }),
 		None => json!({}),

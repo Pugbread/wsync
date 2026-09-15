@@ -15,6 +15,11 @@ local History = require(WSync.Remote.Handlers.History)
 
 local Error = require(script.Parent.Parent.Error)
 
+-- The exclusion rule (SyncScope: `AvoidSync` / `--!ignoresync`) lives on the
+-- read processor; nothing from disk is applied under or over an instance it
+-- keeps in Studio
+local ReadProcessor = require(script.Parent.Read)
+
 local MESH_RELOAD_PROPERTIES = { "MeshContent", "InitialSize" }
 
 --- Per-batch waypoint, gated (pinned wave-4 contract): while a daemon
@@ -86,6 +91,12 @@ local function findChild(parent: Instance, name: string, class: string): Instanc
 	end
 
 	return nil
+end
+
+local function warnKeptInStudio(instance: Instance)
+	Log.warn(
+		`'{instance.Name}' is kept in Studio ({ReadProcessor.exclusionOf(instance)}) — a change from disk was not applied to it`
+	)
 end
 
 local function warnNotCreatable(class: string)
@@ -165,6 +176,14 @@ function WriteProcessor:applyAddition(
 		local instance = findChild(parent, snapshot.name, snapshot.class)
 
 		if instance then
+			if ReadProcessor.isExcluded(instance) then
+				-- A live hydrate pairs by name — and the instance it found is
+				-- kept in Studio, so the addition it was fetched for must
+				-- not land under it
+				warnKeptInStudio(instance)
+				return nil
+			end
+
 			return instance
 		end
 	end
@@ -237,6 +256,20 @@ function WriteProcessor:applyAddition(
 	return instance
 end
 
+--- The Studio instance a fetched addition would stand beside, when Studio
+--- keeps that instance (SyncScope): same name and class under the tracked
+--- parent, and carrying a marker.
+function WriteProcessor:findExcludedTwin(snapshot: Types.AddedSnapshot): Instance?
+	local parent = self.tree:getInstance(snapshot.parent)
+	local twin = if parent then findChild(parent, snapshot.name, snapshot.class) else nil
+
+	if twin and ReadProcessor.isExcluded(twin) then
+		return twin
+	end
+
+	return nil
+end
+
 function WriteProcessor:applyUpdate(snapshot: Types.UpdatedSnapshot, initial: boolean?): Instance?
 	Log.trace("Applying update of", snapshot)
 
@@ -247,6 +280,16 @@ function WriteProcessor:applyUpdate(snapshot: Types.UpdatedSnapshot, initial: bo
 			local addedSnapshot = self.transport:getSnapshot(snapshot.id):expect()
 
 			if addedSnapshot then
+				local twin = self:findExcludedTwin(addedSnapshot)
+
+				if twin then
+					-- The instance this update is for is untracked because
+					-- Studio keeps it — hydrating would stand a second copy
+					-- next to it
+					warnKeptInStudio(twin)
+					return
+				end
+
 				instance = self:applyAddition(addedSnapshot, initial)
 				Log.info("Live hydrated instance:", instance)
 			end
@@ -398,12 +441,16 @@ end
 function WriteProcessor:applyRemoval(object: Types.Ref | Instance, initial: boolean?): Instance?
 	Log.trace("Applying removal of", object)
 
+	-- The subtree is untracked with the instance (Tree.removeSubtree): its
+	-- descendants leave the DataModel with it, and if an Undo brings the same
+	-- objects back they must read as new to the read processor, or the
+	-- addition that re-syncs them skips every still-tracked child
 	if typeof(object) == "Instance" then
 		if not Dom.isCreatable(object.ClassName) then
 			return
 		end
 
-		self.tree:removeByInstance(object)
+		self.tree:removeSubtree(object)
 		object.Parent = nil
 	else
 		local instance = self.tree:getInstance(object)
@@ -422,7 +469,7 @@ function WriteProcessor:applyRemoval(object: Types.Ref | Instance, initial: bool
 			return
 		end
 
-		self.tree:removeById(object)
+		self.tree:removeSubtree(instance)
 		instance.Parent = nil
 
 		object = instance

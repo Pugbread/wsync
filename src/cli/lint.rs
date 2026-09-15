@@ -295,7 +295,7 @@ impl Lint {
 		let mut targets: Vec<PathBuf> = Vec::new();
 
 		for path in &self.paths {
-			let target = path.resolve()?;
+			let target = resolve_target_path(path, &workspace, self.targeting.project.is_some())?;
 
 			if !target.exists() {
 				bail!("--path {} does not exist", target.to_string().bold());
@@ -928,6 +928,17 @@ impl Lint {
 	}
 }
 
+/// An explicit project anchors relative lint scopes to that project. Without
+/// --project, keep the usual cwd-relative CLI convention. Absolute paths are
+/// never prefixed a second time.
+fn resolve_target_path(path: &Path, workspace: &Path, explicit_project: bool) -> Result<PathBuf> {
+	if explicit_project && path.is_relative() {
+		workspace.join(path).resolve()
+	} else {
+		path.resolve()
+	}
+}
+
 #[derive(Default)]
 struct CompileReport {
 	status: &'static str,
@@ -1491,6 +1502,22 @@ fn relative_to(path: &Path, workspace: &Path) -> String {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn explicit_project_anchors_relative_lint_paths_once() {
+		let project = tempfile::tempdir().unwrap();
+		let root = project.path().canonicalize().unwrap();
+		let expected = root.join("src/Hello.luau");
+		assert_eq!(
+			resolve_target_path(Path::new("src/Hello.luau"), &root, true).unwrap(),
+			expected
+		);
+		assert_eq!(resolve_target_path(&expected, &root, true).unwrap(), expected);
+		assert_eq!(
+			resolve_target_path(Path::new("src/Hello.luau"), &root, false).unwrap(),
+			Path::new("src/Hello.luau").resolve().unwrap()
+		);
+	}
 
 	#[test]
 	fn default_lines_parse_including_adversarial_names() {

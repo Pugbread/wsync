@@ -3,14 +3,12 @@
 //! Every live command targets a daemon the same way: `--project` selects the
 //! project, the project's runtime record supplies the port, and `GET /hello`
 //! confirms the daemon on that port actually serves that project before a
-//! single op is sent. `--port` overrides the discovery chain (a deliberately
-//! targeted daemon is only warned about, never refused, on identity
-//! mismatch).
+//! single op is sent. `--port` overrides port discovery, never project identity.
 //!
 //! Remote ops go through `POST /request` with the 5 s default remote-op
 //! timeout. Transport failures, plugin errors, and daemon-side timeouts all
-//! surface as hard errors, so "non-zero exit = the request did not complete"
-//! holds for every command built on this module.
+//! surface as hard errors. A non-zero exit is not a rollback guarantee:
+//! a timeout or lost reply can follow a completed or partial mutation.
 //!
 //! `--raw` conventions kept stable across the surface:
 //!
@@ -43,7 +41,6 @@ use crate::{
 	daemon::{self, RuntimeRecord},
 	ext::PathExt,
 	project::{self, Project},
-	wsync_warn,
 };
 
 /// Default remote-op timeout (Design §10.1, Appendix C)
@@ -175,6 +172,9 @@ impl Target {
 
 	pub fn probe(&self) -> Result<Hello> {
 		let response = reqwest::blocking::Client::builder()
+			// Loopback traffic must never invoke platform proxy discovery (which
+			// can panic under macOS sandbox restrictions) or leave this host.
+			.no_proxy()
 			.timeout(PROBE_TIMEOUT)
 			// Unknown routes answer with a redirect to `/`; following it
 			// would turn "endpoint not implemented" into a bogus 200
@@ -272,7 +272,13 @@ impl Envelope {
 	/// True when the failure means "no usable Studio plugin" rather than a
 	/// plugin-side op error — the tolerated state for `status`/`doctor`
 	pub fn plugin_missing(&self) -> bool {
-		!self.ok && self.error.as_ref().is_some_and(|error| error.code == "PLUGIN_ERROR")
+		!self.ok
+			&& self.error.as_ref().is_some_and(|error| error.code == "PLUGIN_ERROR")
+			&& self
+				.body
+				.pointer("/meta/completion")
+				.and_then(Value::as_str)
+				.is_none_or(|state| state == "notStarted")
 	}
 
 	pub fn error_code(&self) -> &str {
@@ -299,6 +305,23 @@ impl Envelope {
 			print_json(&self.body);
 		}
 
+		if let Some(operation_id) = self.body.pointer("/meta/operationId").and_then(Value::as_str) {
+			let completion = self
+				.body
+				.pointer("/meta/completion")
+				.and_then(Value::as_str)
+				.unwrap_or("unknown");
+			bail!(
+				"{} [{}; completion={completion}; operationId={operation_id}]{}",
+				self.error_message(),
+				self.error_code(),
+				if completion == "notStarted" {
+					""
+				} else {
+					" Inspect the receipt and affected Studio state before retrying."
+				}
+			);
+		}
 		bail!("{} [{}]", self.error_message(), self.error_code())
 	}
 }
@@ -382,7 +405,11 @@ impl Client {
 	/// Wraps an already-probed daemon (the `status`/`doctor` path, which must
 	/// report an unreachable daemon instead of failing on it)
 	pub fn open(target: Target, hello: Hello) -> Result<Self> {
-		if let Some(canonical) = &target.canonical {
+		let canonical = target.canonical.as_ref().with_context(|| format!(
+			"Cannot verify project identity: {} does not identify an existing project file. Pass --project <path>; --port selects a port only",
+			target.project_path.to_string()
+		))?;
+		{
 			if &hello.canonical_project != canonical {
 				let complaint = format!(
 					"Port {} serves a different project ({}), not {}",
@@ -391,18 +418,13 @@ impl Client {
 					target.project_path.to_string().bold()
 				);
 
-				// An explicitly targeted port is the caller's decision; only
-				// a discovered one is refused
-				if target.port_source == PortSource::Flag {
-					wsync_warn!("{}", complaint);
-				} else {
-					bail!("{complaint}");
-				}
+				bail!("{complaint}. Pass the matching --project path; --port never bypasses project verification");
 			}
 		}
 
 		let timeout_ms = REMOTE_TIMEOUT_MS;
 		let http = reqwest::blocking::Client::builder()
+			.no_proxy()
 			.timeout(Duration::from_millis(timeout_ms + HTTP_SLACK_MS))
 			.redirect(reqwest::redirect::Policy::none())
 			.build()?;
@@ -423,9 +445,9 @@ impl Client {
 		format!("http://localhost:{}{path}", self.target.port)
 	}
 
-	/// One remote op over `POST /request`. `Err` means the round-trip itself
-	/// failed; a plugin-side failure comes back as `Ok(envelope)` with
-	/// `ok == false`
+	/// One remote op over `POST /request`. Plugin and transport failures are
+	/// returned as `ok:false` envelopes so `--raw` callers can always inspect
+	/// completion evidence. Transport failure does not imply rollback.
 	pub fn request(&self, op: &str, args: Value) -> Result<Envelope> {
 		self.request_with_timeout(op, args, self.timeout_ms)
 	}
@@ -435,22 +457,73 @@ impl Client {
 	/// outlast the 5 s default. The HTTP hop keeps the same slack rule as the
 	/// default path, so the daemon's own `TIMEOUT` envelope still wins the race
 	pub fn request_with_timeout(&self, op: &str, args: Value, timeout_ms: u64) -> Result<Envelope> {
-		let body = json!({ "op": op, "args": args, "timeoutMs": timeout_ms });
+		let operation_id = uuid::Uuid::new_v4().to_string();
+		let body = json!({
+			"op": op, "args": args, "timeoutMs": timeout_ms,
+			"operationId": operation_id,
+			"expectedProject": self.hello.canonical_project,
+			"expectedBootId": self.hello.boot_id,
+		});
+		let failure = |message: String, not_started: bool| {
+			Envelope::parse(
+				op,
+				json!({
+					"ok": false,
+					"error": { "code": "TRANSPORT_ERROR", "message": message },
+					"meta": {
+						"op": op, "operationId": operation_id,
+				"completion": if not_started { "notStarted" } else { "unknown" },
+				"completionScope": "requestedEffects",
+						"retrySafe": not_started,
+						"statusUrl": self.url(&format!("/operations/{operation_id}")),
+						"expectedBootId": self.hello.boot_id,
+						"recovery": "Inspect the operation receipt and affected Studio state before retrying; missing receipts do not prove the operation never ran.",
+					},
+				}),
+			)
+		};
 
-		let response = self
+		let response = match self
 			.http
 			.post(self.url("/request"))
 			.timeout(Duration::from_millis(timeout_ms + HTTP_SLACK_MS))
 			.json(&body)
 			.send()
-			.with_context(|| format!("Failed to send op `{op}` to the daemon on port {}", self.target.port))?
-			.error_for_status()?;
+		{
+			Ok(response) => response,
+			Err(error) => {
+				return failure(
+					format!(
+						"Failed to receive op `{op}` reply from daemon on port {}: {error}",
+						self.target.port
+					),
+					error.is_connect(),
+				)
+			}
+		};
+		if !response.status().is_success() {
+			return failure(
+				format!(
+					"Daemon returned HTTP {} for op `{op}`; execution status is unknown",
+					response.status()
+				),
+				false,
+			);
+		}
 
-		let body: Value = response
-			.json()
-			.with_context(|| format!("Daemon returned a malformed reply for op `{op}`"))?;
-
-		Envelope::parse(op, body)
+		let body: Value = match response.json() {
+			Ok(body) => body,
+			Err(error) => {
+				return failure(
+					format!("Daemon returned a malformed reply for op `{op}`: {error}"),
+					false,
+				)
+			}
+		};
+		match Envelope::parse(op, body) {
+			Ok(envelope) => Ok(envelope),
+			Err(error) => failure(error.to_string(), false),
+		}
 	}
 
 	/// The common path: run one op and take its value, failing the command

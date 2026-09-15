@@ -346,7 +346,7 @@ const PLACE_HEADINGS: &str = r#"## 0. Agent bootstrap
 ## 6c. Structured writes beyond `set` and `eval`
 ## 6e. Introspection — class info, enums, attribute-scoped search
 ## 6i. LLM-first command budget
-## 7. Safety note"#;
+## 7. Scope and authority"#;
 
 const PLACE_CONVENTIONS: &str = r#"## 2. Filesystem conventions
 
@@ -455,10 +455,23 @@ Additional rules in force here:
   `originalName` for the instance they sit next to. Property changes made
   there do reach Studio — but a property on an instance with no file form
   cannot be set from disk at all.
-- Set a boolean Studio attribute `AvoidSync = true` on any instance to exclude
-  that subtree from sync in both directions, including divergence comparison.
-  It is the Studio-side counterpart to `ignoreGlobs` and needs no file edit.
-  Use `wsync tree` or `wsync meta` to find the boundaries.
+- Set a boolean Studio attribute `AvoidSync = true` on any instance to keep
+  that instance, and everything under it, in Studio only: it is never written
+  to disk, nothing on disk is pushed over it, and the connect-time comparison
+  leaves it out. Setting it on a synced instance removes its files; clearing
+  it syncs the subtree back. It is the Studio-side counterpart to
+  `ignoreGlobs` and needs no file edit. Use `wsync tree` or `wsync meta` to
+  find the boundaries.
+- Put `--!ignoresync` on its own line within the first 10 lines of a script to
+  keep that script, and everything under it, in Studio only, the same way.
+  Adding the directive to a synced script removes its file; deleting the
+  directive syncs the script back.
+- Both markers are read on the Studio side; the daemon never reads them. A
+  file that arrives carrying one — a sidecar with `AvoidSync: true`, a
+  script with the directive — syncs to Studio once and is Studio-only from
+  the moment it lands; the file itself stays behind as a stale copy that the
+  next connect moves to the backlog. To exclude something from the disk side,
+  use `ignoreGlobs`.
 - The runtime directories `.wsync-backups/`, `.wsync-artifacts/` and
   `.wsync-workflows/` are never synced.
 
@@ -538,11 +551,24 @@ Additional rules in force here:
   they stay under a mapped root.
 - The rules in effect define no metadata sidecar, so properties, attributes
   and tags have no file form in this project at all. Change them in Studio, or
-  with `wsync set` and the user's consent.
-- Set a boolean Studio attribute `AvoidSync = true` on any instance to exclude
-  that subtree from sync in both directions, including divergence comparison.
-  It is the Studio-side counterpart to `ignoreGlobs` and needs no file edit.
-  Use `wsync tree` or `wsync meta` to find the boundaries.
+  with an authorized `wsync set` operation.
+- Set a boolean Studio attribute `AvoidSync = true` on any instance to keep
+  that instance, and everything under it, in Studio only: it is never written
+  to disk, nothing on disk is pushed over it, and the connect-time comparison
+  leaves it out. Setting it on a synced instance removes its files; clearing
+  it syncs the subtree back. It is the Studio-side counterpart to
+  `ignoreGlobs` and needs no file edit. Use `wsync tree` or `wsync meta` to
+  find the boundaries.
+- Put `--!ignoresync` on its own line within the first 10 lines of a script to
+  keep that script, and everything under it, in Studio only, the same way.
+  Adding the directive to a synced script removes its file; deleting the
+  directive syncs the script back.
+- Both markers are read on the Studio side; the daemon never reads them. A
+  file that arrives carrying one — a sidecar with `AvoidSync: true`, a
+  script with the directive — syncs to Studio once and is Studio-only from
+  the moment it lands; the file itself stays behind as a stale copy that the
+  next connect moves to the backlog. To exclude something from the disk side,
+  use `ignoreGlobs`.
 - The runtime directories `.wsync-backups/`, `.wsync-artifacts/` and
   `.wsync-workflows/` are never synced.
 
@@ -781,7 +807,7 @@ fn foreign_marker_blocks_are_left_alone() {
 	let foreign = "<!-- t64:image-tools:start -->\nImageMagick lives here.\n<!-- t64:image-tools:end -->\n";
 	let merged = docsgen::agents_md(Some(foreign), &docs);
 
-	assert!(merged.starts_with(foreign), "another tool's block was rewritten");
+	assert!(merged.ends_with(foreign), "another tool's block was rewritten");
 	assert!(merged.contains(&format!("<!-- {AGENT_CONTEXT}:start -->")));
 	assert_eq!(docsgen::agents_md(Some(&merged), &docs), merged);
 }
@@ -824,11 +850,10 @@ fn an_unterminated_start_marker_is_repaired_without_losing_text() {
 fn a_file_without_markers_gains_a_block_and_keeps_its_text() {
 	let merged = docsgen::claude_md(Some("My Claude notes, no trailing newline"));
 
-	assert!(merged.starts_with("My Claude notes, no trailing newline\n"));
+	assert!(merged.ends_with("My Claude notes, no trailing newline"));
 	assert!(merged.contains(&format!(
 		"<!-- {AGENTS_INCLUDE}:start -->\n@AGENTS.md\n<!-- {AGENTS_INCLUDE}:end -->"
 	)));
-	assert!(merged.ends_with('\n'));
 	assert_eq!(docsgen::claude_md(Some(&merged)), merged);
 }
 
@@ -837,20 +862,25 @@ fn a_file_without_markers_gains_a_block_and_keeps_its_text() {
 ////////////////////////////////////////////////////////////////////////////////
 
 #[test]
-fn agents_md_embeds_the_whole_reference() {
+fn agents_md_contains_a_bounded_contract_and_links_the_reference() {
 	let (_dir, docs) = demo_docs();
 	let agents = docsgen::agents_md(None, &docs);
-
-	assert!(agents.starts_with("# Agent notes"), "missing preamble on a new file");
-
+	assert!(agents.starts_with("<!-- wsync:agent-context:start -->"));
+	assert!(agents.contains("# Agent notes"));
 	let embedded = markers::extract(&agents, AGENT_CONTEXT).expect("agent-context block");
-
 	assert!(embedded.contains("# WSync agent context"));
-	assert!(embedded.contains("### wsync.md"));
-	// The embedded copy keeps wsync.md's own markers, exactly as the file has them
-	assert!(embedded.contains(&format!("<!-- {PROJECT_MEMORY}:start -->")));
-	assert!(embedded.contains(&format!("<!-- {PROJECT_MEMORY}:end -->")));
-	assert!(embedded.contains(docs.project_memory.trim_end()));
+	assert!(embedded.contains("[wsync.md](wsync.md)"));
+	assert!(!embedded.contains(&format!("<!-- {PROJECT_MEMORY}:start -->")));
+	assert!(!embedded.contains(docs.project_memory.trim_end()));
+	assert!(
+		embedded.len() <= docsgen::AGENT_CONTRACT_MAX_BYTES,
+		"{} bytes",
+		embedded.len()
+	);
+	assert!(docs.project_memory.len() > embedded.len());
+	let recovery = embedded.find("partially applied").unwrap();
+	let discovery = embedded.find("## Bootstrap").unwrap();
+	assert!(recovery < discovery, "recovery guidance must survive prefix truncation");
 }
 
 #[test]
@@ -880,7 +910,7 @@ fn fallbacks(config: &str) -> Vec<String> {
 fn codex_config_is_created_with_the_wsync_docs() {
 	let created = docsgen::codex_config(None).unwrap();
 
-	assert_eq!(fallbacks(&created), vec!["wsync.md", "AGENTS.md", "CLAUDE.md"]);
+	assert_eq!(fallbacks(&created), vec!["AGENTS.md", "CLAUDE.md"]);
 	assert!(created.ends_with('\n'));
 }
 
@@ -901,7 +931,7 @@ approval_policy = \"never\"
 	assert!(updated.contains("mcp_servers = { demo = "), "MCP config was rewritten");
 	assert!(updated.contains("[profiles.fast]"));
 	assert!(updated.contains("approval_policy = \"never\""));
-	assert_eq!(fallbacks(&updated), vec!["wsync.md", "AGENTS.md", "CLAUDE.md"]);
+	assert_eq!(fallbacks(&updated), vec!["AGENTS.md", "CLAUDE.md"]);
 
 	// The key is inserted above the first table header, where TOML requires it
 	let key_at = updated.find("project_doc_fallback_filenames").unwrap();
@@ -920,10 +950,7 @@ model = \"gpt-5\"
 
 	let updated = docsgen::codex_config(Some(existing)).unwrap();
 
-	assert_eq!(
-		fallbacks(&updated),
-		vec!["wsync.md", "AGENTS.md", "CLAUDE.md", "ro-sync.md"]
-	);
+	assert_eq!(fallbacks(&updated), vec!["AGENTS.md", "CLAUDE.md", "ro-sync.md"]);
 	assert!(updated.contains("# leading comment"));
 	assert!(updated.contains("model = \"gpt-5\""));
 	assert_eq!(updated.matches("project_doc_fallback_filenames").count(), 1);
@@ -932,7 +959,7 @@ model = \"gpt-5\"
 
 #[test]
 fn codex_config_already_correct_is_returned_untouched() {
-	let existing = "project_doc_fallback_filenames = [\"wsync.md\", \"AGENTS.md\", \"CLAUDE.md\"]\nmodel = \"x\"\n";
+	let existing = "project_doc_fallback_filenames = [\"AGENTS.md\", \"CLAUDE.md\"]\nmodel = \"x\"\n";
 
 	assert_eq!(docsgen::codex_config(Some(existing)).unwrap(), existing);
 }
@@ -949,10 +976,7 @@ model = \"gpt-5\"
 
 	let updated = docsgen::codex_config(Some(existing)).unwrap();
 
-	assert_eq!(
-		fallbacks(&updated),
-		vec!["wsync.md", "AGENTS.md", "CLAUDE.md", "ro-sync.md"]
-	);
+	assert_eq!(fallbacks(&updated), vec!["AGENTS.md", "CLAUDE.md", "ro-sync.md"]);
 	assert!(updated.contains("model = \"gpt-5\""));
 }
 
@@ -1022,10 +1046,10 @@ fn write_all_preserves_user_notes_and_foreign_blocks() {
 	docsgen::write_all(workspace.path(), &docs, Preserve::UserNotes).unwrap();
 
 	let agents = read(workspace.path(), "AGENTS.md");
-	assert!(agents.starts_with("# House rules\n\nAlways ask first.\n"));
-	assert!(agents.contains("### wsync.md"));
+	assert!(agents.contains("# House rules\n\nAlways ask first.\n"));
+	assert!(agents.contains("[wsync.md](wsync.md)"));
 
-	assert!(read(workspace.path(), "CLAUDE.md").starts_with("Claude-only note.\n"));
+	assert!(read(workspace.path(), "CLAUDE.md").ends_with("Claude-only note.\n"));
 	assert!(read(workspace.path(), ".codex/config.toml").contains("model = \"gpt-5\""));
 
 	let again = docsgen::write_all(workspace.path(), &docs, Preserve::UserNotes).unwrap();
@@ -1224,7 +1248,7 @@ fn unshipped_commands_are_reported_as_pending_not_promised() {
 	assert!(budget.contains("`wsync context` is not in this build yet"));
 
 	// And the mutating tier is empty, so §7 still has to say something sane
-	assert!(flat(section(doc, "## 7.")).contains("escape hatches"));
+	assert!(flat(section(doc, "## 7.")).contains("Carry authorization forward"));
 }
 
 #[test]
@@ -1319,5 +1343,94 @@ fn prose_never_presents_an_unshipped_command_as_available() {
 			is_honest_about(&block),
 			"`wsync {name}` is named as if it worked, but this build does not ship it:\n{block}"
 		);
+	}
+}
+
+#[test]
+fn agent_contract_size_is_independent_of_project_tree_and_unbounded_names() {
+	let dir = TempDir::new().unwrap();
+	let mut project = project_facts(&dir, place_project());
+	project.name = "界".repeat(100_000);
+	project.project_file = "long".repeat(100_000);
+	project.roots = vec![project.roots[0].clone(); 10_000];
+	let docs = render(&project, &fixture_registry(), &env_facts());
+	assert!(docs.agent_contract.len() <= docsgen::AGENT_CONTRACT_MAX_BYTES);
+}
+
+#[test]
+fn oversized_user_notes_are_preserved_and_reported() {
+	let (_dir, docs) = demo_docs();
+	let notes = format!(
+		"# User notes\n{}\n<!-- other:start -->owned<!-- other:end -->\n",
+		"x".repeat(40_000)
+	);
+	let merged = docsgen::agents_md(Some(&notes), &docs);
+	assert!(merged.ends_with(&notes));
+	assert!(docsgen::agent_size_warning(&merged).unwrap().contains("preserved"));
+	assert_eq!(docsgen::agents_md(Some(&merged), &docs), merged);
+	assert!(docsgen::agent_size_warning(&docs.agent_contract).is_none());
+}
+
+#[test]
+fn real_registry_uses_subcommand_effects_and_current_recovery_contract() {
+	let registry = RegistryFacts::from_generated_json(include_str!("../docs/client-commands.generated.json")).unwrap();
+	assert_eq!(registry.get("backlog").unwrap().safety(), Safety::Mutating);
+	assert_eq!(registry.get("backlog").unwrap().subcommand_effects["list"], "read-only");
+	assert_eq!(registry.get("attr").unwrap().subcommand_effects["ls"], "read-only");
+	let dir = TempDir::new().unwrap();
+	let docs = render(&project_facts(&dir, place_project()), &registry, &env_facts());
+	let reference = flat(&docs.project_memory);
+	for stale in [
+		"wsync conflicts",
+		"wsync resolve",
+		"wsync diff",
+		"wsync decision",
+		"request never completed",
+		"confirm intent before",
+	] {
+		assert!(!reference.contains(stale), "stale guidance: {stale}");
+	}
+	assert!(reference.contains("wsync backlog list"));
+	assert!(reference.contains("wsync attr ls"));
+	assert!(reference.contains("mutates-disk"));
+	assert!(reference.contains("partially applied"));
+}
+
+#[test]
+fn codex_fallback_migrates_only_the_known_full_reference_default() {
+	let legacy = r#"project_doc_fallback_filenames = ["wsync.md", "AGENTS.md", "CLAUDE.md"]"#;
+	assert_eq!(
+		fallbacks(&docsgen::codex_config(Some(legacy)).unwrap()),
+		["AGENTS.md", "CLAUDE.md"]
+	);
+	let custom = r#"project_doc_fallback_filenames = ["my-notes.md", "wsync.md"]"#;
+	assert_eq!(
+		fallbacks(&docsgen::codex_config(Some(custom)).unwrap()),
+		["AGENTS.md", "CLAUDE.md", "my-notes.md", "wsync.md"]
+	);
+}
+
+#[test]
+fn agent_and_claude_contracts_move_ahead_of_large_preserved_notes() {
+	let (_dir, docs) = demo_docs();
+	for (marker, body) in [
+		(AGENT_CONTEXT, docs.agent_contract.as_str()),
+		(AGENTS_INCLUDE, "@AGENTS.md"),
+	] {
+		let prefix = format!(
+			"# Notes\r\n{}\r\n<!-- foreign:start -->keep  \r\n<!-- foreign:end -->",
+			"n".repeat(61_000)
+		);
+		let suffix = "\r\nTrailing user text with no newline";
+		let existing = format!("{prefix}<!-- {marker}:start -->stale<!-- {marker}:end -->{suffix}");
+		let merged = markers::upsert_first(Some(&existing), marker, body, "");
+		assert!(merged.starts_with(&markers::start_tag(marker)));
+		assert!(
+			merged.ends_with(&format!("{prefix}{suffix}")),
+			"outside bytes must retain exact order/line endings"
+		);
+		assert_eq!(markers::upsert_first(Some(&merged), marker, body, ""), merged);
+		let end = merged.find(&markers::end_tag(marker)).unwrap();
+		assert!(end < docsgen::AGENT_CONTRACT_MAX_BYTES + 100);
 	}
 }

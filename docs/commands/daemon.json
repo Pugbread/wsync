@@ -2,7 +2,7 @@
   "name": "daemon",
   "title": "wsync daemon",
   "category": "Daemon",
-  "description": "Starts, inspects, gracefully stops, restarts, or reads logs from one project-scoped managed background daemon.",
+  "description": "Starts, inspects, stops, restarts or reads logs from a project-scoped daemon with a lifecycle record.",
   "subcommands": [
     "start",
     "status",
@@ -42,21 +42,23 @@
       ]
     }
   },
-  "usage": "wsync daemon <start|status|stop|restart|logs> --project <path> [options]",
+  "usage": "wsync daemon <start|status|stop|restart|logs> [--project <path>] [options]",
   "examples": [
     "wsync daemon start --project . --raw",
     "wsync daemon status --project . --raw",
     "wsync daemon stop --project . --timeout 10 --raw",
-    "wsync daemon restart --project . --game-id 123 --place-id 456 --raw",
-    "wsync daemon logs --project . --lines 100"
+    "wsync daemon restart --project . --port 7978 --timeout 10 --raw",
+    "wsync daemon logs --project . --lines 100",
+    "wsync daemon start --project . --game-id 123 --place-id 456 --raw"
   ],
   "notes": [
-    "`start` and `restart` accept `--port`, `--projects-root`, `--managed-by`, `--data-dir`, `--timeout`, `--game-id`, `--group-id`, and repeated `--place-id`. `status`, `stop`, and `logs` use the same canonical project identity and optional `--data-dir`.",
-    "`--projects-root` enables the authenticated Studio project initializer for a manager-authorized canonical root; it is not required for normal project daemons.",
-    "A matching daemon already running for the project is returned instead of spawning a duplicate. A requested port serving another project is a hard error. `restart` prefers the port the daemon was already on.",
-    "Stop authenticates an exact canonical project and boot ID before graceful shutdown. WSync never kills a PID read from a stale runtime record.",
-    "Runtime records live under the platform data directory at `WSync/daemons/<sha256(project)>.json` beside their start lock and log file; the mutation audit log is `WSync/writes.log`.",
-    "`wsync daemon stop --project <path>` is the authenticated per-project form. `wsync stop` is the session-level form and works over `~/.wsync/sessions.toml`.",
-    "Desktop managers should supply their browser capability through `--owner-token-env <ENV>`; secrets are never returned by lifecycle JSON."
+    "Start and restart serve in the current process; they do not detach into a background child. A process manager can launch them as a background service. --raw emits a readiness JSON line and then the process continues serving.",
+    "Start accepts --project, --port, --managed-by, --owner-token-env, --data-dir, --game-id, --group-id, repeated --place-id and --raw. Metadata flags persist those IDs into the project before startup.",
+    "Restart accepts --project, --port, --managed-by, --owner-token-env, --data-dir, --timeout and --raw. It uses persisted project metadata and does not accept game/group/place ID flags. The timeout is the wait for the old daemon to stop.",
+    "Status accepts --project, --data-dir and --raw. Stop also accepts --timeout. Logs accepts --project, --data-dir and --lines; it prints text lines without a --raw mode.",
+    "A matching daemon already running for the project is reported instead of starting a duplicate. A requested port serving another project is an error. Restart prefers the previous daemon port.",
+    "Stop verifies the exact live canonical project and boot ID before graceful shutdown. On graceful timeout it can use an OS-kill fallback only for that verified process; a stale PID record alone is insufficient.",
+    "Runtime records live in the platform data directory under WSync/daemons, alongside start locks and lifecycle logs. The mutation audit log is WSync/writes.log.",
+    "Desktop managers can supply an owner token through --owner-token-env <ENV>. Lifecycle JSON does not disclose the token. No --projects-root flag is implemented in this CLI family."
   ]
 }

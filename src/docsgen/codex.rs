@@ -11,7 +11,7 @@
 use std::fmt;
 
 /// Filenames WSync requires, in the order Codex should try them
-pub const FALLBACK_FILENAMES: [&str; 3] = ["wsync.md", "AGENTS.md", "CLAUDE.md"];
+pub const FALLBACK_FILENAMES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
 
 const KEY: &str = "project_doc_fallback_filenames";
 
@@ -105,6 +105,15 @@ fn required() -> Vec<String> {
 /// WSync's filenames first, then whatever else the user had, de-duplicated.
 /// Stable, so a second refresh is a no-op
 fn merge(current: &[String]) -> Vec<String> {
+	// Only migrate the exact list WSync used to generate. Custom lists keep
+	// their filenames, including an explicitly configured detailed reference.
+	if current
+		.iter()
+		.map(String::as_str)
+		.eq(["wsync.md", "AGENTS.md", "CLAUDE.md"])
+	{
+		return required();
+	}
 	let mut merged = required();
 
 	for name in current {

@@ -25,11 +25,16 @@ pub struct Backlog {
 	#[command(subcommand)]
 	command: Option<BacklogCommand>,
 
-	#[command(flatten)]
-	targeting: Targeting,
+	/// Project path (defaults to the current directory)
+	#[arg(long, global = true, value_name = "PATH")]
+	project: Option<std::path::PathBuf>,
+
+	/// Daemon port
+	#[arg(short = 'P', long, global = true)]
+	port: Option<u16>,
 
 	/// Print machine-readable JSON
-	#[arg(long)]
+	#[arg(long, global = true)]
 	raw: bool,
 }
 
@@ -57,7 +62,15 @@ enum BacklogCommand {
 
 impl Backlog {
 	pub fn main(self) -> Result<()> {
-		let client = Client::connect(&self.targeting)?;
+		if let Some(BacklogCommand::Drop { id, all }) = &self.command {
+			if id.is_some() == *all {
+				bail!("Pass exactly one of an entry id or --all");
+			}
+		}
+		let client = Client::connect(&Targeting {
+			project: self.project.clone(),
+			port: self.port,
+		})?;
 
 		let Backlog { command, raw, .. } = self;
 

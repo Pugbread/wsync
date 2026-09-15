@@ -3,13 +3,12 @@
   "title": "wsync doc",
   "category": "Tool management",
   "description": "Opens the WSync documentation site in the default browser.",
-  "usage": "wsync doc [--raw]",
+  "usage": "wsync doc",
   "examples": [
-    "wsync doc",
-    "wsync doc --raw"
+    "wsync doc"
   ],
   "notes": [
-    "Prints the documentation URL and hands it to the system handler; `--raw` prints the URL as JSON and opens nothing.",
-    "For the command surface itself, `wsync commands` serves the same generated registry offline and is the right tool for agents and for machines without a browser."
+    "Opens https://github.com/Pugbread/wsync with the system browser and prints the URL. Browser launch failure is a command error.",
+    "For offline command documentation without opening a browser, use wsync commands <command>, wsync commands --compact, or wsync commands types."
   ]
 }

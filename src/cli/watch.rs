@@ -25,6 +25,10 @@ pub struct Watch {
 	#[arg()]
 	project: Option<PathBuf>,
 
+	/// Project path (named alternative to the positional project)
+	#[arg(long = "project", value_name = "PATH", conflicts_with = "project")]
+	project_flag: Option<PathBuf>,
+
 	/// Daemon port (defaults to the runtime record, then the project/config
 	/// port)
 	#[arg(short = 'P', long)]
@@ -109,7 +113,12 @@ impl Watch {
 	/// Finds the daemon port: runtime record first (the authoritative
 	/// registry), then the project file, then the config default
 	fn discover_port(&self) -> Result<u16> {
-		let project_path = project::resolve(self.project.clone().unwrap_or_default())?;
+		let project_path = project::resolve(
+			self.project_flag
+				.clone()
+				.or_else(|| self.project.clone())
+				.unwrap_or_default(),
+		)?;
 
 		if project_path.exists() {
 			if let Ok(canonical) = daemon::canonical_project(&project_path) {
@@ -194,5 +203,18 @@ fn summarize(frame: &Value) -> String {
 			frame.get("code").and_then(Value::as_str).unwrap_or("?"),
 		),
 		other => other.to_owned(),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn named_and_positional_project_forms_parse() {
+		let named = Watch::try_parse_from(["watch", "--project", "place.json"]).unwrap();
+		let legacy = Watch::try_parse_from(["watch", "place.json"]).unwrap();
+		assert_eq!(named.project_flag, legacy.project);
+		assert!(Watch::try_parse_from(["watch", "place.json", "--project", "other.json"]).is_err());
 	}
 }

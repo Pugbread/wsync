@@ -69,11 +69,15 @@ impl Refresh {
 		}
 
 		let outcomes = refresh_workspace(&project_path)?;
+		let instruction_warning = std::fs::read_to_string(project_path.get_parent().join("AGENTS.md"))
+			.ok()
+			.and_then(|text| docsgen::agent_size_warning(&text));
 
 		if self.raw {
 			print_json(&json!({
 				"ok": true,
 				"files": outcomes.iter().map(outcome_record).collect::<Vec<_>>(),
+				"warnings": instruction_warning.into_iter().collect::<Vec<_>>(),
 			}));
 
 			return Ok(());

@@ -38,7 +38,7 @@ fn dead_port() -> String {
 #[test]
 fn commands_prints_the_embedded_bundle_verbatim() {
 	let sandbox = CliSandbox::new();
-	let output = sandbox.run(&["commands"]);
+	let output = sandbox.run(&["commands", "--full"]);
 
 	assert!(output.status.success(), "commands failed: {}", cli_stderr(&output));
 
@@ -150,7 +150,7 @@ fn context_answers_offline_from_config_and_disk_facts() {
 	);
 	assert_eq!(snapshot["daemon"]["reachable"], false);
 	assert_eq!(snapshot["plugin"]["connected"], false);
-	assert_eq!(snapshot["conflicts"], Value::Null);
+	assert_eq!(snapshot["backlog"]["entries"], Value::Null);
 	assert_eq!(snapshot["generatedDocs"]["wsync.md"], false);
 
 	// Registry pointers, not the registry
@@ -165,7 +165,7 @@ fn context_answers_offline_from_config_and_disk_facts() {
 		"lint --path",
 		"startup ritual",
 		"wsync mv",
-		"escape hatches",
+		"existing user authorization",
 	] {
 		assert!(policy.contains(expected), "llmPolicy must mention `{expected}`");
 	}
@@ -176,10 +176,19 @@ fn context_answers_offline_from_config_and_disk_facts() {
 	let line = text.lines().find(|line| !line.trim().is_empty()).unwrap_or_default();
 
 	assert!(line.starts_with(r#"{"ok":"#), "context --raw must lead with ok: {line}");
+	fs::write(project_dir.path().join("AGENTS.md"), "n".repeat(40_000)).unwrap();
+	let output = sandbox.run(&["context", "--project", &project, "--port", &port, "--raw"]);
+	let oversized = cli_json(&output);
+	assert_eq!(oversized["instructionBudget"]["bytes"], 40_000);
+	assert!(oversized["instructionBudget"]["warning"]
+		.as_str()
+		.unwrap()
+		.contains("preserved"));
+	assert_eq!(oversized["registryIdentity"], snapshot["registryIdentity"]);
 }
 
 #[test]
-fn context_reports_the_live_daemon_plugin_and_conflicts() {
+fn context_reports_the_live_daemon_plugin_and_backlog() {
 	let daemon = start_daemon(None);
 
 	spawn_cli_plugin(
@@ -207,11 +216,11 @@ fn context_reports_the_live_daemon_plugin_and_conflicts() {
 
 	assert_eq!(snapshot["daemon"]["reachable"], true);
 	assert_eq!(snapshot["daemon"]["servesThisProject"], true);
-	assert_eq!(snapshot["plugin"]["connected"], true);
+	assert_eq!(snapshot["plugin"]["connected"], true, "{snapshot}");
 	assert_eq!(snapshot["plugin"]["version"], "9.9.9-test");
-	// The real daemon serves GET /resolve: no parked conflicts on a fresh
+	// The real daemon serves read-only GET /backlog: no retained entries on a fresh
 	// project is the number zero, not "unanswerable"
-	assert_eq!(snapshot["conflicts"], 0);
+	assert_eq!(snapshot["backlog"]["entries"], 0);
 
 	// `--full-commands` embeds the complete registry in the same snapshot
 	let output = sandbox.run(&["context", "--project", &project, "--port", &port, "--full-commands"]);
@@ -415,4 +424,75 @@ fn tail_streams_log_entries_and_pages_with_the_cursor() {
 
 	child.kill().ok();
 	child.wait().ok();
+}
+
+#[test]
+fn commands_default_is_compact_and_schema_identity_is_stable_offline() {
+	let sandbox = CliSandbox::new();
+	let first = sandbox.run(&["commands"]);
+	let scoped = sandbox.run(&["commands", "--project", "/nonexistent/project", "--compact"]);
+	assert!(first.status.success(), "{}", cli_stderr(&first));
+	assert!(scoped.status.success(), "{}", cli_stderr(&scoped));
+	assert_eq!(cli_json(&first), cli_json(&scoped));
+	let index = cli_json(&first);
+	assert!(index.get("categories").is_some());
+	assert!(index.get("commands").is_none());
+	assert!(index["registryIdentity"]["commandFingerprint"]
+		.as_str()
+		.unwrap()
+		.starts_with("sha256:"));
+	assert!(index["registryIdentity"]["valueFingerprint"]
+		.as_str()
+		.unwrap()
+		.starts_with("sha256:"));
+	assert!(cli_stdout(&first).len() < include_str!("../docs/client-commands.generated.json").len() / 3);
+}
+
+#[test]
+fn commands_nested_lookup_uses_the_real_parser_and_effects() {
+	let sandbox = CliSandbox::new();
+	for (parts, expected, effect) in [
+		(vec!["commands", "attr", "ls"], "attr ls", "read-only"),
+		(
+			vec!["commands", "backlog", "restore"],
+			"backlog restore",
+			"mutates-studio",
+		),
+		(
+			vec!["commands", "monetization", "gamepass", "list"],
+			"monetization gamepass list",
+			"open-cloud-read",
+		),
+	] {
+		let output = sandbox.run(&parts);
+		assert!(output.status.success(), "{}", cli_stderr(&output));
+		let entry = cli_json(&output);
+		assert_eq!(entry["name"], expected);
+		assert_eq!(entry["effects"]["safety"], effect);
+		assert!(
+			entry["help"].as_str().unwrap().contains("--project")
+				|| entry["parentOptions"]
+					.as_array()
+					.unwrap()
+					.iter()
+					.any(|option| option["long"] == "project"),
+			"{entry}"
+		);
+	}
+	let invalid = sandbox.run(&["commands", "attr", "guess"]);
+	assert!(!invalid.status.success());
+}
+
+#[test]
+fn commands_value_schemas_need_no_project_or_studio() {
+	let sandbox = CliSandbox::new();
+	for type_name in ["Vector3", "Color3", "vector3"] {
+		let output = sandbox.run(&["commands", "types", type_name, "--project", "/nonexistent/project"]);
+		assert!(output.status.success(), "{}", cli_stderr(&output));
+		let value = cli_json(&output);
+		assert!(value.is_object(), "schema must be structured JSON: {value}");
+	}
+	let invalid = sandbox.run(&["commands", "types", "NotAType"]);
+	assert!(!invalid.status.success());
+	assert!(cli_stderr(&invalid).contains("commands types"));
 }

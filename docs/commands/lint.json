@@ -25,6 +25,7 @@
     "Compiler resolution checks `--luau-compile`, `WSYNC_LUAU_COMPILE`, `LUAU_COMPILE`, the bundled platform tool, Aftman, and `PATH`. Raw JSON distinguishes analyzer and compiler diagnostics, includes compiler coverage/failure metadata, and preserves unparsed analyzer messages such as configuration errors.",
     "Structured diagnostics recognize luau-lsp's default and GNU formatters, including adversarial Studio instance names. `--formatter=plain` is rejected because luau-lsp 1.68.1 can emit TypeErrors in that mode while returning a successful process status.",
     "`--no-sourcemap` disables WSync DataModel coverage. Requiring `studio` or `filesystem` mode while disabling or replacing the generated sourcemap is rejected.",
-    "The narrowest `lint --path <file>` is the intended post-edit verification step; unrelated global diff output is not."
+    "The narrowest `lint --path <file>` is the intended post-edit verification step; unrelated global diff output is not.",
+    "With an explicit --project, relative --path values are resolved against the selected project directory; absolute --path values remain absolute. Without --project, --path follows cwd. Tool and output file paths remain cwd-relative."
   ]
 }

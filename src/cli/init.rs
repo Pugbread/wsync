@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{ArgAction, Parser};
 use colored::Colorize;
 use std::path::PathBuf;
@@ -17,6 +17,10 @@ pub struct Init {
 	/// Project path
 	#[arg()]
 	project: Option<PathBuf>,
+
+	/// Project path (named alternative to the positional project)
+	#[arg(long = "project", value_name = "PATH", conflicts_with = "project")]
+	project_flag: Option<PathBuf>,
 
 	/// Workspace template
 	#[arg(short = 'T', long)]
@@ -84,12 +88,14 @@ pub struct Init {
 
 impl Init {
 	pub fn main(self) -> Result<()> {
-		let project_path = project::resolve(self.project.clone().unwrap_or_default())?;
+		// Templates are needed by project creation, not by every CLI command.
+		crate::installer::install_templates(false)?;
+		let project = self.project_flag.or(self.project).unwrap_or_default();
+		let project_path = project::resolve(project.clone())?;
 
 		Config::load_workspace(project_path.get_parent());
 		let config = Config::new();
 
-		let project = self.project.unwrap_or_default();
 		let template = self.template.unwrap_or(config.template.clone());
 		let git = self.git.unwrap_or(config.use_git);
 		let wally = self.wally.unwrap_or(config.use_wally);
@@ -113,10 +119,13 @@ impl Init {
 			rojo_mode: config.rojo_mode,
 			use_lua: config.lua_extension,
 		};
+		drop(config);
 
 		if ts {
 			if let Some(path) = workspace::init_ts(workspace_config)? {
 				let path = path.resolve()?.join("default.project.json");
+				crate::cli::refresh::refresh_workspace(&path)
+					.context("Project initialized, but agent documents could not be generated; run `wsync refresh --project <path>` to finish")?;
 
 				wsync_info!(
 					"Successfully initialized roblox-ts project: {}",
@@ -137,6 +146,8 @@ impl Init {
 
 		workspace_config.project = &project_path;
 		workspace::init(workspace_config)?;
+		crate::cli::refresh::refresh_workspace(&project_path)
+			.context("Project initialized, but agent documents could not be generated; run `wsync refresh --project <path>` to finish")?;
 
 		wsync_info!("Successfully initialized project: {}", project_path.to_string().bold());
 

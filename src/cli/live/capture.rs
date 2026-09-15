@@ -145,12 +145,17 @@ struct CaptureModel {
 	view: Option<View>,
 
 	/// Camera direction vector as x,y,z (overrides --view)
-	#[arg(long, value_name = "X,Y,Z", conflicts_with = "camera_cframe")]
+	#[arg(
+		long,
+		value_name = "X,Y,Z",
+		conflicts_with = "camera_cframe",
+		allow_hyphen_values = true
+	)]
 	direction: Option<String>,
 
 	/// Authored camera: exactly the 12 comma-separated values of
 	/// CFrame:GetComponents(), replacing view, direction, and padding framing
-	#[arg(long = "camera-cframe", value_name = "12-VALUES")]
+	#[arg(long = "camera-cframe", value_name = "12-VALUES", allow_hyphen_values = true)]
 	camera_cframe: Option<String>,
 
 	/// Framing head-room multiplier, 1.0-4.0

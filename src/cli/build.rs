@@ -22,6 +22,10 @@ pub struct Build {
 	#[arg()]
 	project: Option<PathBuf>,
 
+	/// Project path (named alternative to the positional project)
+	#[arg(long = "project", value_name = "PATH", conflicts_with = "project")]
+	project_flag: Option<PathBuf>,
+
 	/// Session identifier
 	#[arg()]
 	session: Option<String>,
@@ -61,7 +65,12 @@ pub struct Build {
 
 impl Build {
 	pub fn main(self) -> Result<()> {
-		let project_path = project::resolve(self.project.clone().unwrap_or_default())?;
+		let project_path = project::resolve(
+			self.project_flag
+				.clone()
+				.or_else(|| self.project.clone())
+				.unwrap_or_default(),
+		)?;
 
 		Config::load_workspace(project_path.get_parent());
 		let config = Config::new();
@@ -243,7 +252,7 @@ impl Build {
 	fn spawn(self) -> Result<()> {
 		let mut args = vec![String::from("build")];
 
-		if let Some(project) = self.project {
+		if let Some(project) = self.project_flag.or(self.project) {
 			args.push(project.to_string())
 		}
 

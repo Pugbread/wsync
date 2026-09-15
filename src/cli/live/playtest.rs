@@ -433,7 +433,7 @@ impl PlaytestRun {
 						"kind": "timeout",
 						"exitCode": 3,
 						"error": format!("no terminal record within --timeout {}s (plus grace)", self.timeout),
-						"jobStatus": fetch_job_status(&client),
+						"jobStatus": fetch_job_status(&client, &job_id),
 						"elapsed": started.elapsed().as_secs_f64(),
 					}),
 				}
@@ -448,7 +448,7 @@ impl PlaytestRun {
 					record: json!({
 						"type": "aborted",
 						"reason": format!("lost the run stream: {err:#}"),
-						"jobStatus": fetch_job_status(&client),
+						"jobStatus": fetch_job_status(&client, &job_id),
 						"exitCode": 4,
 						"elapsed": started.elapsed().as_secs_f64(),
 					}),
@@ -463,7 +463,7 @@ impl PlaytestRun {
 		} else {
 			// Best-effort: a failed stop is reported but never rewrites the
 			// run's own outcome
-			match client.request("playtest_stop", json!({})) {
+			match client.request("playtest_stop", json!({ "jobId": job_id })) {
 				Ok(envelope) if envelope.ok => {}
 				Ok(envelope) => wsync_warn!(
 					"Failed to stop the playtest after the run: {}",
@@ -629,8 +629,8 @@ fn boot_failure_record(envelope: &Envelope, elapsed: Duration) -> Value {
 
 /// The final observed job status for a failure report — best-effort, so a
 /// dead daemon degrades to `unavailable` instead of masking the real error
-fn fetch_job_status(client: &Client) -> String {
-	match client.request("playtest_status", json!({})) {
+fn fetch_job_status(client: &Client, job_id: &str) -> String {
+	match client.request("playtest_status", json!({ "jobId": job_id })) {
 		Ok(envelope) if envelope.ok => envelope
 			.value
 			.get("jobStatus")
@@ -780,15 +780,27 @@ struct Common {
 	#[command(flatten)]
 	targeting: Targeting,
 
+	/// Pin this operation to an existing playtest generation; stale jobs are refused
+	#[arg(long, value_name = "ID", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+	job: Option<String>,
+
 	/// Print machine-readable JSON
 	#[arg(long)]
 	raw: bool,
 }
 
 impl Common {
+	fn pinned_args(&self, mut args: Value) -> Value {
+		if let Some(job) = &self.job {
+			args["jobId"] = json!(job);
+		}
+		args
+	}
+
 	/// One op, one value, the shared `--raw` convention: the op's value as one
 	/// JSON line, or a compact human rendering
 	fn run_op(&self, op: &str, args: Value, timeout_ms: Option<u64>) -> Result<Value> {
+		let args = self.pinned_args(args);
 		let client = Client::connect(&self.targeting)?;
 
 		let envelope = match timeout_ms {
@@ -796,7 +808,16 @@ impl Common {
 			None => client.request(op, args)?,
 		};
 
-		envelope.into_value(self.raw)
+		let meta = (op == "playtest_exec")
+			.then(|| envelope.body.get("meta").cloned())
+			.flatten();
+		let mut value = envelope.into_value(self.raw)?;
+		if let Some(meta) = meta {
+			if value.is_object() {
+				value["meta"] = meta;
+			}
+		}
+		Ok(value)
 	}
 }
 
@@ -856,31 +877,41 @@ impl PlaytestStart {
 	/// launch itself can die moments later — most often Studio refusing outright
 	/// because its test state is wedged. Without this check `start` cheerfully
 	/// reports success for a generation that is already dead.
-	fn settle_check(client: &Client, raw: bool) -> Result<()> {
+	fn settle_check(client: &Client, job_id: &str) -> Result<Option<Value>> {
 		std::thread::sleep(std::time::Duration::from_millis(1200));
 
-		let Ok(status) = client.request("playtest_status", json!({})) else {
-			return Ok(());
-		};
-
-		let Ok(status) = status.into_value(raw) else {
-			return Ok(());
+		let status = match client.request("playtest_status", json!({ "jobId": job_id })) {
+			Ok(envelope) if envelope.ok => envelope.value,
+			Ok(envelope) => {
+				return Ok(Some(json!({
+					"state": "unverified", "jobId": job_id, "probe": envelope.body,
+					"note": "Start was accepted, but its status probe failed. Inspect this job before another lifecycle action."
+				})))
+			}
+			Err(error) => {
+				return Ok(Some(json!({
+					"state": "unverified", "jobId": job_id, "error": format!("{error:#}"),
+					"note": "Start was accepted, but its status probe could not be read. Inspect this job before another lifecycle action."
+				})))
+			}
 		};
 
 		if status.get("jobStatus").and_then(Value::as_str) != Some("failed") {
-			return Ok(());
+			return Ok(None);
 		}
 
 		let detail = status.get("error").and_then(Value::as_str).unwrap_or_default();
-
 		match explain_studio_wedge(detail) {
 			Some(explained) => bail!("{explained}"),
 			None if !detail.is_empty() => bail!("the playtest failed to start: {detail}"),
-			None => Ok(()),
+			None => bail!("the playtest job {job_id} failed to start without error details"),
 		}
 	}
 
 	fn main(self) -> Result<()> {
+		if self.common.job.is_some() {
+			bail!("--job targets an existing playtest; start creates a new generation. Use `playtest stop --job <ID>` first when replacing a specific job");
+		}
 		let client = Client::connect(&self.common.targeting)?;
 
 		if self.force {
@@ -892,28 +923,32 @@ impl PlaytestStart {
 			let _ = client.request_with_timeout("playtest_stop", json!({ "force": true }), RUN_START_TIMEOUT_MS);
 		}
 
-		let started = client
-			.request_with_timeout(
-				"playtest_start",
-				json!({ "mode": self.mode.as_str(), "players": self.players }),
-				RUN_START_TIMEOUT_MS,
-			)?
-			.into_value(self.common.raw)
-			.map_err(|error| {
-				if error.to_string().contains("already active") {
-					// Both readings are possible here and they want opposite
-					// actions, so name them rather than pushing --force at
-					// someone whose playtest is simply still running
-					error.context(
-						"stop the running playtest first (`wsync playtest stop`); \
+		let start_envelope = client.request_with_timeout(
+			"playtest_start",
+			json!({ "mode": self.mode.as_str(), "players": self.players }),
+			RUN_START_TIMEOUT_MS,
+		)?;
+		let start_meta = start_envelope.body.get("meta").cloned();
+		let started = start_envelope.into_value(self.common.raw).map_err(|error| {
+			if error.to_string().contains("already active") {
+				// Both readings are possible here and they want opposite
+				// actions, so name them rather than pushing --force at
+				// someone whose playtest is simply still running
+				error.context(
+					"stop the running playtest first (`wsync playtest stop`); \
 						 if nothing is actually running, that generation is wedged — \
 						 `wsync playtest stop --force` clears it without restarting Studio",
-					)
-				} else {
-					error
-				}
-			})?;
+				)
+			} else {
+				error
+			}
+		})?;
 
+		let job_id = started.get("jobId").and_then(Value::as_str).ok_or_else(|| {
+			anyhow::anyhow!("playtest_start answered without jobId; inspect status before retrying start")
+		})?;
+
+		let mut verification = None;
 		let waited = if self.wait {
 			// Multiplayer waits for the server plus every client; play for
 			// server and one client; run for the server context alone
@@ -926,7 +961,7 @@ impl PlaytestStart {
 			let outcome = client
 				.request_with_timeout(
 					"playtest_wait",
-					json!({ "minimum": minimum, "timeoutMs": self.timeout * 1000 }),
+					json!({ "minimum": minimum, "timeoutMs": self.timeout * 1000, "jobId": job_id }),
 					self.timeout * 1000,
 				)
 				.and_then(|envelope| envelope.into_value(self.common.raw));
@@ -937,13 +972,13 @@ impl PlaytestStart {
 					// "contexts never connected" is the symptom; the launch's own
 					// failure is the cause, so report that (and the wedge remedy)
 					// in preference to the timeout wording
-					Self::settle_check(&client, self.common.raw)?;
+					Self::settle_check(&client, job_id)?;
 
 					return Err(error);
 				}
 			}
 		} else {
-			Self::settle_check(&client, self.common.raw)?;
+			verification = Self::settle_check(&client, job_id)?;
 
 			None
 		};
@@ -952,6 +987,12 @@ impl PlaytestStart {
 			let mut record = json!({ "ok": true });
 
 			merge_into(&mut record, &started);
+			if let Some(meta) = start_meta {
+				record["meta"] = meta;
+			}
+			if let Some(verification) = &verification {
+				record["verification"] = verification.clone();
+			}
 
 			if let Some(waited) = &waited {
 				record["wait"] = waited.clone();
@@ -960,6 +1001,10 @@ impl PlaytestStart {
 			print_json(&record);
 
 			return Ok(());
+		}
+
+		if verification.is_some() {
+			wsync_warn!("Start accepted for job {job_id}, but status is unverified. Inspect this job before another lifecycle action");
 		}
 
 		wsync_info!(
@@ -1008,7 +1053,12 @@ impl PlaytestStatus {
 			return Ok(());
 		}
 
-		let active = value.get("active").and_then(Value::as_bool) == Some(true);
+		let active = value.get("active").and_then(Value::as_bool).unwrap_or_else(|| {
+			matches!(
+				value.get("status").and_then(Value::as_str),
+				Some("starting" | "running" | "stopping")
+			)
+		});
 
 		if !active {
 			wsync_info!("No active playtest");
@@ -1061,8 +1111,18 @@ fn print_contexts(value: &Value) {
 	for context in contexts {
 		println!(
 			"  {:<12} {}",
-			context.get("context").and_then(Value::as_str).unwrap_or("?"),
-			context.get("status").and_then(Value::as_str).unwrap_or("connected"),
+			context
+				.get("name")
+				.or_else(|| context.get("context"))
+				.and_then(Value::as_str)
+				.unwrap_or("?"),
+			context.get("status").and_then(Value::as_str).unwrap_or(
+				if context.get("ready").and_then(Value::as_bool) == Some(true) {
+					"ready"
+				} else {
+					"waiting"
+				}
+			),
 		);
 	}
 
@@ -1131,13 +1191,8 @@ struct PlaytestExec {
 	#[arg(long, value_name = "CTX")]
 	context: String,
 
-	/// Luau source; use `return …` for a value back
-	#[arg(long, value_name = "LUAU", conflicts_with = "source_file")]
-	source: Option<String>,
-
-	/// Read the Luau source from a file
-	#[arg(long = "source-file", value_name = "FILE", conflicts_with = "source")]
-	source_file: Option<PathBuf>,
+	#[command(flatten)]
+	source: crate::cli::source_input::SourceInput,
 
 	/// game runs through a temporary Script/LocalScript; plugin uses the
 	/// plugin sandbox
@@ -1145,7 +1200,7 @@ struct PlaytestExec {
 	identity: Identity,
 
 	/// Seconds the execution may run
-	#[arg(long, value_name = "SECONDS", default_value = "15", value_parser = clap::value_parser!(u64).range(1..=600))]
+	#[arg(long, value_name = "SECONDS", default_value = "15", value_parser = clap::value_parser!(u64).range(1..=60))]
 	timeout: u64,
 }
 
@@ -1153,11 +1208,7 @@ impl PlaytestExec {
 	fn main(self) -> Result<()> {
 		check_context(&self.context)?;
 
-		let source = match (&self.source, &self.source_file) {
-			(Some(source), None) => source.clone(),
-			(None, Some(path)) => read_script(path, "--source-file")?,
-			_ => bail!("`playtest exec` needs exactly one of --source or --source-file"),
-		};
+		let source = self.source.read()?;
 
 		let args = json!({
 			"context": self.context,
@@ -1166,29 +1217,61 @@ impl PlaytestExec {
 			"timeoutMs": self.timeout * 1000,
 		});
 
-		let value = self.common.run_op("playtest_exec", args, Some(self.timeout * 1000))?;
+		// Runtime execution gets its advertised timeout; reply dispatch and
+		// multipart result transfer have separate 10s + 30s budgets underneath.
+		let value = self
+			.common
+			.run_op("playtest_exec", args, Some((self.timeout + 45) * 1000))?;
+		let execution_failed = value.get("ok").and_then(Value::as_bool) == Some(false);
 
 		if self.common.raw {
 			print_json(&value);
+			if execution_failed {
+				bail!(
+					"Playtest source failed: {}. Earlier effects may have applied",
+					value
+						.get("error")
+						.and_then(Value::as_str)
+						.unwrap_or("unknown execution error")
+				);
+			}
 
 			return Ok(());
 		}
 
-		let empty = Vec::new();
-		let results = value.get("results").and_then(Value::as_array).unwrap_or(&empty);
-
-		for (index, result) in results.iter().enumerate() {
-			println!("{:>3}  {}", index + 1, human_value(result));
+		if execution_failed {
+			bail!(
+				"Playtest source failed: {}. Earlier effects may have applied",
+				value
+					.get("error")
+					.and_then(Value::as_str)
+					.unwrap_or("unknown execution error")
+			);
+		}
+		let count = value.get("count").and_then(Value::as_u64).unwrap_or(0);
+		// Dense indexed slots preserve nils across Roblox event serialization.
+		// Older plugins still return legacy value/count; keep that compatible.
+		if let Some(slots) = value.get("results").and_then(Value::as_array) {
+			for slot in slots {
+				println!(
+					"{:>3}  {}",
+					slot["index"].as_u64().unwrap_or(0),
+					if slot["isNil"] == true {
+						"nil".to_owned()
+					} else {
+						human_value(&slot["value"])
+					}
+				);
+			}
+		} else if count == 1 {
+			println!("  1  {}", human_value(&value["value"]));
+		} else if let Some(results) = value.get("value").and_then(Value::as_array) {
+			for (index, result) in results.iter().enumerate() {
+				println!("{:>3}  {}", index + 1, human_value(result));
+			}
 		}
 
-		wsync_info!(
-			"exec in {} returned {} value(s)",
-			self.context.bold(),
-			value
-				.get("count")
-				.and_then(Value::as_u64)
-				.unwrap_or(results.len() as u64)
-		);
+		wsync_info!("exec in {} returned {} value(s)", self.context.bold(), count);
 
 		Ok(())
 	}
@@ -1439,7 +1522,7 @@ impl PlaytestCapture {
 		let summary = capture::capture_via_screenshot_file(
 			&client,
 			"playtest_screenshot",
-			json!({ "context": self.context }),
+			self.common.pinned_args(json!({ "context": self.context })),
 			&self.output,
 			self.timeout * 1000,
 			self.common.raw,
@@ -1499,7 +1582,8 @@ impl PlaytestClip {
 		let summary = capture::capture_video_file(
 			&client,
 			"playtest_video",
-			json!({ "context": self.context, "seconds": self.seconds }),
+			self.common
+				.pinned_args(json!({ "context": self.context, "seconds": self.seconds })),
 			&self.output,
 			timeout_ms,
 			self.common.raw,

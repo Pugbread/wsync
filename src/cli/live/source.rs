@@ -41,8 +41,21 @@ pub struct Source {
 	targeting: Targeting,
 
 	/// Studio path, `/`-separated
-	#[arg(long, value_name = "STUDIO-PATH")]
-	path: String,
+	#[arg(
+		long,
+		value_name = "STUDIO-PATH",
+		required_unless_present = "positional_path",
+		conflicts_with = "positional_path"
+	)]
+	path: Option<String>,
+
+	/// Studio path (positional alternative to --path)
+	#[arg(value_name = "STUDIO-PATH")]
+	positional_path: Option<String>,
+
+	/// Save source only after a successful read, replacing the file atomically
+	#[arg(short, long, value_name = "FILE")]
+	output: Option<PathBuf>,
 
 	/// Read the file backing the instance on disk instead of live Studio
 	#[arg(long)]
@@ -55,32 +68,45 @@ pub struct Source {
 
 impl Source {
 	pub fn main(self) -> Result<()> {
+		let path = self
+			.path
+			.as_deref()
+			.or(self.positional_path.as_deref())
+			.context("A Studio path is required")?;
 		if self.disk {
-			return self.read_disk();
+			return self.read_disk(path);
 		}
 
 		let client = Client::connect(&self.targeting)?;
-		let value = client.value("get", json!({ "path": self.path, "prop": "Source" }), self.raw)?;
+		let value = client.value("get", json!({ "path": path, "prop": "Source" }), self.raw)?;
 
 		let source = match &value {
 			Value::String(source) => source.clone(),
-			Value::Null => bail!("{} has no readable Source property", self.path),
+			Value::Null => bail!("{path} has no readable Source property"),
 			// A codec-tagged value means the property is not a plain string
-			other => bail!("Source of {} is not a string value: {other}", self.path),
+			other => bail!("Source of {path} is not a string value: {other}"),
 		};
+		if let Some(output) = &self.output {
+			write_source(output, &source)?;
+		}
 
 		if self.raw {
 			print_json(&json!({
 				"ok": true,
-				"path": self.path,
+				"path": path,
 				"from": "studio",
 				"file": null,
 				"source": source,
+				"output": self.output,
 			}));
 
 			return Ok(());
 		}
 
+		if let Some(output) = &self.output {
+			println!("{}", output.display());
+			return Ok(());
+		}
 		print!("{source}");
 
 		if !source.ends_with('\n') {
@@ -92,7 +118,7 @@ impl Source {
 
 	/// Resolves the instance through the project's middleware projection and
 	/// prints the file backing it
-	fn read_disk(self) -> Result<()> {
+	fn read_disk(&self, path: &str) -> Result<()> {
 		let target = Target::resolve(&self.targeting)?;
 
 		if !target.project_exists {
@@ -106,23 +132,31 @@ impl Source {
 
 		let project = Project::load(&target.project_path)?;
 		let core = Core::new(project, false)?;
-		let file = resolve_file(&core, &self.path)?;
+		let file = resolve_file(&core, path)?;
 
 		let source = fs::read_to_string(&file)
 			.with_context(|| format!("Failed to read {} (is it a binary model file?)", file.to_string()))?;
+		if let Some(output) = &self.output {
+			write_source(output, &source)?;
+		}
 
 		if self.raw {
 			print_json(&json!({
 				"ok": true,
-				"path": self.path,
+				"path": path,
 				"from": "disk",
 				"file": file.to_string(),
 				"source": source,
+				"output": self.output,
 			}));
 
 			return Ok(());
 		}
 
+		if let Some(output) = &self.output {
+			println!("{}", output.display());
+			return Ok(());
+		}
 		print!("{source}");
 
 		if !source.ends_with('\n') {
@@ -131,6 +165,23 @@ impl Source {
 
 		Ok(())
 	}
+}
+
+fn write_source(output: &std::path::Path, source: &str) -> Result<()> {
+	use std::io::Write;
+	let temp = output.with_file_name(format!(".wsync-source-{}.tmp", uuid::Uuid::new_v4()));
+	let result = (|| -> Result<()> {
+		let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+		file.write_all(source.as_bytes())?;
+		file.sync_all()?;
+		drop(file);
+		fs::rename(&temp, output)?;
+		Ok(())
+	})();
+	if result.is_err() {
+		let _ = fs::remove_file(&temp);
+	}
+	result.with_context(|| format!("Failed to save source to {}", output.display()))
 }
 
 /// Walks the project's projected tree by Studio path segments and returns

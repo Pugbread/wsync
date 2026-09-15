@@ -2,7 +2,7 @@
 //! (set.json, new.json, rm.json, mv.json, attr.json, tag.json, call.json,
 //! eval.json; Design §10.2, §10.6).
 //!
-//! These are user-initiated escape hatches, never autonomous tools, so the
+//! These operations follow the user's authorized task scope. Their
 //! guardrails are enforced twice — once here, before a socket is opened, and
 //! once again in the plugin (Remote/WriteRules). The CLI half is what makes a
 //! refusal *free*: nothing is sent, so nothing can half-apply.
@@ -30,6 +30,7 @@ use std::{fs, path::PathBuf};
 
 use crate::{
 	cli::client::{clip, field, human_value, kind_of, parse_literal, print_ok, Client, Targeting},
+	cli::{source_input::SourceInput, value_schema},
 	wsync_info, wsync_warn,
 };
 
@@ -39,6 +40,7 @@ use crate::{
 
 /// Set one property, or apply a batch of property writes, in Studio
 #[derive(Parser)]
+#[command(after_help = value_schema::help())]
 pub struct Set {
 	#[command(flatten)]
 	targeting: Targeting,
@@ -53,7 +55,7 @@ pub struct Set {
 
 	/// Value as a JSON literal or tagged value; bare text that is not valid
 	/// JSON is taken as a string
-	#[arg(long, value_name = "JSON", conflicts_with = "batch")]
+	#[arg(long, value_name = "JSON", conflicts_with = "batch", allow_hyphen_values = true)]
 	value: Option<String>,
 
 	/// Apply a JSON array of `{path, prop, value}` writes from this file
@@ -116,6 +118,7 @@ impl Set {
 		}
 
 		let value = parse_literal(literal);
+		value_schema::validate_cli(&value, self.raw)?;
 
 		// Also pre-network: a Name that breaks the path grammar is refused
 		// before a socket is opened (the plugin refuses it again)
@@ -241,10 +244,15 @@ impl Set {
 				}
 			}
 
+			let value = entry
+				.get("value")
+				.context("Each --batch entry needs a value field (use null explicitly to clear it)")?;
+			value_schema::validate_cli(value, self.raw)
+				.map_err(|error| anyhow::anyhow!("Invalid value in --batch entry {number}: {error}"))?;
 			writes.push(BatchWrite {
 				path: path.to_owned(),
 				prop: prop.to_owned(),
-				value: entry.get("value").cloned().unwrap_or(Value::Null),
+				value: value.clone(),
 			});
 		}
 
@@ -269,7 +277,9 @@ impl Set {
 		}
 
 		let client = Client::connect(&self.targeting)?;
-		let value = client.value("set_batch", args, self.raw)?;
+		let envelope = client.request("set_batch", args)?;
+		let meta = envelope.body.get("meta").cloned();
+		let value = envelope.into_value(self.raw)?;
 
 		let empty = Vec::new();
 		let results = value.get("results").and_then(Value::as_array).unwrap_or(&empty);
@@ -279,7 +289,18 @@ impl Set {
 			.unwrap_or_else(|| results.iter().filter(|result| !result_ok(result)).count() as u64);
 
 		if self.raw {
-			print_ok(&value);
+			let mut result = json!({ "ok": failed == 0 });
+			if let Some(fields) = value.as_object() {
+				for (key, value) in fields {
+					if key != "ok" {
+						result[key] = value.clone();
+					}
+				}
+			}
+			if let Some(meta) = meta {
+				result["meta"] = meta;
+			}
+			crate::cli::client::print_json(&result);
 		} else {
 			report_batch(&writes, results, &value);
 		}
@@ -458,6 +479,7 @@ fn report_batch(writes: &[BatchWrite], results: &[Value], value: &Value) {
 
 /// Create a new instance under a live Studio parent
 #[derive(Parser)]
+#[command(after_help = value_schema::help())]
 pub struct New {
 	#[command(flatten)]
 	targeting: Targeting,
@@ -512,6 +534,7 @@ impl New {
 		}
 
 		if let Some(props) = &props {
+			value_schema::validate_cli(props, self.raw)?;
 			if let Some(name) = props.get("Name").and_then(Value::as_str) {
 				screen_name(name, "for Name in --props")?;
 			}
@@ -679,6 +702,7 @@ fn name_service(service: &str) -> &str {
 
 /// List, set, or remove attributes on a live Studio instance
 #[derive(Parser)]
+#[command(after_help = value_schema::help())]
 pub struct Attr {
 	#[command(subcommand)]
 	command: AttrCommand,
@@ -691,10 +715,12 @@ enum AttrCommand {
 	/// Clear one attribute
 	Rm(AttrRm),
 	/// List every attribute on an instance (read-only)
+	#[command(visible_alias = "list")]
 	Ls(AttrLs),
 }
 
 #[derive(Parser)]
+#[command(after_help = value_schema::help())]
 struct AttrSet {
 	#[command(flatten)]
 	targeting: Targeting,
@@ -709,7 +735,7 @@ struct AttrSet {
 
 	/// Value as a JSON literal or tagged value; bare text that is not valid
 	/// JSON is taken as a string
-	#[arg(long, value_name = "JSON")]
+	#[arg(long, value_name = "JSON", allow_hyphen_values = true)]
 	value: String,
 
 	/// Print machine-readable JSON
@@ -761,14 +787,16 @@ impl Attr {
 
 impl AttrSet {
 	fn main(self) -> Result<()> {
-		let client = Client::connect(&self.targeting)?;
+		let input = parse_literal(&self.value);
+		value_schema::validate_cli(&input, self.raw)?;
 
 		let args = json!({
 			"path": self.path,
 			"name": self.name,
-			"value": parse_literal(&self.value),
+			"value": input,
 		});
 
+		let client = Client::connect(&self.targeting)?;
 		let value = client.value("set_attr", args, self.raw)?;
 
 		if self.raw {
@@ -972,6 +1000,7 @@ impl TagRm {
 
 /// Invoke a method on a live Studio instance
 #[derive(Parser)]
+#[command(after_help = value_schema::help())]
 pub struct Call {
 	#[command(flatten)]
 	targeting: Targeting,
@@ -1015,6 +1044,7 @@ impl Call {
 		let mut args = json!({ "path": self.path, "method": self.method });
 
 		if let Some(call_args) = call_args {
+			value_schema::validate_cli(&call_args, self.raw)?;
 			args["args"] = call_args;
 		}
 
@@ -1042,9 +1072,8 @@ pub struct Eval {
 	#[command(flatten)]
 	targeting: Targeting,
 
-	/// Luau source; use `return …` when you need a value back
-	#[arg(long, value_name = "LUAU")]
-	source: String,
+	#[command(flatten)]
+	source: SourceInput,
 
 	/// Print machine-readable JSON
 	#[arg(long)]
@@ -1053,8 +1082,9 @@ pub struct Eval {
 
 impl Eval {
 	pub fn main(self) -> Result<()> {
+		let source = self.source.read()?;
 		let client = Client::connect(&self.targeting)?;
-		let value = client.value("eval", json!({ "source": self.source }), self.raw)?;
+		let value = client.value("eval", json!({ "source": source }), self.raw)?;
 
 		if self.raw {
 			print_ok(&value);

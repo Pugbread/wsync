@@ -1,19 +1,12 @@
 //! Daemon-side op tests (registry contracts `path`, `meta`, `where`): the
-//! request router answers these from the live tree without any plugin, and
-//! `GET /choice/source` serves both sides of a pending divergence row.
+//! request router answers these from the live tree without any plugin.
 
 mod common;
 
 use serde_json::{json, Value};
-use std::{collections::HashMap, fs, time::Duration};
+use std::time::Duration;
 
-use common::{child_ref_in, get_json, post_json, spawn_fake_plugin, start_daemon, FakePluginScript, TestDaemon};
-
-const SETTLE: Duration = Duration::from_millis(600);
-
-/// A well-formed ref no daemon-side instance ever has
-const STUDIO_ONLY_REF: &str = "ffffffffffffffffffffffffffffffff";
-const STUDIO_ONLY_REF_2: &str = "fffffffffffffffffffffffffffffffe";
+use common::{post_json, start_daemon, TestDaemon};
 
 async fn request(daemon: &TestDaemon, op: &str, args: Value) -> (reqwest::StatusCode, Value) {
 	post_json(daemon, "/request", &json!({ "op": op, "args": args })).await
@@ -123,31 +116,3 @@ async fn path_meta_and_where_answer_without_a_plugin() {
 	assert_eq!(reply["ok"], false);
 	assert_eq!(reply["error"]["code"], "PLUGIN_ERROR");
 }
-
-/// Uploads a four-row divergence set: add (script), update (script), remove
-/// (folder — not script-backed), remove (script)
-async fn commit_source_set(daemon: &TestDaemon, mod_a: &str, hello: &str) -> String {
-	let (status, receipt) = post_json(
-		daemon,
-		"/compare",
-		&json!({
-			"submissionId": "sub-source",
-			"chunkIndex": 0,
-			"finalChunk": true,
-			"entries": [
-				{ "ref": mod_a, "change": "add", "class": "ModuleScript", "name": "ModA", "instancePath": "ReplicatedStorage/ModA" },
-				{ "ref": hello, "change": "update", "class": "ModuleScript", "name": "Hello", "instancePath": "ReplicatedStorage/Hello" },
-				{ "ref": STUDIO_ONLY_REF, "change": "remove", "class": "Folder", "name": "StudioOnly", "instancePath": "ReplicatedStorage/StudioOnly" },
-				{ "ref": STUDIO_ONLY_REF_2, "change": "remove", "class": "ModuleScript", "name": "GoneScript", "instancePath": "ReplicatedStorage/GoneScript" },
-			],
-		}),
-	)
-	.await;
-
-	assert_eq!(status, 200);
-	assert_eq!(receipt["committed"], true);
-
-	receipt["choiceId"].as_str().unwrap().to_owned()
-}
-
-

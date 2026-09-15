@@ -11,8 +11,10 @@
 //! status from config and disk facts alone.
 
 use anyhow::{bail, Result};
-use clap::Parser;
-use serde_json::{json, Map, Value};
+use clap::{CommandFactory, Parser};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::{fs, path::PathBuf};
 
 use crate::{
 	cli::client::{print_json, Client, Target, Targeting},
@@ -25,64 +27,151 @@ use crate::{
 // commands
 // ---------------------------------------------------------------------------
 
-/// Print generated command docs as JSON: the full registry, one command, or a
-/// compact index
+/// Print compact command discovery, focused command help, or offline value schemas
 #[derive(Parser)]
 pub struct Commands {
-	/// Print only this command's registry entry
-	#[arg(value_name = "COMMAND")]
-	name: Option<String>,
+	/// Command and optional nested subcommand; `types [TypeName]` discovers JSON values
+	#[arg(value_name = "COMMAND", num_args = 0..)]
+	name: Vec<String>,
 
-	/// Print the compact index (name and description per category) instead of
-	/// complete entries
-	#[arg(long)]
+	/// Print only choosing fields (the default for the command index)
+	#[arg(long, conflicts_with = "full")]
 	compact: bool,
+
+	/// Explicitly print the complete embedded registry
+	#[arg(long)]
+	full: bool,
+
+	/// Accepted for consistent project-scoped invocations; discovery remains offline
+	#[arg(long, value_name = "PATH")]
+	project: Option<PathBuf>,
 }
 
 impl Commands {
 	pub fn main(self) -> Result<()> {
-		// The full dump is the embedded file verbatim (commands.json), so the
-		// bytes agents read match the published docs exactly
-		if self.name.is_none() && !self.compact {
+		let names: Vec<&str> = self.name.iter().flat_map(|name| name.split_whitespace()).collect();
+		if self.full {
+			if !names.is_empty() {
+				bail!("Use `wsync commands --full` without a command name");
+			}
 			print!("{}", registry_bundle::CLIENT_COMMANDS);
-
 			if !registry_bundle::CLIENT_COMMANDS.ends_with('\n') {
 				println!();
 			}
-
 			return Ok(());
 		}
-
 		let Some(bundle) = registry_bundle::parsed() else {
 			bail!("The embedded command registry does not parse — this binary was built from a broken docs bundle");
 		};
-
+		if names
+			.first()
+			.is_some_and(|name| matches!(*name, "types" | "values" | "value-types"))
+		{
+			let payload = match names.as_slice() {
+				[_] => super::value_schema::catalog(),
+				[_, name] => super::value_schema::lookup(name).ok_or_else(|| {
+					anyhow::anyhow!("Unknown value type `{name}` — run `wsync commands types` for supported tags")
+				})?,
+				_ => bail!("Usage: wsync commands types [TypeName]"),
+			};
+			println!("{}", serde_json::to_string_pretty(&payload)?);
+			return Ok(());
+		}
 		let empty = Vec::new();
 		let commands = bundle.get("commands").and_then(Value::as_array).unwrap_or(&empty);
-
-		if let Some(name) = &self.name {
+		if let Some(name) = names.first() {
 			let Some(entry) = commands
 				.iter()
-				.find(|entry| entry.get("name").and_then(Value::as_str) == Some(name.as_str()))
+				.find(|entry| entry.get("name").and_then(Value::as_str) == Some(name))
 			else {
 				bail!("No command named `{name}` in the registry — run `wsync commands --compact` for the index");
 			};
-
-			let payload = if self.compact {
+			let payload = if names.len() > 1 {
+				{
+					let nested = nested_entry(entry, &names)?;
+					if self.compact {
+						compact_entry(&nested)
+					} else {
+						nested
+					}
+				}
+			} else if self.compact {
 				compact_entry(entry)
 			} else {
 				entry.clone()
 			};
-
 			println!("{}", serde_json::to_string_pretty(&payload)?);
-
 			return Ok(());
 		}
-
 		println!("{}", serde_json::to_string_pretty(&compact_index(&bundle, commands))?);
-
 		Ok(())
 	}
+}
+
+/// Follow the real clap tree, so nested discovery cannot describe an invented path.
+fn nested_entry(entry: &Value, path: &[&str]) -> Result<Value> {
+	let mut command = super::Cli::command();
+	command.build();
+	let mut parent_options = Vec::new();
+	for (index, part) in path.iter().enumerate() {
+		if index > 0 {
+			for arg in command.get_arguments().filter(|arg| !arg.is_global_set()) {
+				parent_options.push(json!({ "scope": format!("wsync {}", path[..index].join(" ")), "long": arg.get_long(), "short": arg.get_short(), "help": arg.get_help().map(ToString::to_string), "position": "before the next subcommand" }));
+			}
+		}
+		let next_command = command
+			.get_subcommands()
+			.find(|child| child.get_name() == *part)
+			.cloned()
+			.ok_or_else(|| {
+				anyhow::anyhow!(
+					"No subcommand `{}` — run `wsync commands {}` for valid commands",
+					path.join(" "),
+					path[0]
+				)
+			})?;
+		command = next_command;
+	}
+	let invocation = format!("wsync {}", path.join(" "));
+	command = command.bin_name(&invocation);
+	let subpath = path[1..].join(" ");
+	let examples: Vec<Value> = entry
+		.get("examples")
+		.and_then(Value::as_array)
+		.into_iter()
+		.flatten()
+		.filter(|example| {
+			example
+				.as_str()
+				.is_some_and(|example| example == invocation || example.starts_with(&format!("{invocation} ")))
+		})
+		.cloned()
+		.collect();
+	Ok(json!({
+		"name": path.join(" "),
+		"category": entry.get("category"),
+		"description": command.get_about().map(ToString::to_string),
+		"usage": command.render_usage().to_string().trim_start_matches("Usage: "),
+		"help": command.render_long_help().to_string(),
+		"effects": entry.get("subcommandMetadata").and_then(|metadata| metadata.get(&subpath)),
+		"subcommands": command.get_subcommands().filter(|child| child.get_name() != "help").map(|child| child.get_name()).collect::<Vec<_>>(),
+		"examples": examples,
+		"parentOptions": parent_options,
+		"notes": entry.get("notes"),
+		"registryIdentity": registry_identity(),
+	}))
+}
+
+/// No network or runtime probing: identifies the exact embedded schema and build.
+fn registry_identity() -> Value {
+	json!({
+		"cliVersion": env!("CARGO_PKG_VERSION"),
+		"commit": env!("WSYNC_BUILD_COMMIT"),
+		"dirty": env!("WSYNC_BUILD_DIRTY") == "true",
+		"schemaVersion": registry_bundle::parsed().and_then(|bundle| bundle.get("schemaVersion").cloned()),
+		"commandFingerprint": format!("sha256:{:x}", Sha256::digest(registry_bundle::CLIENT_COMMANDS.as_bytes())),
+		"valueFingerprint": format!("sha256:{:x}", Sha256::digest(include_str!("../../docs/value-types.json").as_bytes())),
+	})
 }
 
 /// One command reduced to the fields that pick it out of a family
@@ -134,7 +223,8 @@ fn compact_index(bundle: &Value, commands: &[Value]) -> Value {
 
 	json!({
 		"total": commands.len(),
-		"hint": "run `wsync commands <name>` for one command's full usage",
+		"hint": "Use `wsync commands <name> [subcommand...]` for focused usage; `wsync commands types [TypeName]` for value schemas; `wsync commands --full` for the full registry",
+		"registryIdentity": registry_identity(),
 		"categories": grouped,
 	})
 }
@@ -213,24 +303,13 @@ impl Context {
 			None => json!({ "connected": false, "reason": "no daemon to ask" }),
 		};
 
-		// Conflict count from `GET /resolve`; a daemon build without the
-		// endpoint (or no daemon at all) is `null` — "not answerable", which
-		// is different from zero
-		let conflicts = client.as_ref().and_then(|client| {
-			let endpoint = client.get_endpoint("/resolve").ok()?;
-
+		// Read-only backlog snapshot; unavailable/mismatched daemon remains unknown.
+		let backlog = client.as_ref().and_then(|client| {
+			let endpoint = client.get_endpoint("/backlog").ok()?;
 			if endpoint.unavailable() {
 				return None;
 			}
-
-			let count = endpoint
-				.json
-				.as_ref()?
-				.get("conflicts")
-				.and_then(Value::as_array)
-				.map(Vec::len)?;
-
-			Some(count)
+			endpoint.json.as_ref()?.get("entries")?.as_array().map(Vec::len)
 		});
 
 		let workspace = target.project_path.get_parent();
@@ -243,7 +322,8 @@ impl Context {
 			json!({
 				"index": "wsync commands --compact",
 				"command": "wsync commands <name>",
-				"fullRegistry": "wsync commands (full dump — explicit user request only)",
+				"fullRegistry": "wsync commands --full",
+				"valueSchemas": "wsync commands types [TypeName]",
 			})
 		};
 
@@ -251,6 +331,7 @@ impl Context {
 			"ok": true,
 			"project": {
 				"path": target.project_path.to_string(),
+				"canonicalPath": target.canonical,
 				"exists": target.project_exists,
 				"parses": project.is_some(),
 				"name": project.as_ref().map(|project| project.name.clone()),
@@ -260,7 +341,9 @@ impl Context {
 			"syncedRoots": project.as_ref().map(synced_roots).unwrap_or_default(),
 			"daemon": daemon,
 			"plugin": plugin,
-			"conflicts": conflicts,
+			"backlog": { "entries": backlog, "readOnly": true },
+			"registryIdentity": registry_identity(),
+			"instructionBudget": instruction_budget(&workspace.join("AGENTS.md")),
 			"generatedDocs": {
 				"wsync.md": generated("wsync.md"),
 				"AGENTS.md": generated("AGENTS.md"),
@@ -316,49 +399,36 @@ fn collect_roots(node: &ProjectNode, prefix: &str, roots: &mut Vec<Value>) {
 /// The LLM-first command budget (Design §10.6), embedded so agents that read
 /// only `context` still get steered
 fn llm_policy() -> Value {
-	let mut policy = Map::new();
+	json!({
+		"budget": [
+			"Reuse known context; fetch context only when required project or connection facts are missing/stale, and refresh after project/config/binary changes or reconnects.",
+			"No startup ritual: prefer local reads, focused live inspection, and narrow `wsync lint --path` verification.",
+			"Use `wsync commands --compact` for discovery, `wsync commands <name> [subcommand...]` for exact syntax/effects, and `wsync commands types <TypeName>` for offline value schemas.",
+			"--project selects the project; file inputs remain relative to the shell working directory unless a flag explicitly documents otherwise. Prefer absolute files across directories.",
+			"After one schema/syntax error consult the relevant command/type schema; do not guess alternate JSON forms.",
+			"Studio is authoritative for live objects; local mapped source is the normal editing surface. Preserve canonical project path, target paths, schema identity, completed edits and outstanding operation IDs in handoffs."
+		],
+		"writes": [
+			"Use existing user authorization within scope; inspect exact targets when needed. Ask only for material ambiguity or additional destructive/external effects beyond that scope.",
+			"One agent owns shared Studio playtest/eval/capture lifecycle. Coordinate live writes; parallelize independent file work.",
+			"Use supported waypoints for grouped undo; reparent with `wsync mv`, not raw `set Parent`.",
+			"Non-zero/timeout is not proof of no effect. Check completion/operation receipts and actual targets before retrying partial or unknown writes. Treat stdout as data only after validating success."
+		],
+		"reference": "wsync.md",
+	})
+}
 
-	policy.insert(
-		"budget".to_owned(),
-		json!([
-			"Run `wsync context` once, and only when project context is not already in AGENTS.md.",
-			"Prefer local file reads and cheap offline commands for normal code work.",
-			"Use focused live reads (`tree --depth`, `ls`, `meta`, `get --prop`) for Explorer shape and \
-			 Studio-owned objects — the live tree is authoritative; the disk view is narrower by design.",
-			"Use `wsync commands --compact` only when choosing between command families and \
-			 `wsync commands <name>` only for the command about to be run; dump the full registry \
-			 only on explicit user request.",
-			"Disk-only inference never overrides live Studio reads.",
-			"Before mutating Studio: inspect the exact live target with read-only commands, then confirm \
-			 explicit user intent. `plan` is available for dry-run explanations but is not a mandatory ritual.",
-			"Order reads by cost: cheap-first discovery (`context`, `status --raw`, `query --format paths`, \
-			 `path`, `meta`) before targeted reads (`tree --depth`, `ls`, `props`, `get --prop`) before \
-			 higher-token reads (`changes`, wide `tree`, `find`, `logs --limit`) before backup/debug reads \
-			 (`snapshot`).",
-			"Do not run `diff`, `changes`, `conflicts`, or live `source` as a startup ritual: `source` is a \
-			 loose divergence diagnostic, not a verification step; `conflicts` is for resolving observed \
-			 conflicts, not a health poll; `changes`/`diff` are noisy on drifty projects.",
-			"Post-edit verification is the narrowest `wsync lint --path` plus a local file read, never \
-			 unrelated global diff output.",
-		]),
-	);
-
-	policy.insert(
-		"writes".to_owned(),
-		json!([
-			"Bracket multi-write changes with `--waypoint <name>` so one Studio undo reverses the batch.",
-			"`set Parent` is refused — reparent with `wsync mv`; `--force-parent` exists only for an \
-			 intentional single raw assignment, and batches have no escape.",
-		]),
-	);
-
-	policy.insert(
-		"safety".to_owned(),
-		json!(
-			"Live mutating commands are user-initiated escape hatches, never autonomous tools; \
-			 every write is audited to writes.log."
-		),
-	);
-
-	Value::Object(policy)
+fn instruction_budget(path: &std::path::Path) -> Value {
+	match fs::read_to_string(path) {
+		Ok(text) => json!({
+			"file": "AGENTS.md", "bytes": text.len(),
+			"generatedBudgetBytes": crate::docsgen::AGENT_CONTRACT_MAX_BYTES,
+			"warningThresholdBytes": crate::docsgen::AGENT_FILE_WARNING_BYTES,
+			"warning": crate::docsgen::agent_size_warning(&text),
+		}),
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+			json!({ "file": "AGENTS.md", "bytes": null, "warning": null })
+		}
+		Err(error) => json!({ "file": "AGENTS.md", "bytes": null, "warning": error.to_string() }),
+	}
 }

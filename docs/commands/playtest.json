@@ -139,7 +139,9 @@
     "wsync playtest input --project . --context client:1 --file ./input-actions.json --raw",
     "wsync playtest capture --project . --context client:1 --output ./captures/client-1.png --raw",
     "wsync playtest clip --project . --context client:1 --seconds 8 --output ./captures/client-1.mp4 --raw",
-    "wsync playtest stop --project . --raw"
+    "wsync playtest stop --project . --raw",
+    "wsync playtest logs --project . --job job-id --context client:1 --since-seq 42 --raw",
+    "wsync playtest wait --project . --job job-id --context client:1 --timeout 30 --raw"
   ],
   "notes": [
     "`run --script <file>` owns the complete foreground lifecycle: it starts a Studio playtest, waits for the selected `--context` (`server` by default), injects the playscript, streams progress, prints the return value, and stops the playtest without another WSync invocation.",
@@ -154,6 +156,12 @@
     "`--identity game` is the default and runs through a temporary Script/LocalScript in the disposable playtest clone. Plugin identity is an explicit escape hatch in the plugin sandbox and cannot require game modules.",
     "All runtime changes are temporary and never sync to disk or persist to edit mode. Play and Run DataModels are a separate environment and never reverse-sync. Run coordination is authenticated with the private job generation token. The start audit record includes script paths and SHA-256 hashes; the completion record includes the outcome and exit code.",
     "`start` returns a lower-level asynchronous job. Use `--wait`, `playtest wait`, `status`, and `contexts` to synchronize with `server` and `client:N`; the low-level commands remain supported and unchanged.",
-    "Runtime copies communicate only with the edit-mode plugin through PluginConnectionService. They do not connect to localhost. `playtest capture --context client:N -o FILE` writes one PNG and `playtest clip --context client:N --seconds 1-30 -o FILE` writes one MP4; both take a PlayClient context only, because the PlayServer renders no viewport. A running experience cannot read a screenshot back into pixels, so the engine writes each frame into Roblox's capture directory and the local CLI copies it out and deletes it — no screenshot permission is requested and no artifact is uploaded from Studio."
+    "Runtime copies communicate only with the edit-mode plugin through PluginConnectionService. They do not connect to localhost. `playtest capture --context client:N -o FILE` writes one PNG and `playtest clip --context client:N --seconds 1-30 -o FILE` writes one MP4; both take a PlayClient context only, because the PlayServer renders no viewport. A running experience cannot read a screenshot back into pixels, so the engine writes each frame into Roblox's capture directory and the local CLI copies it out and deletes it — no screenshot permission is requested and no artifact is uploaded from Studio.",
+    "playtest exec accepts exactly one of --source, --source-file or --stdin; --source-file - also reads stdin. Leading Luau comments are accepted inline. --timeout for exec is 1-60 seconds (other playtest operations have separate bounds).",
+    "playtest exec prints the runtime value/count result and exits nonzero when the submitted source fails, even if delivery succeeded. Earlier source mutations may have applied before that error.",
+    "Existing-job operations accept --job <ID>: status, contexts, wait, exec, logs, ui, input, capture, clip, stop, and request. A stale generation cannot select or mutate a newer runtime. Pin the job returned by start when coordinating multiple agents. start itself creates a new generation and rejects --job.",
+    "wait --context client:1 waits for that exact context to be ready; a different ready context does not satisfy it. start --wait pins its own returned job ID.",
+    "Exec results always include count. Returns without nil use value (one value or a dense array); returns containing nil use results with indexed slots {index:1,value:...} or {index:2,isNil:true}. Each returned value is serialized once so ordinary results retain the full 1 MiB envelope capacity.",
+    "The exec source timeout is separate from its request deadline: WSync reserves an additional 45 seconds for dispatch and multipart result transfer, so a valid near-deadline script is not cut off while returning its result."
   ]
 }

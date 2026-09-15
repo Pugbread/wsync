@@ -179,8 +179,8 @@ jobs:
             --output "$archive" \
             "https://github.com/luau-lang/luau/releases/download/${LUAU_VERSION}/luau-ubuntu.zip"
           echo "${LUAU_UBUNTU_SHA256}  ${archive}" | sha256sum --check --strict
-          unzip -o -j "$archive" luau-compile -d "${RUNNER_TEMP}/luau"
-          chmod +x "${RUNNER_TEMP}/luau/luau-compile"
+          unzip -o -j "$archive" luau luau-compile -d "${RUNNER_TEMP}/luau"
+          chmod +x "${RUNNER_TEMP}/luau/luau" "${RUNNER_TEMP}/luau/luau-compile"
 
       # --require-compiler turns the local-developer SKIP into a failure: having
       # just downloaded and checksummed a compiler, "no compiler found" can only
@@ -190,6 +190,20 @@ jobs:
           node scripts/check-luau-bytecode.mjs
           --luau-compile "${RUNNER_TEMP}/luau/luau-compile"
           --require-compiler
+
+      # The syncback core (Watcher → ReadProcessor → Tree) decides which files
+      # a Studio move or delete removes; plugin/tests/*.luau run the real
+      # modules over a fake DataModel with the same pinned release's `luau`.
+      - name: Run the syncback scenarios over the real plugin modules
+        run: >
+          node scripts/check-plugin-syncback.mjs
+          --luau "${RUNNER_TEMP}/luau/luau"
+          --require-luau
+
+      - name: Validate tagged values and runtime return transport
+        run: |
+          node scripts/check-value-codec.mjs --luau "${RUNNER_TEMP}/luau/luau" --require-luau
+          node scripts/check-playtest-results.mjs --luau "${RUNNER_TEMP}/luau/luau" --require-luau
 
       # TODO (needs tooling this job does not install): selene lint and
       # stylua --check, both already pinned in plugin/aftman.toml. The
