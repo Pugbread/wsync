@@ -26,7 +26,7 @@ use std::{
 };
 
 use crate::{
-	cli::client::{print_json, Client, Targeting},
+	cli::client::{path_arg, print_json, Client, Targeting},
 	cli::live::transfer::{self, human_size, sha256_hex},
 	ext::PathExt,
 	wsync_info,
@@ -101,6 +101,10 @@ struct CaptureUi {
 	#[arg(value_name = "TARGET", conflicts_with = "region")]
 	target: Option<String>,
 
+	/// TARGET as a flag (the named form of the positional target)
+	#[arg(long, value_name = "TARGET", conflicts_with = "region")]
+	path: Option<String>,
+
 	/// Explicit rectangle in native viewport pixels, as x,y,width,height
 	#[arg(long, value_name = "X,Y,W,H")]
 	region: Option<String>,
@@ -135,10 +139,15 @@ impl View {
 }
 
 #[derive(Parser)]
+#[command(group(clap::ArgGroup::new("studio_path").required(true).multiple(true).args(["path", "target"])))]
 struct CaptureModel {
 	/// Studio path of the model or instance to capture
 	#[arg(value_name = "TARGET")]
-	target: String,
+	target: Option<String>,
+
+	/// TARGET as a flag (the named form of the positional target)
+	#[arg(long, value_name = "TARGET")]
+	path: Option<String>,
 
 	/// Camera view preset
 	#[arg(long, value_enum, value_name = "PRESET", conflicts_with = "camera_cframe")]
@@ -223,7 +232,9 @@ impl CaptureUi {
 		insert_size(&mut options, self.common.size.as_deref())?;
 		insert_region(&mut options, self.region.as_deref())?;
 
-		run("ui", self.target, options, self.common)
+		let target = path_arg(self.path, self.target)?;
+
+		run("ui", target, options, self.common)
 	}
 }
 
@@ -283,7 +294,9 @@ impl CaptureModel {
 			}
 		}
 
-		run("model", Some(self.target), options, self.common)
+		let target = path_arg(self.path, self.target)?.context("A model path is required")?;
+
+		run("model", Some(target), options, self.common)
 	}
 }
 

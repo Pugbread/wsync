@@ -135,13 +135,6 @@
       "reason": "Provenance of the new-instance apply order (props while unparented, parent late, Source after parenting) — an ordering that exists because UpdateSourceAsync requires a rooted script. Naming the source marks it deliberate. Comment only."
     },
     {
-      "path": "src/cli/live/write.rs",
-      "token": "ro-sync",
-      "contains": "exactly like Ro-Sync: a dropped marker costs undo labelling",
-      "max": 1,
-      "reason": "Provenance of the single-write --waypoint semantics: the pre-write marker is best-effort (warn on failure, never block the write) because the plugin auto-seals every mutation — the reference established that failure mode split. Comment only."
-    },
-    {
       "path": "plugin/src/Remote/Capture/init.luau",
       "token": "ro-sync",
       "contains": "Ro-Sync's Photo engine",

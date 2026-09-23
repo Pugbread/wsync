@@ -18,6 +18,7 @@
 -- into live syncback.
 
 local HttpService = game:GetService("HttpService")
+local ScriptEditorService = game:GetService("ScriptEditorService")
 
 local WSync = script:FindFirstAncestor("WSync")
 
@@ -32,14 +33,110 @@ local Hex = require(WSync.Transport.Hex)
 local Http = require(WSync.Transport.Http)
 local Paths = require(WSync.Remote.Paths)
 local generateRef = require(WSync.Helpers.generateRef)
+local Sha256 = require(WSync.Lib.Sha256)
 
 local Meta = require(script.Parent.Meta)
+local ReadProcessor = require(script.Parent.Processor.Read)
 local Protocol = require(script.Protocol)
 
 export type UploadOutcome = {
 	choiceId: string,
 	resolver: "app" | "plugin",
+	rehydrate: boolean?,
 }
+
+--- How many descendants of one Studio-only root the upload describes. Past
+--- this the daemon is told the list is truncated and keeps Studio's copy
+local MAX_DESCENDANTS = 1000
+
+--- SHA-256 of a script's LF-normalized editor source — the text live sync
+--- and the bulk pull would send (open drafts included), normalized the way
+--- the daemon hashes its files. nil for non-scripts or unreadable sources.
+local function sourceHashOf(instance: Instance): string?
+	local isScript = false
+
+	pcall(function()
+		isScript = instance:IsA("Script") or instance:IsA("LocalScript") or instance:IsA("ModuleScript")
+	end)
+
+	if not isScript then
+		return nil
+	end
+
+	local ok, source = pcall(function()
+		return ScriptEditorService:GetEditorSource(instance :: any)
+	end)
+
+	if not ok or type(source) ~= "string" then
+		ok, source = pcall(function()
+			return (instance :: any).Source
+		end)
+	end
+
+	if not ok or type(source) ~= "string" then
+		return nil
+	end
+
+	local normalized = (source :: string):gsub("\r\n", "\n")
+
+	return Sha256.hash(normalized)
+end
+
+--- The synced descendants of a Studio-only instance, relative to it. Mirrors
+--- what a bulk pull would carry: code scope keeps only the code classes, and
+--- excluded instances (`AvoidSync` / `--!ignoresync`) are skipped with their
+--- subtrees.
+local function descendantsOf(root: Instance): ({ Protocol.Descendant }, boolean)
+	local found: { Protocol.Descendant } = {}
+	local truncated = false
+	local codeScope = SyncScope.isCode()
+
+	local function walk(instance: Instance, prefix: string)
+		for _, child in instance:GetChildren() do
+			if truncated then
+				return
+			end
+
+			if codeScope and not SyncScope.isCodeClass(child.ClassName) then
+				continue
+			end
+
+			if ReadProcessor.isExcluded(child) then
+				continue
+			end
+
+			if #found >= MAX_DESCENDANTS then
+				truncated = true
+				return
+			end
+
+			local path = if prefix == "" then child.Name else `{prefix}/{child.Name}`
+
+			table.insert(found, {
+				path = path,
+				class = child.ClassName,
+				sourceSha256 = sourceHashOf(child),
+			})
+
+			walk(child, path)
+		end
+	end
+
+	local ok = pcall(walk, root, "")
+
+	return found, truncated or not ok
+end
+
+--- The place this Studio session is, for matching the daemon's sync base.
+--- An unpublished place (PlaceId 0) still reports itself: the daemon then
+--- only matches it against a base recorded by an unpublished place too.
+local function currentPlace(): Protocol.Place?
+	local ok, place = pcall(function()
+		return { placeId = game.PlaceId, gameId = game.GameId }
+	end)
+
+	return if ok then place else nil
+end
 
 export type ChoiceStatus = {
 	pending: boolean,
@@ -114,6 +211,12 @@ function Divergence:__buildEnv(): Protocol.Env
 
 			return if ok then path else nil
 		end,
+		sourceHashOf = function(instance: any): string?
+			return sourceHashOf(instance :: Instance)
+		end,
+		descendantsOf = function(instance: any): ({ Protocol.Descendant }, boolean)
+			return descendantsOf(instance :: Instance)
+		end,
 	}
 end
 
@@ -136,9 +239,10 @@ end
 --------------------------------------------------------------------------------
 
 --- Upload the local diff. Resolves an UploadOutcome (`choiceId` + the
---- daemon's `resolver` ruling), or nil when nothing was uploadable (every
---- record skipped — treated like the empty-diff fast path). Rejects with a
---- descriptive message after the single mismatch-restart is exhausted.
+--- daemon's `resolver` ruling, and whether to re-pair instances). An empty
+--- diff still uploads one empty chunk — that commit is how the daemon learns
+--- the sides agree. Rejects with a descriptive message after the single
+--- mismatch-restart is exhausted.
 function Divergence:upload(changes: Types.Changes)
 	return Promise.new(function(resolve, reject)
 		local mapped = Protocol.mapEntries(changes, self:__buildEnv())
@@ -160,14 +264,10 @@ function Divergence:upload(changes: Types.Changes)
 			end
 		end
 
-		if #mapped.entries == 0 then
-			return resolve(nil)
-		end
-
 		self:__setPendingRemovals(mapped.pendingRemovals)
 
 		local chunks = Protocol.planChunks(mapped.entries, measureEntry)
-		local upload = Protocol.newUpload(chunks, Util.generateGUID)
+		local upload = Protocol.newUpload(chunks, Util.generateGUID, currentPlace())
 		local url = `{self.baseUrl}/compare`
 
 		Log.trace(`Uploading divergence set: {#mapped.entries} entries in {#chunks} chunks`)
@@ -207,6 +307,7 @@ function Divergence:upload(changes: Types.Changes)
 				return resolve({
 					choiceId = verdict.choiceId,
 					resolver = verdict.resolver,
+					rehydrate = verdict.rehydrate,
 				} :: UploadOutcome)
 			elseif verdict.kind == "restart" then
 				-- Same entries (and the same minted refs), fresh submission id

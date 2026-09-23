@@ -26,6 +26,7 @@ local Capture = require(script.Parent.Capture)
 local Transmit = require(script.Parent.Transmit)
 local Clipboard = require(script.Parent.Clipboard)
 local PlaytestOps = require(script.Parent.Playtest)
+local SyncOps = require(script.Parent.Sync)
 
 type Args = { [string]: any }
 type Context = { protocol: number, pluginVersion: string, ops: { [string]: any } }
@@ -58,10 +59,8 @@ local CATALOG = {
 	"select_set",
 	"eval",
 	"logs",
-	"save",
 	"undo",
 	"redo",
-	"waypoint",
 	"version",
 	"ping",
 	"capabilities",
@@ -97,6 +96,9 @@ local CATALOG = {
 	"playtest_stop",
 	"playtest_run_cancel",
 	"open_in_editor",
+	"sync_barrier",
+	"verify_sources",
+	"verify_tree",
 }
 
 local Meta = {}
@@ -235,6 +237,11 @@ function Meta.ops.capabilities(_args: Args, ctx: Context)
 				runMaxTimeoutSec = PlaytestOps.LIMITS.runMaxTimeoutSec,
 				pollMaxRecords = PlaytestOps.LIMITS.pollMaxRecords,
 				waitMaxTimeoutMs = PlaytestOps.LIMITS.waitMaxTimeoutMs,
+			},
+			verify = {
+				maxEntries = SyncOps.LIMITS.verifyMaxEntries,
+				treeMaxLimit = SyncOps.LIMITS.treeMaxLimit,
+				treeMaxNodes = SyncOps.LIMITS.treeMaxNodes,
 			},
 		},
 		-- Path grammar (coordinator ruling): `/`-separated Studio names, no

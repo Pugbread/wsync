@@ -3,16 +3,20 @@
   "title": "wsync eval",
   "category": "Live writes",
   "description": "Executes Luau source inside Studio through the plugin sandbox and returns the result.",
-  "usage": "wsync eval [--project <path>] [--port <port>] (--source <luau> | --source-file <file> | --stdin) [--raw]",
+  "usage": "wsync eval [--project <path>] [--port <port>] (--source <luau> | --source-file <file> | --stdin) [--drafts] [--raw]",
   "examples": [
     "wsync eval --project . --source 'return Vector3.new(1, 2, 3)'",
     "wsync eval --project . --source-file ./scripts/probe.luau --raw",
-    "wsync eval --project . --stdin --raw"
+    "wsync eval --project . --stdin --raw",
+    "wsync eval --project . --drafts --source 'return require(game.ReplicatedStorage.Shared.Config)'"
   ],
   "notes": [
     "Use `return ...` when you need a returned value. Native Roblox globals such as Vector3.new, Color3.fromRGB, CFrame.new, UDim2.new, Enum, and Instance.new are available in Studio execution; the JSON wire tags are for set/new/attr/call arguments. Discover them offline with `wsync commands types`.",
     "Choose exactly one source input. `--source-file -` also reads stdin. Source file paths are relative to the shell working directory. Leading comments (including --!strict) are accepted by --source; file/stdin avoids shell quoting and argument length limits.",
     "`eval` is request/response against one connected Studio session and carries the standard 5 second remote-op timeout. `wsync exec` is the fire-and-forget broadcast form and acknowledges queuing only.",
-    "Use within the user-authorized task scope. A timeout or execution/encoding failure can follow earlier mutations; inspect affected state before retrying, and use the operation receipt when provided."
+    "Use within the user-authorized task scope. A timeout or execution/encoding failure can follow earlier mutations; inspect affected state before retrying, and use the operation receipt when provided.",
+    "Drafts caveat: WSync writes script text through `ScriptEditorService`, so it lands as editor/draft text, while an edit-mode `require` runs the committed `.Source`. A module WSync just wrote can therefore require as empty (\"Module code did not return exactly one value\") or run its previous code. Use `--drafts` to test what the editor shows.",
+    "`--drafts` gives the chunk a `require` that compiles every ModuleScript it reaches — directly or through other modules, including modules with no draft of their own — from its editor text (its `.Source` when there is no draft) and runs it with the real `script`, so `script.Parent` requires resolve. Nothing is committed and no instance is created. Each module runs at most once per eval, must return exactly one value, and a recursive require fails, as with `require`. The response adds `drafts: {modules, fromEditor?}` — the module count and the paths loaded from editor text that differed from `.Source`.",
+    "`--drafts` limits: only `require(<ModuleScript>)` sees drafts — string requires and asset ids use Studio's own `require` (committed sources), as does a module whose source cannot be read; each eval builds a fresh module graph, so module state is not shared with modules Studio already required or kept between evals; modules run as `loadstring` chunks (`--!native` is ignored, errors name the module by its full name). A plugin that predates `--drafts` ignores it, and the CLI warns."
   ]
 }

@@ -2,13 +2,14 @@
   "name": "daemon",
   "title": "wsync daemon",
   "category": "Daemon",
-  "description": "Starts, inspects, stops, restarts or reads logs from a project-scoped daemon with a lifecycle record.",
+  "description": "Starts, inspects, stops, restarts, resumes or reads logs from a project-scoped daemon with a lifecycle record.",
   "subcommands": [
     "start",
     "status",
     "stop",
     "restart",
-    "logs"
+    "logs",
+    "resume"
   ],
   "subcommandMetadata": {
     "start": {
@@ -40,16 +41,24 @@
       "requires": [
         "project"
       ]
+    },
+    "resume": {
+      "safety": "controls-local-service",
+      "requires": [
+        "project",
+        "daemon"
+      ]
     }
   },
-  "usage": "wsync daemon <start|status|stop|restart|logs> [--project <path>] [options]",
+  "usage": "wsync daemon <start|status|stop|restart|logs|resume> [--project <path>] [options]",
   "examples": [
     "wsync daemon start --project . --raw",
     "wsync daemon status --project . --raw",
     "wsync daemon stop --project . --timeout 10 --raw",
     "wsync daemon restart --project . --port 7978 --timeout 10 --raw",
     "wsync daemon logs --project . --lines 100",
-    "wsync daemon start --project . --game-id 123 --place-id 456 --raw"
+    "wsync daemon start --project . --game-id 123 --place-id 456 --raw",
+    "wsync daemon resume --project ."
   ],
   "notes": [
     "Start and restart serve in the current process; they do not detach into a background child. A process manager can launch them as a background service. --raw emits a readiness JSON line and then the process continues serving.",
@@ -59,6 +68,9 @@
     "A matching daemon already running for the project is reported instead of starting a duplicate. A requested port serving another project is an error. Restart prefers the previous daemon port.",
     "Stop verifies the exact live canonical project and boot ID before graceful shutdown. On graceful timeout it can use an OS-kill fallback only for that verified process; a stale PID record alone is insufficient.",
     "Runtime records live in the platform data directory under WSync/daemons, alongside start locks and lifecycle logs. The mutation audit log is WSync/writes.log.",
-    "Desktop managers can supply an owner token through --owner-token-env <ENV>. Lifecycle JSON does not disclose the token. No --projects-root flag is implemented in this CLI family."
+    "Desktop managers can supply an owner token through --owner-token-env <ENV>. Lifecycle JSON does not disclose the token. No --projects-root flag is implemented in this CLI family.",
+    "When no live daemon serves a project, every other command that addresses it (`--project`, a positional project, or the project in the working directory) prints a banner on stderr before running — offline commands such as `lint`, `build`, `sourcemap` and `doctor` included — with the last known state (crashed, heartbeat lost, stopped, not answering, never started), when, and the start command. stdout is never touched. `daemon`, `serve`, `status`, `stop`, the install/config/auth surface and the legacy session commands skip it; `WSYNC_NO_DAEMON_BANNER=1` turns it off for scripts that never run a daemon.",
+    "A desktop-managed daemon that exits unexpectedly or stops answering heartbeats gets `Manager: …` notes appended to its lifecycle log — the exit status (e.g. `signal 6 (SIGABRT)`) and the last stderr lines — so `daemon logs` shows why it died even when the daemon could not write anything itself.",
+    "A daemon that dies while applying a connect (or within 30 seconds of it) leaves a marker in `.wsync-backups/`; the next daemon starts in safe mode. In safe mode a connect still compares and decides, but applies nothing to disk or Studio: it writes what it would have done to `.wsync-backups/safe-mode-report.json` and refuses the connect with that explanation, so a crash cannot turn into a crash loop that rewrites the project on every restart. `/hello` reports `safeMode` while it lasts. Fix the cause (`wsync doctor` checks the usual disk hazards), then `wsync daemon resume` and reconnect the plugin. A graceful stop never triggers it."
   ]
 }

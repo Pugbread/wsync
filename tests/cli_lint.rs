@@ -838,3 +838,60 @@ fn repair_tree_fails_and_skips_downstream_checks_without_a_daemon() {
 	assert_eq!(status_of("plugin"), "skip");
 	assert_eq!(status_of("path-index"), "skip");
 }
+
+/// The incident: an agent turned `init.client.luau` into `init.luau` and for
+/// a moment both existed — generating the sourcemap then recursed until the
+/// stack overflowed. The first sync rule's init file now wins, with a
+/// warning naming the folder and the ignored file
+#[cfg(unix)]
+#[test]
+fn lint_survives_two_init_files_in_one_folder() {
+	let sandbox = CliSandbox::new();
+	let project = lint_project(
+		&sandbox,
+		&[
+			("src/CarFlareClient/init.client.luau", "print('client')\n"),
+			("src/CarFlareClient/init.luau", "return {}\n"),
+			("src/CarFlareClient/Config.luau", "return 1\n"),
+		],
+	);
+	seed_definitions(&sandbox);
+
+	let (stub, _argv, sourcemap_copy) = analyzer_stub(&sandbox, "luau-lsp-inits", "", 0);
+
+	let output = sandbox.run(&[
+		"lint",
+		"--project",
+		&project.to_string_lossy(),
+		"--luau-lsp",
+		&stub.to_string_lossy(),
+		"--compile",
+		"off",
+		"--data-model",
+		"filesystem",
+		"--raw",
+	]);
+
+	let stderr = cli_stderr(&output);
+
+	assert!(output.status.success(), "lint must not crash: {stderr}");
+	assert!(
+		stderr.contains("CarFlareClient has 2 init files") && stderr.contains("ignoring init.luau"),
+		"{stderr}"
+	);
+
+	fn find<'a>(node: &'a Value, name: &str) -> Option<&'a Value> {
+		if node["name"] == name {
+			return Some(node);
+		}
+
+		node["children"].as_array()?.iter().find_map(|child| find(child, name))
+	}
+
+	let sourcemap: Value = serde_json::from_str(&fs::read_to_string(&sourcemap_copy).unwrap()).unwrap();
+	let flare = find(&sourcemap, "CarFlareClient").expect("the folder is in the sourcemap");
+
+	assert_eq!(flare["className"], "Script", "`.client` precedes the plain module rule");
+	assert_eq!(flare["filePaths"], json!(["src/CarFlareClient/init.client.luau"]));
+	assert_eq!(flare["children"][0]["name"], "Config");
+}

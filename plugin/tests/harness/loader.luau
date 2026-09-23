@@ -8,7 +8,8 @@
 -- sources use (`WSync.Types`, `script.Parent.Parent.Snapshot`) resolve
 -- through module refs instead of a DataModel. Modules the fakes stand in for
 -- (Log, Config, Dom, Signal, Types) come from STUBS; everything else is the
--- real source.
+-- real source. The real Log is still loadable as `RealLog`, for scenarios
+-- about log formatting itself.
 
 local Fakes = assert(loadstring(FAKES_SOURCE, "=fakes"))()
 
@@ -25,6 +26,7 @@ local WSync = {
 	Lib = { Dom = ref("Dom") },
 	Helpers = { equals = ref("equals"), generateRef = ref("generateRef") },
 	Packages = { Signal = ref("Signal") },
+	Transport = { Hex = ref("Hex") },
 }
 
 local core = {
@@ -34,8 +36,6 @@ local core = {
 	Snapshot = ref("Snapshot"),
 	Error = ref("Error"),
 }
-
-local processor = { Parent = core, Read = ref("Read") }
 
 local function scriptFor(parent)
 	return {
@@ -47,8 +47,16 @@ local function scriptFor(parent)
 	}
 end
 
+-- Core/Processor is a module with children: `script.Read` / `script.Write`
+-- from its own init, `script.Parent.Read` from theirs
+local processor = scriptFor(core)
+processor.Read = ref("Read")
+processor.Write = ref("Write")
+
 local SCRIPTS = {
 	Read = scriptFor(processor),
+	Write = scriptFor(processor),
+	Processor = processor,
 	Snapshot = scriptFor(core),
 }
 

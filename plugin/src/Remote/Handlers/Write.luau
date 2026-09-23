@@ -1,8 +1,8 @@
 --!strict
 -- Mutating ops: `set`, `set_batch`, `new`, `rm`, `mv`, the attribute and tag
--- families, `call`, `eval`, `save`, plus the `open_in_editor` Studio-editor
--- control (set.json, new.json, rm.json, mv.json, attr.json, tag.json,
--- call.json, eval.json, save.json, open.json; Design §5.4, §6.4, §10.6).
+-- families, `call`, `eval`, plus the `open_in_editor` Studio-editor control
+-- (set.json, new.json, rm.json, mv.json, attr.json, tag.json, call.json,
+-- eval.json, open.json; Design §5.4, §6.4, §10.6).
 --
 -- Safety framing (Design §10.6): these ops are user-initiated escape hatches
 -- routed through the daemon — never autonomous tools. Guardrails enforced
@@ -14,10 +14,9 @@
 --   * `mv` across top-level service boundaries requires force:true;
 --   * script `Source` writes go through ScriptEditorService:UpdateSourceAsync
 --     only — a failure is a failed op, never a raw `.Source` fallback (§6.1);
---   * every mutation brackets itself in a `WSync: <op> "<target>"` waypoint
---     (History.opWaypoint) unless an explicit transaction is open, and tags
---     its response meta with `mutation: true` plus a compact audit object for
---     the daemon's writes.log (ctx.audit -> WriteRules.shapeAudit).
+--   * every mutation tags its response meta with `mutation: true` plus a
+--     compact audit object for the daemon's writes.log
+--     (ctx.audit -> WriteRules.shapeAudit).
 --
 -- `attr_ls` and `tag_ls` are read-only conveniences colocated with their
 -- families; `open_in_editor` changes Studio UI state only (the select_set
@@ -26,16 +25,11 @@
 local ScriptEditorService = game:GetService("ScriptEditorService")
 local CollectionService = game:GetService("CollectionService")
 
-local WSync = script:FindFirstAncestor("WSync")
-
-local Log = require(WSync.Log)
-
 local Error = require(script.Parent.Parent.Error)
 local Codec = require(script.Parent.Parent.Codec)
 local Paths = require(script.Parent.Parent.Paths)
 local WriteRules = require(script.Parent.Parent.WriteRules)
-
-local History = require(script.Parent.History)
+local DraftRequire = require(script.Parent.Parent.DraftRequire)
 
 type Args = { [string]: any }
 
@@ -198,7 +192,6 @@ function Write.ops.set(args: Args, ctx)
 
 	local path = (Paths.pathOf(instance))
 
-	History.opWaypoint("set", path)
 	ctx.audit(WriteRules.shapeAudit("set", path, { class = instance.ClassName, prop = prop }))
 
 	local response: { [string]: any } = {
@@ -217,47 +210,13 @@ function Write.ops.set(args: Args, ctx)
 	return response
 end
 
---- `set_batch {writes, keepGoing?, waypoint?}` — a pre-validated batch of
---- property writes. Pre-flight guards (shape, the Parent rejection) fail the
---- whole batch before anything is touched; `keepGoing` only relaxes
---- per-entry runtime failures. With `waypoint`, one ChangeHistory recording
---- brackets the batch so a single Studio undo reverses it (set.json) —
---- unless an explicit transaction is already open, whose recording brackets
---- everything instead.
+--- `set_batch {writes, keepGoing?}` — a pre-validated batch of property
+--- writes. Pre-flight guards (shape, the Parent rejection) fail the whole
+--- batch before anything is touched; `keepGoing` only relaxes per-entry
+--- runtime failures.
 function Write.ops.set_batch(args: Args, ctx)
 	local writes = WriteRules.validateBatch(args.writes)
 	local keepGoing = args.keepGoing == true
-
-	local waypointName: string? = nil
-
-	if args.waypoint ~= nil then
-		if
-			type(args.waypoint) ~= "string"
-			or args.waypoint == ""
-			or #args.waypoint > WriteRules.LIMITS.maxWaypointNameBytes
-		then
-			invalid(`waypoint must be a string of 1-{WriteRules.LIMITS.maxWaypointNameBytes} bytes`)
-		end
-
-		waypointName = args.waypoint
-	end
-
-	local recordingId: string? = nil
-
-	if waypointName ~= nil and not History.isTransactionOpen() then
-		recordingId = History.tryBeginBatchRecording(waypointName)
-
-		if recordingId == nil then
-			error(
-				Error.new(
-					Error.CONFLICT,
-					"Studio refused to begin a change-history recording for the batch "
-						.. "(another recording may already be in progress)"
-				),
-				0
-			)
-		end
-	end
 
 	local results: { { [string]: any } } = table.create(#writes)
 	local applied = 0
@@ -293,14 +252,6 @@ function Write.ops.set_batch(args: Args, ctx)
 				stopped = true
 			end
 		end
-	end
-
-	if recordingId ~= nil then
-		-- Commit only when something changed; an all-failed batch cancels the
-		-- recording so it never leaves an empty undo entry.
-		History.finishBatchRecording(recordingId, applied > 0)
-	elseif applied > 0 then
-		History.opWaypoint("set_batch", `{applied} writes`)
 	end
 
 	if applied > 0 then
@@ -431,7 +382,6 @@ function Write.ops.new(args: Args, ctx)
 
 	local path = (Paths.pathOf(instance))
 
-	History.opWaypoint("new", path)
 	ctx.audit(WriteRules.shapeAudit("new", path, { class = instance.ClassName }))
 
 	return {
@@ -463,7 +413,6 @@ function Write.ops.rm(args: Args, ctx)
 		error(Error.new(WriteRules.classifyWriteFailure(message), message), 0)
 	end
 
-	History.opWaypoint("rm", path)
 	ctx.audit(WriteRules.shapeAudit("rm", path, { class = className }))
 
 	return { path = path, class = className, destroyed = true }
@@ -508,7 +457,6 @@ function Write.ops.mv(args: Args, ctx)
 
 	local resultPath = (Paths.pathOf(instance))
 
-	History.opWaypoint("mv", fromPath)
 	ctx.audit(WriteRules.shapeAudit("mv", fromPath, { class = instance.ClassName, to = resultPath }))
 
 	local response: { [string]: any } = {
@@ -573,7 +521,6 @@ function Write.ops.set_attr(args: Args, ctx)
 
 	local path = (Paths.pathOf(instance))
 
-	History.opWaypoint("set_attr", path)
 	ctx.audit(WriteRules.shapeAudit("set_attr", path, { class = instance.ClassName, prop = name }))
 
 	return { path = path, name = name }
@@ -602,7 +549,6 @@ function Write.ops.rm_attr(args: Args, ctx)
 
 	local path = (Paths.pathOf(instance))
 
-	History.opWaypoint("rm_attr", path)
 	ctx.audit(WriteRules.shapeAudit("rm_attr", path, { class = instance.ClassName, prop = name }))
 
 	return { path = path, name = name, cleared = true }
@@ -686,7 +632,6 @@ function Write.ops.add_tag(args: Args, ctx)
 		error(Error.new(Error.PLUGIN_ERROR, `AddTag failed: {tostring(err)}`), 0)
 	end
 
-	History.opWaypoint("add_tag", path)
 	ctx.audit(WriteRules.shapeAudit("add_tag", path, { class = instance.ClassName, prop = tag }))
 
 	return { path = path, tag = tag, added = true }
@@ -715,7 +660,6 @@ function Write.ops.rm_tag(args: Args, ctx)
 
 	local path = (Paths.pathOf(instance))
 
-	History.opWaypoint("rm_tag", path)
 	ctx.audit(WriteRules.shapeAudit("rm_tag", path, { class = instance.ClassName, prop = tag }))
 
 	return { path = path, tag = tag, removed = true }
@@ -755,7 +699,7 @@ end
 --- `call {path, method, args?}` — invoke one method; args decoded through the
 --- value codec, every return value codec-encoded (multi-return as an array).
 --- Methods with side effects count as writes (call.json), so every call is
---- bracketed and audited — a spurious waypoint after a pure read is harmless.
+--- audited — a spurious audit entry after a pure read is harmless.
 function Write.ops.call(args: Args, ctx)
 	local instance = Paths.resolve(args.path)
 	local method = WriteRules.validatePropName(args.method, "method")
@@ -802,7 +746,6 @@ function Write.ops.call(args: Args, ctx)
 		results[index] = Codec.encode(packed[index + 1], budget)
 	end
 
-	History.opWaypoint("call", `{path}.{method}`)
 	ctx.audit(WriteRules.shapeAudit("call", path, { class = instance.ClassName, prop = method }))
 
 	local response: { [string]: any } = {
@@ -831,7 +774,16 @@ export type Returns = { n: number, [number]: any }
 --- hatches carry exactly one trust level and one classification: compile
 --- errors are INVALID_ARGUMENT, runtime errors PLUGIN_ERROR with the message
 --- scrubbed and truncated. Returns the values the chunk returned, packed.
-function Write.runSource(source: any, chunkName: string, context: string): Returns
+---
+--- `drafts` (`eval --drafts`) gives the chunk a `require` that loads
+--- ModuleScripts from their editor text (Remote/DraftRequire.luau); the
+--- session it used is returned second, for the response's `drafts` report.
+function Write.runSource(
+	source: any,
+	chunkName: string,
+	context: string,
+	drafts: boolean?
+): (Returns, DraftRequire.Session?)
 	if type(source) ~= "string" or source == "" then
 		invalid("source must be a non-empty string")
 	end
@@ -852,6 +804,20 @@ function Write.runSource(source: any, chunkName: string, context: string): Retur
 		invalid(`compile error: {tostring(compileError)}`)
 	end
 
+	local session: DraftRequire.Session? = nil
+
+	if drafts then
+		local draftSession = DraftRequire.new(
+			DraftRequire.studioHost(function(instance: Instance): string
+				return (Paths.pathOf(instance))
+			end),
+			(getfenv :: any)(fn)
+		)
+
+		DraftRequire.install(draftSession, fn)
+		session = draftSession
+	end
+
 	local packed = table.pack(pcall(fn :: any))
 
 	if not packed[1] then
@@ -859,13 +825,19 @@ function Write.runSource(source: any, chunkName: string, context: string): Retur
 	end
 
 	-- Drop the pcall status so callers see exactly the chunk's return values
-	return (table.pack(table.unpack(packed, 2, packed.n)) :: any) :: Returns
+	return (table.pack(table.unpack(packed, 2, packed.n)) :: any) :: Returns, session
 end
 
---- `eval {source}` — run Luau in the plugin environment and codec-encode
---- every return value as an array (eval.json).
+--- `eval {source, drafts?}` — run Luau in the plugin environment and
+--- codec-encode every return value as an array (eval.json). `drafts: true`
+--- makes `require` run ModuleScripts' editor text instead of their committed
+--- `.Source`, and reports which modules that changed.
 function Write.ops.eval(args: Args, ctx)
-	local returns = Write.runSource(args.source, "wsync-eval", "eval raised")
+	if args.drafts ~= nil and type(args.drafts) ~= "boolean" then
+		invalid("drafts must be a boolean")
+	end
+
+	local returns, drafts = Write.runSource(args.source, "wsync-eval", "eval raised", args.drafts == true)
 
 	local returnCount = returns.n
 	local budget = Codec.newBudget()
@@ -875,7 +847,6 @@ function Write.ops.eval(args: Args, ctx)
 		results[index] = Codec.encode(returns[index], budget)
 	end
 
-	History.opWaypoint("eval", "")
 	ctx.audit(WriteRules.shapeAudit("eval", ""))
 
 	local response: { [string]: any } = {
@@ -886,39 +857,19 @@ function Write.ops.eval(args: Args, ctx)
 		response.results = results
 	end
 
-	return response
-end
+	if drafts ~= nil then
+		-- `fromEditor` omitted when empty, like `results`: every module ran
+		-- its committed source
+		local report: { [string]: any } = { modules = drafts.moduleCount }
 
---------------------------------------------------------------------------------
--- save
---------------------------------------------------------------------------------
+		if #drafts.fromEditor > 0 then
+			report.fromEditor = drafts.fromEditor
+		end
 
---- `save` — ask Studio to save the current place. Per save.json the save is
---- asynchronous and the op acks when Studio accepts the request: DataModel
---- Save() can take seconds, which would blow the 5 s remote-op timeout, so
---- it runs detached and any failure surfaces in the Studio output.
-function Write.ops.save(_args: Args, ctx)
-	local okLookup, saveFn = pcall(function()
-		return (game :: any).Save
-	end)
-
-	if not okLookup or type(saveFn) ~= "function" then
-		error(Error.new(Error.PLUGIN_ERROR, "this Studio build does not expose DataModel Save()"), 0)
+		response.drafts = report
 	end
 
-	task.spawn(function()
-		local ok, err = pcall(function()
-			(game :: any):Save()
-		end)
-
-		if not ok then
-			Log.warn("Async place save failed:", err)
-		end
-	end)
-
-	ctx.audit(WriteRules.shapeAudit("save", ""))
-
-	return { requested = true }
+	return response
 end
 
 --------------------------------------------------------------------------------

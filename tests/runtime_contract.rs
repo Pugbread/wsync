@@ -352,7 +352,6 @@ async fn handler_level_failures_cannot_claim_completed_execution() {
 	let (mut plugin, _) = connect_client(&daemon, "plugin", "inner-failure-plugin").await;
 	let client = http();
 	for (op, value, meta, expected) in [
-		("save", json!({"requested":true}), json!({"mutation":true}), "unknown"),
 		("undo", json!({"requested":true}), json!({"mutation":true}), "unknown"),
 		("redo", json!({"requested":true}), json!({"mutation":true}), "unknown"),
 		(
@@ -413,7 +412,7 @@ async fn handler_level_failures_cannot_claim_completed_execution() {
 		assert_eq!(reply["meta"]["completion"], expected, "{op}");
 		assert_eq!(reply["meta"]["retrySafe"], false, "{op}");
 		assert_eq!(reply["meta"]["completionScope"], "requestedEffects", "{op}");
-		if matches!(op, "save" | "undo" | "redo" | "playtest_start" | "playtest_run_start") {
+		if matches!(op, "undo" | "redo" | "playtest_start" | "playtest_run_start") {
 			assert_eq!(reply["meta"]["acknowledged"], true, "{op}");
 			assert!(reply["meta"]["nextCheck"].is_string(), "{op}");
 		}

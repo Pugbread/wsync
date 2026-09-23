@@ -775,7 +775,7 @@ fn a_malformed_batch_file_never_reaches_the_plugin() {
 }
 
 // ---------------------------------------------------------------------------
-// Batches: waypoint passthrough, keep-going, per-entry reporting
+// Batches: keep-going, per-entry reporting
 // ---------------------------------------------------------------------------
 
 /// `results` are positional against the writes that were sent, so the table
@@ -793,11 +793,11 @@ fn batch_value(results: Value, applied: u64, failed: u64, stopped: bool) -> Valu
 }
 
 #[test]
-fn a_batch_sends_one_op_carrying_the_waypoint_and_keep_going() {
+fn a_batch_sends_one_op_carrying_keep_going() {
 	let daemon = start_daemon(None);
 	let journal = spawn_plugin(
 		&daemon,
-		"batch-waypoint-plugin",
+		"batch-plugin",
 		table_responder(vec![(
 			"set_batch",
 			batch_value(json!([{ "ok": true }, { "ok": true }]), 2, 0, false),
@@ -821,8 +821,6 @@ fn a_batch_sends_one_op_carrying_the_waypoint_and_keep_going() {
 		&daemon.port.to_string(),
 		"--batch",
 		&batch.to_string_lossy(),
-		"--waypoint",
-		"refactor camera",
 		"--keep-going",
 	]);
 
@@ -833,7 +831,6 @@ fn a_batch_sends_one_op_carrying_the_waypoint_and_keep_going() {
 
 	let args = args_for(&journal, "set_batch");
 
-	assert_eq!(args["waypoint"], "refactor camera");
 	assert_eq!(args["keepGoing"], true);
 	assert_eq!(args["writes"].as_array().unwrap().len(), 2);
 	assert_eq!(args["writes"][0]["path"], "Workspace/Camera");
@@ -962,45 +959,6 @@ fn keep_going_still_exits_non_zero_when_an_entry_failed() {
 	// --keep-going buys
 	assert!(table.contains("1 applied, 1 failed"), "unexpected table: {table}");
 	assert!(!table.contains("skipped"), "nothing should have been skipped: {table}");
-}
-
-#[test]
-fn a_single_write_marks_the_waypoint_before_the_set() {
-	let daemon = start_daemon(None);
-	let journal = spawn_plugin(
-		&daemon,
-		"single-waypoint-plugin",
-		table_responder(vec![
-			("waypoint", json!({ "name": "before tweak" })),
-			(
-				"set",
-				json!({ "path": "Workspace/Camera", "prop": "FieldOfView", "value": 90 }),
-			),
-		]),
-	);
-
-	let sandbox = Sandbox::new();
-	let output = sandbox.run(&[
-		"set",
-		"--project",
-		&daemon.root.to_string_lossy(),
-		"--port",
-		&daemon.port.to_string(),
-		"--path",
-		"Workspace/Camera",
-		"--prop",
-		"FieldOfView",
-		"--value",
-		"90",
-		"--waypoint",
-		"before tweak",
-	]);
-
-	assert!(output.status.success(), "set failed: {}", stderr(&output));
-
-	// The marker has to precede the write, or it labels the wrong boundary
-	assert_eq!(ops(&journal), vec!["waypoint".to_owned(), "set".to_owned()]);
-	assert_eq!(args_for(&journal, "waypoint")["name"], "before tweak");
 }
 
 // ---------------------------------------------------------------------------
@@ -1456,14 +1414,12 @@ fn eval_returns_values_and_fails_on_a_compile_error() {
 }
 
 #[test]
-fn save_waypoint_undo_and_redo_each_wrap_one_op() {
+fn undo_and_redo_each_wrap_one_op() {
 	let daemon = start_daemon(None);
 	let journal = spawn_plugin(
 		&daemon,
 		"history-plugin",
 		table_responder(vec![
-			("save", json!({ "requested": true })),
-			("waypoint", json!({ "name": "before refactor" })),
 			("undo", json!({ "requested": true })),
 			("redo", json!({ "requested": true })),
 		]),
@@ -1474,16 +1430,6 @@ fn save_waypoint_undo_and_redo_each_wrap_one_op() {
 	let port = daemon.port.to_string();
 
 	for args in [
-		vec!["save", "--project", &project, "--port", &port],
-		vec![
-			"waypoint",
-			"--project",
-			&project,
-			"--port",
-			&port,
-			"--name",
-			"before refactor",
-		],
 		vec!["undo", "--project", &project, "--port", &port],
 		vec!["redo", "--project", &project, "--port", &port],
 	] {
@@ -1492,16 +1438,7 @@ fn save_waypoint_undo_and_redo_each_wrap_one_op() {
 		assert!(output.status.success(), "{args:?} failed: {}", stderr(&output));
 	}
 
-	assert_eq!(
-		ops(&journal),
-		vec![
-			"save".to_owned(),
-			"waypoint".to_owned(),
-			"undo".to_owned(),
-			"redo".to_owned()
-		]
-	);
-	assert_eq!(args_for(&journal, "waypoint")["name"], "before refactor");
+	assert_eq!(ops(&journal), vec!["undo".to_owned(), "redo".to_owned()]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1523,7 +1460,7 @@ fn raw_write_output_leads_with_ok() {
 				"new",
 				json!({ "path": "Workspace/Box", "class": "Part", "name": "Box" }),
 			),
-			("save", json!({ "requested": true })),
+			("undo", json!({ "requested": true })),
 		]),
 	);
 
@@ -1577,10 +1514,10 @@ fn raw_write_output_leads_with_ok() {
 	assert_eq!(value["class"], "Part");
 
 	// An argument-less op still answers with the same discriminator
-	let saved = sandbox.run(&["save", "--project", &project, "--port", &port, "--raw"]);
+	let undone = sandbox.run(&["undo", "--project", &project, "--port", &port, "--raw"]);
 
-	assert!(saved.status.success(), "save --raw failed: {}", stderr(&saved));
-	assert_eq!(assert_leads_with_ok(&saved)["requested"], true);
+	assert!(undone.status.success(), "undo --raw failed: {}", stderr(&undone));
+	assert_eq!(assert_leads_with_ok(&undone)["requested"], true);
 }
 
 #[test]
@@ -1716,4 +1653,173 @@ fn status_reports_the_write_log_path_and_whether_it_exists() {
 	// A daemon that reports its own location is not pending; one that does
 	// not leaves the CLI's default flagged as a guess
 	assert_eq!(log["pending"], log["source"] == "state directory");
+}
+
+// ---------------------------------------------------------------------------
+// One path spelling for every single-instance command
+// ---------------------------------------------------------------------------
+
+/// Incident report: `meta` took a positional path while `source` demanded
+/// `--path`. Every single-instance command now takes both, and the op sees
+/// the same `path` either way
+#[test]
+fn single_instance_commands_take_the_path_positionally_or_as_a_flag() {
+	let daemon = start_daemon(None);
+	let journal = spawn_plugin(
+		&daemon,
+		"path-forms-plugin",
+		Arc::new(|op, args| Answer::Value(json!({ "path": args["path"].clone(), "op": op }))),
+	);
+
+	let sandbox = Sandbox::new();
+	let project = daemon.root.to_string_lossy().into_owned();
+	let port = daemon.port.to_string();
+
+	let cases: Vec<(Vec<&str>, &str, &str)> = vec![
+		(vec!["get", "Workspace/Camera"], "get", "Workspace/Camera"),
+		(vec!["props", "Workspace/Camera"], "props", "Workspace/Camera"),
+		(vec!["ls", "ReplicatedStorage"], "ls", "ReplicatedStorage"),
+		(vec!["tree", "Workspace", "--depth", "1"], "tree", "Workspace"),
+		(vec!["rm", "Workspace/Box"], "rm", "Workspace/Box"),
+		(
+			vec!["set", "Workspace/Camera", "--prop", "FieldOfView", "--value", "90"],
+			"set",
+			"Workspace/Camera",
+		),
+		(vec!["new", "Workspace", "--class", "Part"], "new", "Workspace"),
+		(vec!["attr", "ls", "Workspace/Box"], "attr_ls", "Workspace/Box"),
+		(
+			vec!["tag", "add", "Workspace/Box", "--tag", "Enemy"],
+			"add_tag",
+			"Workspace/Box",
+		),
+		(
+			vec!["call", "Workspace/Folder", "--method", "GetChildren"],
+			"call",
+			"Workspace/Folder",
+		),
+		// Both forms at once are fine when they agree
+		(
+			vec!["rm", "Workspace/Same", "--path", "Workspace/Same"],
+			"rm",
+			"Workspace/Same",
+		),
+		// ls/tree default to the DataModel root when no path is given
+		(vec!["ls"], "ls", ""),
+	];
+
+	for (args, op, path) in cases {
+		journal.lock().unwrap().clear();
+
+		let mut full = args.clone();
+		full.extend(["--project", project.as_str(), "--port", port.as_str(), "--raw"]);
+
+		let output = sandbox.run(&full);
+
+		assert!(output.status.success(), "{args:?} failed: {}", stderr(&output));
+		assert_eq!(args_for(&journal, op)["path"], path, "{args:?} sent the wrong path");
+	}
+}
+
+#[test]
+fn two_different_paths_are_refused_before_the_network() {
+	let daemon = start_daemon(None);
+	let journal = spawn_plugin(&daemon, "two-paths-plugin", table_responder(vec![]));
+
+	let sandbox = Sandbox::new();
+	let project = daemon.root.to_string_lossy().into_owned();
+	let port = daemon.port.to_string();
+
+	for args in [
+		vec!["rm", "Workspace/A", "--path", "Workspace/B"],
+		vec!["get", "Workspace/A", "--path", "Workspace/B"],
+		vec!["source", "Workspace/A", "--path", "Workspace/B"],
+	] {
+		let mut full = args.clone();
+		full.extend(["--project", project.as_str(), "--port", port.as_str()]);
+
+		let output = sandbox.run(&full);
+
+		assert!(!output.status.success(), "{args:?} exited zero");
+		assert!(
+			stderr(&output).contains("Two different paths"),
+			"{args:?}: unexpected message: {}",
+			stderr(&output)
+		);
+	}
+
+	assert_untouched(&journal, "a two-path command");
+
+	// Neither form at all is still a usage error
+	let output = sandbox.run(&["rm", "--project", &project, "--port", &port]);
+
+	assert!(!output.status.success(), "rm without a path exited zero");
+	assert_untouched(&journal, "rm without a path");
+}
+
+// ---------------------------------------------------------------------------
+// eval --drafts
+// ---------------------------------------------------------------------------
+
+#[test]
+fn eval_drafts_reaches_the_plugin_and_reports_what_ran_from_the_editor() {
+	let daemon = start_daemon(None);
+	let journal = spawn_plugin(
+		&daemon,
+		"eval-drafts-plugin",
+		Arc::new(|op, args| match op {
+			// A current plugin answers `drafts` with its report
+			"eval" if args["drafts"] == true && args["source"] == "return 1" => Answer::Value(json!({
+				"count": 1,
+				"results": [1],
+				"drafts": { "modules": 2, "fromEditor": ["ReplicatedStorage/Fresh"] },
+			})),
+			// An older plugin ignores the flag
+			"eval" => Answer::Value(json!({ "count": 1, "results": [1] })),
+			_ => Answer::Failure("UNKNOWN_OP", "the fake plugin does not implement this op"),
+		}),
+	);
+
+	let sandbox = Sandbox::new();
+	let project = daemon.root.to_string_lossy().into_owned();
+	let port = daemon.port.to_string();
+	let base = ["--project", project.as_str(), "--port", port.as_str()];
+
+	let mut args = vec!["eval", "--drafts", "--source", "return 1"];
+	args.extend(base);
+
+	let output = sandbox.run(&args);
+
+	assert!(output.status.success(), "eval --drafts failed: {}", stderr(&output));
+	assert_eq!(args_for(&journal, "eval")["drafts"], true);
+	assert!(
+		stderr(&output).contains("1 from editor text: ReplicatedStorage/Fresh"),
+		"the drafts report must be rendered: {}",
+		stderr(&output)
+	);
+
+	// Without the flag nothing extra is sent
+	journal.lock().unwrap().clear();
+
+	let mut args = vec!["eval", "--source", "return 1", "--raw"];
+	args.extend(base);
+
+	let output = sandbox.run(&args);
+
+	assert!(output.status.success(), "eval failed: {}", stderr(&output));
+	assert!(args_for(&journal, "eval").get("drafts").is_none());
+
+	// A plugin that ignores the flag is called out, and --raw stays one line
+	let mut args = vec!["eval", "--drafts", "--source", "return 2", "--raw"];
+	args.extend(base);
+
+	let output = sandbox.run(&args);
+
+	assert!(output.status.success(), "eval --drafts failed: {}", stderr(&output));
+	assert!(
+		stderr(&output).contains("ignored --drafts"),
+		"an ignored flag must be called out: {}",
+		stderr(&output)
+	);
+	assert_eq!(assert_leads_with_ok(&output)["count"], 1);
 }

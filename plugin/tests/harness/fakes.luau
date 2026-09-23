@@ -1,10 +1,11 @@
 -- The fake Roblox surface the syncback scenarios run on (see
--- scripts/check-plugin-syncback.mjs). Only what Watcher, ReadProcessor, Tree
+-- scripts/check-plugin-syncback.mjs). Only what Watcher, the processors, Tree
 -- and their dependencies touch: instances with a parent/children hierarchy
--- that fires ChildAdded/ChildRemoved/Changed the way Studio does, the three
--- services those modules resolve at load, and stand-ins for the impure
--- modules (Log, Config, Dom, Signal). Everything else the scenarios load is
--- the real plugin source.
+-- that fires ChildAdded/ChildRemoved/Changed the way Studio does (with
+-- Immediate signal behavior — the strictest case for echo suppression), the
+-- services those modules resolve at load, `Instance.new`, and stand-ins for
+-- the impure modules (Log, Config, Dom, Signal). Everything else the
+-- scenarios load is the real plugin source.
 
 local Fakes = {}
 
@@ -99,6 +100,29 @@ function methods:GetDescendants()
 	return out
 end
 
+--- Studio's form: dot-joined names from below the DataModel down.
+function methods:GetFullName(): string
+	local names = {}
+	local current = self
+
+	while current and current.__props.ClassName ~= "DataModel" do
+		table.insert(names, 1, current.__props.Name)
+		current = current.__props.Parent
+	end
+
+	return table.concat(names, ".")
+end
+
+--- Detach (firing the usual events) and mark destroyed, descendants first.
+function methods:Destroy()
+	for _, child in self:GetChildren() do
+		child:Destroy()
+	end
+
+	self.Parent = nil
+	rawset(self, "__destroyed", true)
+end
+
 function methods:FindFirstAncestor(name: string)
 	local current = self.__props.Parent
 
@@ -171,6 +195,10 @@ end
 
 FakeInstance.__newindex = function(self, key, value)
 	local props = rawget(self, "__props")
+
+	if key == "Parent" and rawget(self, "__destroyed") then
+		error(`The Parent property of {props.Name} is locked, current parent: NULL, new parent {value}`)
+	end
 
 	if key ~= "Parent" then
 		props[key] = value
@@ -278,12 +306,22 @@ Fakes.services = {
 }
 
 --- Install a fresh DataModel as the `game` global (and a `workspace` with a
---- camera the Watcher skips). Every loadstring chunk shares this env.
+--- camera the Watcher skips, and `Instance.new` over the fake classes).
+--- Every loadstring chunk shares this env.
 function Fakes.installGlobals()
 	local dataModel = Fakes.new("DataModel", "game")
 
 	game = dataModel
 	workspace = { CurrentCamera = {} }
+	Instance = {
+		new = function(className: string)
+			if not ANCESTRY[className] then
+				error(`Unable to create an Instance of type "{className}"`)
+			end
+
+			return Fakes.new(className)
+		end,
+	}
 
 	return dataModel
 end
@@ -292,22 +330,50 @@ end
 -- Stand-ins for the impure modules
 --------------------------------------------------------------------------------
 
---- Every `Log.warn` the plugin code emits, for scenarios to assert on.
+--- Every `Log.warn` (and `Log.debug`) the plugin code emits, for scenarios
+--- to assert on.
 Fakes.warnings = {}
+Fakes.debugs = {}
+
+--- A log argument as text: error objects by message, buffers (refs) as hex
+--- the way the real Log prints them.
+local function logText(part: any): string
+	if type(part) == "table" and part.message ~= nil then
+		return tostring(part.message)
+	end
+
+	if type(part) == "buffer" then
+		local hex = {}
+
+		for i = 0, buffer.len(part) - 1 do
+			table.insert(hex, string.format("%02x", buffer.readu8(part, i)))
+		end
+
+		return table.concat(hex)
+	end
+
+	return tostring(part)
+end
+
+local function logLine(...): string
+	local parts = {}
+
+	for i = 1, select("#", ...) do
+		table.insert(parts, logText((select(i, ...))))
+	end
+
+	return table.concat(parts, " ")
+end
 
 Fakes.Log = {
 	trace = function() end,
-	debug = function() end,
+	debug = function(...)
+		table.insert(Fakes.debugs, logLine(...))
+	end,
 	info = function() end,
 	stage = function() end,
 	warn = function(...)
-		local parts = {}
-
-		for _, part in { ... } do
-			table.insert(parts, tostring(if type(part) == "table" then part.message else part))
-		end
-
-		table.insert(Fakes.warnings, table.concat(parts, " "))
+		table.insert(Fakes.warnings, logLine(...))
 	end,
 	error = function(...)
 		error(table.concat({ ... }, " "), 0)
@@ -337,12 +403,29 @@ local DEFAULTS = {
 
 local SERVICES = { DataModel = true, ReplicatedStorage = true, ServerScriptService = true }
 
+local function hasProperty(instance, property): boolean
+	return (DEFAULTS[instance.ClassName] or {})[property] ~= nil
+end
+
 Fakes.Dom = {
 	getDefaultProperties = function(className)
 		return DEFAULTS[className] or {}
 	end,
 	readProperty = function(instance, property)
+		if not hasProperty(instance, property) then
+			return false, { kind = "UnknownProperty" }
+		end
+
 		return true, instance[property]
+	end,
+	writeProperty = function(instance, property, value)
+		if not hasProperty(instance, property) then
+			return false, { kind = "UnknownProperty" }
+		end
+
+		instance[property] = value
+
+		return true
 	end,
 	isCreatable = function(className)
 		return not SERVICES[className]

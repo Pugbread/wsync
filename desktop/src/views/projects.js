@@ -24,9 +24,9 @@ const FAILURE_HEADINGS = {
   io: "Could not run the daemon.",
   invalid_argument: "That request was rejected.",
   no_host: "Serving needs the WSync desktop host.",
-  exited: "The daemon exited.",
+  exited: "The daemon stopped unexpectedly.",
   killed: "The daemon was terminated.",
-  "heartbeat-lost": "The daemon stopped answering heartbeats.",
+  "heartbeat-lost": "The daemon stopped responding.",
   // Design 8.4: the broker created the project but its auto-serve did not take.
   // The project is real and on disk; only the daemon is missing.
   "serve-failed": "The project was created, but its daemon would not start.",
@@ -168,6 +168,16 @@ export function mountProjects(root, api) {
       return el("span", { class: "chip chip-ok", text: "Serving" });
     }
     if (busy.has(project.id)) return el("span", { class: "chip chip-accent", text: "Starting…" });
+    // The shell's banner carries the detail and the restart; the card only has
+    // to say which project it is about, in words stronger than "Failed".
+    const down = api.getDaemonDown?.(project.id);
+    if (down) {
+      return el("span", {
+        class: "chip chip-danger",
+        text: down.reason === "heartbeat-lost" ? "Not responding" : "Crashed",
+        title: "Edits on disk are not syncing to Studio",
+      });
+    }
     if (failure) return el("span", { class: "chip chip-danger", text: "Failed" });
     return el("span", { class: "chip", text: "Idle" });
   }

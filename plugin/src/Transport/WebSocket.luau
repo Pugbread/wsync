@@ -516,7 +516,9 @@ function WebSocket:__handleFrame(frame: { [string]: any }, resolveHello: ((frame
 		if changes then
 			self:__enqueue({ SyncChanges = changes } :: any)
 		else
-			Log.error(Error.new(Error.MalformedFrame, "sync with invalid refs"))
+			-- A warning, not Log.error: that throws, and the resync below
+			-- would never run
+			Log.warn(Error.new(Error.MalformedFrame, "sync with invalid refs"))
 			self:__fail("Received a malformed sync frame — resync required", false)
 		end
 	elseif kind == "details" then
@@ -527,7 +529,9 @@ function WebSocket:__handleFrame(frame: { [string]: any }, resolveHello: ((frame
 			self.__detailsFingerprint = rootRefsFingerprint(frame)
 			self:__enqueue({ SyncDetails = details } :: any)
 		else
-			Log.error(Error.new(Error.MalformedFrame, "details with invalid refs"))
+			-- A warning, not Log.error: that throws, and the resync below
+			-- would never run
+			Log.warn(Error.new(Error.MalformedFrame, "details with invalid refs"))
 			self:__fail("Received a malformed details frame — resync required", false)
 		end
 	elseif kind == "execute" then
@@ -604,6 +608,8 @@ end
 --- immediately — a finish jumping the queue would close the recording before
 --- the bracketed frames applied. Both ops are therefore enqueued as
 --- `DispatchRequest` messages and executed by Core in queue order.
+--- `sync_barrier` (`wsync wait-synced`) rides the same path for the same
+--- reason: its answer must come after every earlier sync frame applied.
 function WebSocket:__handleRequest(frame: { [string]: any })
 	local requestId = frame.request_id
 
@@ -612,7 +618,11 @@ function WebSocket:__handleRequest(frame: { [string]: any })
 		return
 	end
 
-	if frame.op == "transaction_begin" or frame.op == "transaction_finish" then
+	if
+		frame.op == "transaction_begin"
+		or frame.op == "transaction_finish"
+		or frame.op == "sync_barrier"
+	then
 		self:__enqueue({ DispatchRequest = frame } :: any)
 		return
 	end

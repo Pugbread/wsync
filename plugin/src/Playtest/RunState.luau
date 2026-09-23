@@ -22,6 +22,11 @@
 --     emitted";
 --   * the exit-code mapping: success 0, failure 2, timeout 3, aborted 4,
 --     boot failure 5;
+--   * the self-contained terminal: every client failure reported during
+--     the run (a failed `clientResult` with its traceback, an error-level
+--     `log` from a PlayClient) is repeated on the `result`/`aborted` record
+--     as `clientFailures` — a client that errored is usually *why* the main
+--     script sat waiting until the hard timeout;
 --   * destructive-ack poll pagination: records at or below `sinceSeq` are
 --     acknowledged and freed, everything newer is delivered oldest-first
 --     under record/byte caps.
@@ -53,6 +58,12 @@ RunState.LIMITS = {
 	bootDeadlineSec = 45,
 	-- Heartbeat staleness threshold (keep in sync with Protocol.LIMITS)
 	heartbeatStaleSec = 6,
+	-- Client failures repeated on the terminal record; the progress records
+	-- keep the full text (keep in sync with src/cli/live/playtest.rs)
+	maxClientFailureResults = 32,
+	maxClientFailureLogs = 16,
+	clientFailureErrorBytes = 8 * 1024,
+	clientFailureTracebackBytes = 32 * 1024,
 }
 
 export type Outcome = "success" | "failure" | "timeout" | "aborted" | "bootFailure"
@@ -97,6 +108,15 @@ type QueueEntry = {
 	record: { [string]: any },
 }
 
+export type ClientFailures = {
+	-- `{context, source, error, traceback?, count?, seq?, t}` in arrival order
+	entries: { { [string]: any } },
+	results: number,
+	logs: number,
+	-- Failures past the caps: counted, never listed
+	omitted: number,
+}
+
 export type State = {
 	config: Config,
 	argsJson: string,
@@ -119,6 +139,7 @@ export type State = {
 	mainBootClock: number?,
 	heartbeats: { [string]: number },
 	heartbeatStale: { [string]: any }?,
+	clientFailures: ClientFailures,
 }
 
 local function invalid(message: string): never
@@ -412,6 +433,125 @@ local function flushQueueDropped(state: State, now: number)
 	appendRecord(state, marker, now)
 end
 
+--------------------------------------------------------------------------------
+-- Client failures (repeated on the terminal record)
+--------------------------------------------------------------------------------
+
+--- Cut `value` to at most `limit` bytes on a UTF-8 boundary, marking the cut.
+--- The terminal record is JSON-encoded with its poll page, and a split code
+--- point there would fail the whole page.
+local function capText(value: string, limit: number): string
+	if #value <= limit then
+		return value
+	end
+
+	local cut = limit
+
+	-- Back off while the byte after the cut continues a code point
+	while cut > 0 do
+		local nextByte = string.byte(value, cut + 1)
+
+		if nextByte == nil or nextByte < 0x80 or nextByte >= 0xC0 then
+			break
+		end
+
+		cut -= 1
+	end
+
+	return string.sub(value, 1, cut) .. "<truncated>"
+end
+
+--- Which client failure a record reports, if any: a `clientResult` that did
+--- not succeed (a client playscript error, an escaped task error, a client
+--- boot failure, an unreadable result), or an error-level `log` line from a
+--- PlayClient. Mirrors `client_failure_source` in src/cli/live/playtest.rs.
+local function clientFailureSource(record: { [string]: any }): string?
+	if record.type == "clientResult" and record.ok ~= true then
+		return "clientResult"
+	end
+
+	if
+		record.type == "log"
+		and record.level == "error"
+		and type(record.context) == "string"
+		and string.sub(record.context, 1, 7) == "client:"
+	then
+		return "log"
+	end
+
+	return nil
+end
+
+--- Keep a bounded copy of a client failure for the terminal record. Runs
+--- after the record was offered to the queue, so `seq`/`t` name the progress
+--- record that carried it — or are absent/derived when telemetry could not
+--- fit (the terminal is then the only place that failure survives).
+local function noteClientFailure(state: State, record: { [string]: any }, now: number)
+	local source = clientFailureSource(record)
+
+	if source == nil then
+		return
+	end
+
+	local failures = state.clientFailures
+	local context = if type(record.context) == "string" then record.context else "client"
+	local at = if type(record.t) == "number" then record.t else runClock(state, now)
+
+	if source == "log" then
+		local message = capText(tostring(record.message or ""), RunState.LIMITS.clientFailureErrorBytes)
+
+		-- A client erroring every frame is one failure, not a flood
+		for _, entry in failures.entries do
+			if entry.source == "log" and entry.context == context and entry.error == message then
+				entry.count += 1
+
+				return
+			end
+		end
+
+		if failures.logs >= RunState.LIMITS.maxClientFailureLogs then
+			failures.omitted += 1
+
+			return
+		end
+
+		local entry: { [string]: any } = {
+			context = context,
+			source = "log",
+			error = message,
+			count = 1,
+			seq = record.seq,
+			t = at,
+		}
+
+		failures.logs += 1
+		table.insert(failures.entries, entry)
+
+		return
+	end
+
+	if failures.results >= RunState.LIMITS.maxClientFailureResults then
+		failures.omitted += 1
+
+		return
+	end
+
+	local entry: { [string]: any } = {
+		context = context,
+		source = "clientResult",
+		error = capText(tostring(record.error or "client playscript failed"), RunState.LIMITS.clientFailureErrorBytes),
+		seq = record.seq,
+		t = at,
+	}
+
+	if record.traceback ~= nil then
+		entry.traceback = capText(tostring(record.traceback), RunState.LIMITS.clientFailureTracebackBytes)
+	end
+
+	failures.results += 1
+	table.insert(failures.entries, entry)
+end
+
 --- Append one record. Producers are inert once the run is terminal — the
 --- `result`/`aborted` record enqueued by `finalize` is always the last.
 --- Returns whether the record landed (a false return has been counted).
@@ -422,7 +562,11 @@ function RunState.enqueue(state: State, record: { [string]: any }, now: number):
 
 	flushQueueDropped(state, now)
 
-	return rawEnqueue(state, record, now, IMPORTANT[record.type] == true)
+	local landed = rawEnqueue(state, record, now, IMPORTANT[record.type] == true)
+
+	noteClientFailure(state, record, now)
+
+	return landed
 end
 
 --------------------------------------------------------------------------------
@@ -457,6 +601,7 @@ function RunState.create(config: Config, argsJson: string, jobId: string, now: n
 		mainBootClock = nil,
 		heartbeats = {},
 		heartbeatStale = nil,
+		clientFailures = { entries = {}, results = 0, logs = 0, omitted = 0 },
 	}
 
 	local started: { [string]: any } = {
@@ -733,6 +878,10 @@ end
 --- Make the pending (or given) terminal final and enqueue the last record:
 --- `aborted` for aborted outcomes, `result` for everything else. Any pending
 --- drop accounting is flushed first so its marker precedes the terminal.
+--- The record is self-contained: it carries its `exitCode` and final
+--- `jobStatus`, and — whatever the outcome — every client failure reported
+--- during the run as `clientFailures` (plus `clientFailuresOmitted` past the
+--- caps). A run without client failures has neither field.
 function RunState.finalize(state: State, terminal: Terminal?, now: number, stopError: string?): boolean
 	if state.terminal ~= nil then
 		return false
@@ -773,12 +922,27 @@ function RunState.finalize(state: State, terminal: Terminal?, now: number, stopE
 			error = effective.error,
 			traceback = effective.traceback,
 			context = effective.context,
+			jobStatus = effective.jobStatus,
 			elapsed = effective.elapsed,
 		}
 	end
 
+	record.exitCode = RunState.exitCode(effective.outcome)
+
 	if effective.stopError ~= nil then
 		record.stopError = effective.stopError
+	end
+
+	-- Producers are inert from here on, so the list is final and can be
+	-- handed over without a copy
+	local failures = state.clientFailures
+
+	if #failures.entries > 0 then
+		record.clientFailures = failures.entries
+
+		if failures.omitted > 0 then
+			record.clientFailuresOmitted = failures.omitted
+		end
 	end
 
 	-- Reserve room for the final pair — the pending `dropped` marker (which

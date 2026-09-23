@@ -2,13 +2,14 @@
   "name": "status",
   "title": "wsync status",
   "category": "Live diagnostics",
-  "description": "Summarizes daemon reachability, plugin handshake, project config, sourcemap, and write-log health.",
+  "description": "Summarizes daemon reachability, plugin handshake, pending outbound changes, project config, sourcemap, and write-log health.",
   "usage": "wsync status [--project <path>] [--port <port>] [--raw]",
   "examples": [
     "wsync status --project .",
     "wsync status --project . --raw"
   ],
   "notes": [
-    "Use when the task needs current daemon/plugin health or a failed live operation needs diagnosis. Existing fresh context often makes another status call unnecessary; there is no mandatory context/status startup pair."
+    "Use when the task needs current daemon/plugin health or a failed live operation needs diagnosis. Existing fresh context often makes another status call unnecessary; there is no mandatory context/status startup pair.",
+    "`outbound` counts changes for Studio the daemon has not seen applied yet: `queuedChanges` not yet on the plugin connection, `unconfirmedChanges` sent since the last `wsync wait-synced` confirmed them, plus `unprocessedEvents` still in the file watcher pipeline. Run `wsync wait-synced` to drain and confirm them."
   ]
 }

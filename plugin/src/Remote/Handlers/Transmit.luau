@@ -54,7 +54,6 @@ local Rules = require(script.Parent.Parent.TransmitRules)
 local WriteRules = require(script.Parent.Parent.WriteRules)
 
 local Capture = require(script.Parent.Capture)
-local History = require(script.Parent.History)
 local Write = require(script.Parent.Write)
 
 type Args = { [string]: any }
@@ -371,17 +370,15 @@ end
 --- The `source` batch: run the chunk at the `eval` trust level, then
 --- normalize whatever it returned into targets.
 ---
---- The chunk is bracketed and audited exactly like `eval` the moment it
---- returns — before the batch can fail on anything downstream — so
---- place-visible Luau that ran is always undoable and always in the daemon's
---- writes.log (Design §6.4; the `ctx.audit` sink is designed to survive a
---- failed response for precisely this reason).
+--- The chunk is audited exactly like `eval` the moment it returns — before
+--- the batch can fail on anything downstream — so place-visible Luau that
+--- ran is always in the daemon's writes.log (Design §6.4; the `ctx.audit`
+--- sink is designed to survive a failed response for precisely this reason).
 local function collectSource(batch: Rules.Batch, raw: any, ctx: any): { Target }
 	local returns = Write.runSource(raw, "wsync-transmit", "the transmit source raised")
 
-	-- Bracket and audit before anything downstream can raise (eval's shape,
-	-- verbatim): the chunk has already run by this point.
-	History.opWaypoint("transmit_prepare", "")
+	-- Audit before anything downstream can raise (eval's shape, verbatim):
+	-- the chunk has already run by this point.
 	ctx.audit(WriteRules.shapeAudit("transmit_prepare", ""))
 
 	local values = Rules.flattenReturns(returns)

@@ -1,17 +1,152 @@
 use backtrace::Backtrace;
+use chrono::Local;
 use colored::Colorize;
 use log::{error, trace, LevelFilter};
 use open;
 use panic_message::get_panic_info_message;
-use std::{env, panic, process};
+use std::{
+	cell::RefCell,
+	env,
+	fs::OpenOptions,
+	io::Write,
+	panic,
+	path::{Path, PathBuf},
+	process,
+	sync::Mutex,
+	thread,
+};
 
 use crate::{logger, util, wsync_error};
 
 const MAX_BACKTRACE_LEN: usize = 6500;
 
+/// How many breadcrumbs a crash report names: the innermost few say what
+/// was being processed, the outermost says where the walk started
+const REPORTED_BREADCRUMBS: usize = 4;
+
+/// The log file a panic is appended to besides stderr — the daemon's
+/// lifecycle journal, so a daemon that dies unattended leaves its reason
+/// where `wsync daemon logs` looks
+static PANIC_LOG: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+thread_local! {
+	/// What this thread is working on, outermost first (see `breadcrumb`)
+	static BREADCRUMBS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Routes crash reports into `path` as well as stderr. Called by the daemon
+/// before its first snapshot, so a crash while loading the project is
+/// journaled too
+pub fn set_panic_log(path: &Path) {
+	*PANIC_LOG.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path.to_owned());
+}
+
+/// A scoped note of what the current thread is doing ("snapshotting
+/// <path>"). The panic hook reports the trail of live breadcrumbs, so a
+/// crash names the path being processed. Dropping the guard pops it.
+///
+/// Only a *panic* reaches the hook: a stack overflow aborts the process
+/// without running any hook, which is why the snapshot walk carries a hard
+/// depth guard (`middleware::MAX_SNAPSHOT_DEPTH`) that turns runaway
+/// recursion into an ordinary error naming the path instead
+#[must_use = "the breadcrumb is popped when the guard drops"]
+pub struct Breadcrumb {
+	// Breadcrumbs are thread-local: the guard must drop on the thread that
+	// pushed it
+	_not_send: std::marker::PhantomData<*const ()>,
+}
+
+pub fn breadcrumb(label: String) -> Breadcrumb {
+	BREADCRUMBS.with(|breadcrumbs| breadcrumbs.borrow_mut().push(label));
+
+	Breadcrumb {
+		_not_send: std::marker::PhantomData,
+	}
+}
+
+impl Drop for Breadcrumb {
+	fn drop(&mut self) {
+		BREADCRUMBS
+			.try_with(|breadcrumbs| {
+				if let Ok(mut breadcrumbs) = breadcrumbs.try_borrow_mut() {
+					breadcrumbs.pop();
+				}
+			})
+			.ok();
+	}
+}
+
+/// The current thread's live breadcrumbs, outermost first
+pub fn breadcrumbs() -> Vec<String> {
+	BREADCRUMBS
+		.try_with(|breadcrumbs| {
+			breadcrumbs
+				.try_borrow()
+				.map(|breadcrumbs| breadcrumbs.clone())
+				.unwrap_or_default()
+		})
+		.unwrap_or_default()
+}
+
+/// One line naming what the thread was doing: the innermost breadcrumbs,
+/// plus the outermost one when the trail is longer than that
+fn describe_breadcrumbs(trail: &[String]) -> Option<String> {
+	let innermost = trail.last()?;
+	let mut description = innermost.clone();
+
+	if trail.len() > 1 {
+		let skip = trail.len().saturating_sub(REPORTED_BREADCRUMBS);
+		let within: Vec<&str> = trail[skip..trail.len() - 1].iter().rev().map(String::as_str).collect();
+
+		description.push_str(&format!(" (within: {}", within.join(" < ")));
+
+		if skip > 0 {
+			description.push_str(&format!(" < … {} more < {}", skip - 1, trail[0]));
+		}
+
+		description.push(')');
+	}
+
+	Some(description)
+}
+
+/// Appends the crash to the registered log file. Best effort: the hook is
+/// already reporting a crash, so a failing write is ignored
+fn journal_panic(message: &str, location: &str, breadcrumbs: Option<&str>) {
+	let Some(path) = PANIC_LOG.lock().ok().and_then(|path| path.clone()) else {
+		return;
+	};
+
+	let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) else {
+		return;
+	};
+
+	let stamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+	let thread = thread::current();
+	let thread = thread.name().unwrap_or("unnamed");
+
+	writeln!(file, "[{stamp}] PANIC in thread '{thread}' at {location}: {message}").ok();
+
+	if let Some(breadcrumbs) = breadcrumbs {
+		writeln!(file, "[{stamp}] PANIC while {breadcrumbs}").ok();
+	}
+
+	file.sync_all().ok();
+}
+
 pub fn hook() {
 	panic::set_hook(Box::new(|panic_info| {
 		let message = get_panic_info_message(panic_info).unwrap_or("Failed to get panic info message");
+		let location = panic_info
+			.location()
+			.map(|location| format!("{}:{}", location.file(), location.line()))
+			.unwrap_or_else(|| String::from("unknown location"));
+		let breadcrumbs = describe_breadcrumbs(&breadcrumbs());
+
+		// The journal first: everything below may block (the issue prompt)
+		// or fail, and an unattended daemon has nobody reading stderr
+		journal_panic(message, &location, breadcrumbs.as_deref());
+
 		let backtrace_enabled = util::env_backtrace();
 		let verbosity = util::env_verbosity();
 
@@ -36,6 +171,13 @@ pub fn hook() {
 			wsync_error!("{}: {}: {}", "Location".bold(), location.file(), location.line());
 		} else {
 			report.push_str("Failed to get panic info location");
+		}
+
+		if let Some(breadcrumbs) = &breadcrumbs {
+			report.push_str("\n\nWhile:\n------\n");
+			report.push_str(breadcrumbs);
+
+			wsync_error!("{}: {}", "While".bold(), breadcrumbs);
 		}
 
 		report.push_str("\n\nVerbose output:\n----------------\n");
@@ -108,4 +250,57 @@ pub fn hook() {
 
 		process::exit(1)
 	}));
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn breadcrumbs_are_scoped_and_described_innermost_first() {
+		assert!(breadcrumbs().is_empty());
+
+		{
+			let _outer = breadcrumb("snapshotting /p".into());
+			let _inner = breadcrumb("snapshotting /p/a".into());
+
+			assert_eq!(breadcrumbs(), vec!["snapshotting /p", "snapshotting /p/a"]);
+			assert_eq!(
+				describe_breadcrumbs(&breadcrumbs()).unwrap(),
+				"snapshotting /p/a (within: snapshotting /p)"
+			);
+		}
+
+		assert!(breadcrumbs().is_empty(), "guards pop on drop");
+
+		let long: Vec<String> = (0..10).map(|index| format!("level {index}")).collect();
+		assert_eq!(
+			describe_breadcrumbs(&long).unwrap(),
+			"level 9 (within: level 8 < level 7 < level 6 < … 5 more < level 0)"
+		);
+		assert_eq!(describe_breadcrumbs(&[]), None);
+	}
+
+	#[test]
+	fn breadcrumbs_are_per_thread() {
+		let _crumb = breadcrumb("main work".into());
+
+		let other = thread::spawn(breadcrumbs).join().unwrap();
+		assert!(other.is_empty(), "another thread never sees this thread's trail");
+	}
+
+	#[test]
+	fn a_panic_is_journaled_with_its_breadcrumb() {
+		let dir = tempfile::tempdir().unwrap();
+		let log = dir.path().join("daemon.log");
+
+		set_panic_log(&log);
+		journal_panic("boom", "src/x.rs:1", Some("snapshotting /p/a"));
+		*PANIC_LOG.lock().unwrap() = None;
+
+		let text = std::fs::read_to_string(&log).unwrap();
+		assert!(text.contains("PANIC in thread"), "{text}");
+		assert!(text.contains("at src/x.rs:1: boom"), "{text}");
+		assert!(text.contains("PANIC while snapshotting /p/a"), "{text}");
+	}
 }

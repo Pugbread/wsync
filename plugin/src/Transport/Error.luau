@@ -35,19 +35,18 @@ function Error.__new(message: string, kind: string): Error
 	return err
 end
 
+--- A copy of `err` with its `$n` placeholders filled — safe for any
+--- argument text, `%` included (Util.interpolate)
 function Error.new(err: Error, ...): Error
 	err = table.clone(err)
-
-	for i, v in { ... } do
-		err.message = err.message:gsub("$" .. i, Util.stringify(v))
-	end
+	err.message = Util.interpolate(err.message, ...)
 
 	return err
 end
 
 function Error.fromResponse(response: { [string]: any }): Error
 	local message = response.Body ~= "" and response.Body or response.StatusMessage
-	return Error.__new(Error.Unknown.message:gsub("$1", message), "Unknown")
+	return Error.__new(Util.interpolate(Error.Unknown.message, message), "Unknown")
 end
 
 function Error.fromMessage(message: string): Error
@@ -61,7 +60,7 @@ function Error.fromMessage(message: string): Error
 		return Error.new(Error.ConnectFail)
 	end
 
-	return Error.__new(Error.Unknown.message:gsub("$1", message), "Unknown")
+	return Error.__new(Util.interpolate(Error.Unknown.message, message), "Unknown")
 end
 
 function Error:__eq(other: Error): boolean

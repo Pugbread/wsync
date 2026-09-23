@@ -3,13 +3,14 @@
   "title": "wsync get",
   "category": "Live inspection",
   "description": "Reads an instance view or one property from the live Studio session.",
-  "usage": "wsync get [--project <path>] [--port <port>] --path <studio-path> [--prop <property>] [--raw]",
+  "usage": "wsync get [--project <path>] [--port <port>] (<studio-path> | --path <studio-path>) [--prop <property>] [--raw]",
   "examples": [
-    "wsync get --project . --path Workspace/Camera --prop FieldOfView",
+    "wsync get Workspace/Camera --project . --prop FieldOfView",
     "wsync get --project . --path ReplicatedStorage/Shared --raw"
   ],
   "notes": [
     "Requires the daemon and Studio plugin to be connected.",
-    "Reads the whole live DataModel, including instances the project does not project to disk."
+    "Reads the whole live DataModel, including instances the project does not project to disk.",
+    "The Studio path is positional or `--path` — every single-instance command takes both forms; passing both is accepted only when they name the same path."
   ]
 }

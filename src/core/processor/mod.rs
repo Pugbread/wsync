@@ -65,6 +65,7 @@ struct QueuedWrite {
 
 pub struct Processor {
 	writer: Sender<QueuedWrite>,
+	fences: Sender<tokio::sync::oneshot::Sender<usize>>,
 }
 
 impl Processor {
@@ -85,6 +86,7 @@ impl Processor {
 
 		let handler = handler.clone();
 		let (sender, receiver) = crossbeam_channel::unbounded();
+		let (fence_sender, fence_receiver) = crossbeam_channel::unbounded::<tokio::sync::oneshot::Sender<usize>>();
 
 		Builder::new()
 			.name("processor".into())
@@ -102,12 +104,40 @@ impl Processor {
 							handler.on_client_event(request?);
 							vfs.resume();
 						}
+						recv(fence_receiver) -> fence => {
+							// `select!` picks among ready channels at random, so
+							// the fence drains what the watcher had already
+							// handed over before it answers. Bounded by the
+							// backlog at this moment: a steady stream of new
+							// events cannot hold the fence open
+							let mut drained = 0;
+
+							for _ in 0..vfs_receiver.len() {
+								let Ok(event) = vfs_receiver.try_recv() else { break };
+
+								handler.on_vfs_event(event);
+								drained += 1;
+							}
+
+							fence?.send(drained).ok();
+						}
 					}
 				}
 			})
 			.unwrap();
 
-		Self { writer: sender }
+		Self {
+			writer: sender,
+			fences: fence_sender,
+		}
+	}
+
+	/// Answers on `done` (with the number of watcher events it drained) once
+	/// every watcher event already handed to the processor has been processed
+	/// — and therefore every resulting change pushed to the queue. The
+	/// `wait-synced` barrier's processor stage
+	pub fn fence(&self, done: tokio::sync::oneshot::Sender<usize>) {
+		self.fences.send(done).ok();
 	}
 
 	pub fn write(&self, request: WriteRequest) {
@@ -141,6 +171,9 @@ impl Handler {
 		profiling::start_frame!();
 
 		trace!("Received VFS event: {event:?}");
+
+		// Named in the crash report (and the daemon log) if anything below panics
+		let _breadcrumb = crate::crash_handler::breadcrumb(format!("processing the file event {event:?}"));
 
 		let engine_on = Config::new().conflict_engine;
 

@@ -88,6 +88,12 @@ function Bulk.attach(newSession: Session)
 	clearTransferState()
 end
 
+--- The attached session, or nil between sessions (the verify ops in
+--- Handlers/Sync resolve refs through the same bridge).
+function Bulk.activeSession(): Session?
+	return session
+end
+
 --- Core detaches on stop; a torn-down session invalidates every transfer.
 function Bulk.detach()
 	session = nil

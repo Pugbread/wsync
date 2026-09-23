@@ -208,7 +208,7 @@ async fn each_op_type_audits_its_real_target() {
 		),
 		// DataModel-scoped ops legitimately audit an empty target
 		("eval", json!({ "op": "eval", "target": "" })),
-		("save", json!({ "op": "save", "target": "" })),
+		("undo", json!({ "op": "undo", "target": "" })),
 	];
 
 	let canned = ops

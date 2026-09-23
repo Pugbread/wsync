@@ -137,6 +137,32 @@ pub fn get_all() -> Result<HashMap<String, Session>> {
 	Ok(get_sessions()?.active_sessions)
 }
 
+/// Ports of every registered session, read without creating, repairing or
+/// rewriting the registry — for the per-command daemon-down check, which
+/// must never touch disk. A missing or corrupted registry reads as empty
+pub fn peek_ports() -> Vec<u16> {
+	let Ok(path) = util::get_wsync_dir().map(|dir| dir.join("sessions.toml")) else {
+		return Vec::new();
+	};
+	let Ok(text) = fs::read_to_string(path) else {
+		return Vec::new();
+	};
+
+	let mut ports: Vec<u16> = toml::from_str::<Sessions>(&text)
+		.map(|sessions| {
+			sessions
+				.active_sessions
+				.into_values()
+				.filter_map(|session| session.port)
+				.collect()
+		})
+		.unwrap_or_default();
+
+	ports.sort_unstable();
+	ports.dedup();
+	ports
+}
+
 pub fn remove(session: &Session) -> Result<()> {
 	let mut sessions = get_sessions()?;
 

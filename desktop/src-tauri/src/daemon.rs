@@ -16,14 +16,22 @@
 //! * The registry lock is never held across an await that can block on a child.
 //!   `stop` removes its entry first and then runs the stop sequence, so the
 //!   supervisor task that reaps the child can always take the lock.
+//! * An *unexpected* end — the child exiting on its own, or three heartbeats in
+//!   a row going unanswered — is the one thing this module reports on its own
+//!   initiative, and it is reported loudly: a note in the project's daemon
+//!   journal (the daemon cannot write one after a stack overflow), a
+//!   `daemon:down`, and one OS notification per incident. A deliberate teardown
+//!   sets `expected_exit` first and says nothing through this path.
 
 use std::{
     collections::{HashMap, VecDeque},
     ffi::OsString,
+    fmt::Write as _,
     future::Future,
+    io::Write as _,
     path::{Path, PathBuf},
     pin::Pin,
-    process::Stdio,
+    process::{ExitStatus, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -33,7 +41,9 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tauri::{AppHandle, Emitter as _};
+use sha2::{Digest as _, Sha256};
+use tauri::{AppHandle, Emitter as _, Manager as _};
+use tauri_plugin_notification::NotificationExt as _;
 use tokio::{
     io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader},
     process::{Child, Command},
@@ -85,6 +95,31 @@ const SHUTDOWN_BUDGET: Duration = Duration::from_secs(6);
 /// Lines of the child's stderr kept for diagnostics. Bounded so a looping
 /// daemon cannot grow the host's memory.
 const STDERR_TAIL_LINES: usize = 24;
+
+/// Characters kept per stderr line, for the same reason: the line count alone
+/// does not bound a daemon that prints one enormous line.
+const STDERR_LINE_CHARS: usize = 500;
+
+/// How long an unexpected exit waits for the stderr reader to reach EOF before
+/// the tail is read. A Rust stack overflow's message is the very last thing the
+/// process writes, so reading the tail the moment `wait()` returns can miss
+/// exactly the line that explains the death. Bounded, because a grandchild that
+/// inherited the pipe can hold it open indefinitely.
+const STDERR_DRAIN_GRACE: Duration = Duration::from_millis(500);
+
+/// Characters of reason an OS notification carries. Banners truncate long
+/// bodies unpredictably, so the host cuts first, at a known place.
+const ALERT_REASON_CHARS: usize = 160;
+
+/// `DaemonLog::note`'s timestamp layout in the engine (`src/daemon.rs`). The
+/// notes this host appends must be indistinguishable from the daemon's own.
+const JOURNAL_STAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+
+/// The journal prefixes the engine parses (`MANAGER_*_NOTE` in `src/daemon.rs`).
+/// A contract, not wording: `wsync daemon logs` keys on them.
+const JOURNAL_EXIT_NOTE: &str = "Manager: daemon exited unexpectedly";
+const JOURNAL_HEARTBEAT_NOTE: &str = "Manager: heartbeat lost";
+const JOURNAL_STDERR_NOTE: &str = "Manager: stderr | ";
 
 /// The daemon routes the webview's data layer may reach through the host
 /// (Design 5.2). Not a proxy: an exact-path allowlist, GET only, and the target
@@ -622,19 +657,50 @@ impl DaemonRegistry {
         tasks.push(tokio::spawn(async move {
             while let Ok(Some(_line)) = lines.next_line().await {}
         }));
+        // Fires when the stderr reader reaches EOF — or is dropped unsent, when
+        // there is no stderr at all — so the supervisor knows the tail is whole.
+        let (stderr_done_tx, stderr_done) = oneshot::channel::<()>();
         if let Some(stderr) = stderr {
             let tail = Arc::clone(&stderr_tail);
             tasks.push(tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
+                // Split on raw bytes rather than `lines()`: one invalid UTF-8
+                // byte would end a `lines()` loop, and with it the draining.
+                let mut segments = BufReader::new(stderr).split(b'\n');
+                while let Ok(Some(bytes)) = segments.next_segment().await {
+                    let line = clean_stderr_line(&String::from_utf8_lossy(&bytes));
+                    if line.is_empty() {
+                        continue;
+                    }
                     let mut tail = tail.lock().await;
                     if tail.len() == STDERR_TAIL_LINES {
                         tail.pop_front();
                     }
                     tail.push_back(line);
                 }
+                let _ = stderr_done_tx.send(());
             }));
         }
+
+        let reporter = Reporter {
+            events: Arc::clone(&self.events),
+            project_id: project_id.to_string(),
+            boot_id: ready.boot_id.clone(),
+            // A daemon somebody else manages keeps its own journal; this host
+            // is not its manager and must not write `Manager:` notes into it.
+            journal: (!ready.already_running).then(|| JournalTarget {
+                data_dir: data_dir.to_path_buf(),
+                // The engine keys the journal on the canonical project; the
+                // path we were given is the only fallback there is.
+                canonical_project: if ready.canonical_project.is_empty() {
+                    project_path.to_string()
+                } else {
+                    ready.canonical_project.clone()
+                },
+            }),
+            stderr_tail: Arc::clone(&stderr_tail),
+            expected_exit: Arc::clone(&expected_exit),
+            down_reported: Arc::new(AtomicBool::new(false)),
+        };
 
         let child_control = if ready.already_running {
             // Per the contract this child has already exited and the daemon it
@@ -647,14 +713,11 @@ impl DaemonRegistry {
             let (kill_tx, kill_rx) = oneshot::channel::<()>();
             let (exited_tx, exited_rx) = watch::channel(false);
             tasks.push(spawn_supervisor(
-                Arc::clone(&self.events),
-                project_id.to_string(),
-                ready.boot_id.clone(),
                 child,
                 kill_rx,
                 exited_tx,
-                Arc::clone(&stderr_tail),
-                Arc::clone(&expected_exit),
+                stderr_done,
+                reporter.clone(),
             ));
             Some(ChildControl {
                 kill: Some(kill_tx),
@@ -662,7 +725,12 @@ impl DaemonRegistry {
             })
         };
 
-        tasks.push(self.spawn_heartbeat(project_id.to_string(), session.port, token.clone()));
+        tasks.push(spawn_heartbeat(
+            session.clone(),
+            token.clone(),
+            child_control.as_ref().map(|control| control.exited.clone()),
+            reporter,
+        ));
 
         self.entries.lock().await.insert(
             project_id.to_string(),
@@ -678,38 +746,6 @@ impl DaemonRegistry {
 
         self.events.up(&session);
         Ok(session)
-    }
-
-    /// Design 3.3: one beat per served project while it is served.
-    fn spawn_heartbeat(&self, project_id: String, port: u16, token: String) -> JoinHandle<()> {
-        let events = Arc::clone(&self.events);
-        tokio::spawn(async move {
-            let body = serde_json::json!({ "token": token });
-            let mut failures = 0u32;
-            let mut reported_down = false;
-            loop {
-                time::sleep(HEARTBEAT_INTERVAL).await;
-                match post_json(port, "/manager-heartbeat", &body).await {
-                    Ok(_) => {
-                        failures = 0;
-                        reported_down = false;
-                    }
-                    Err(error) => {
-                        failures += 1;
-                        if failures >= HEARTBEAT_FAILURES_BEFORE_DOWN && !reported_down {
-                            reported_down = true;
-                            emit_down(
-                                &events,
-                                &project_id,
-                                "heartbeat-lost",
-                                &format!("The daemon stopped answering heartbeats: {error}"),
-                                None,
-                            );
-                        }
-                    }
-                }
-            }
-        })
     }
 
     // ---------------------------------------------------------------- stop --
@@ -1039,41 +1075,185 @@ async fn hello(port: u16) -> Result<Value, String> {
         .ok_or_else(|| "/hello did not answer with JSON".to_string())
 }
 
-/// Reaps the child and reports an *unexpected* exit exactly once. A deliberate
-/// teardown sets `expected_exit` and emits its own, richer `daemon:down`.
-#[allow(clippy::too_many_arguments)]
-fn spawn_supervisor(
+/// Where an unexpected end of a daemon this host manages is written down.
+#[derive(Clone)]
+struct JournalTarget {
+    /// The directory the child was given as `--data-dir`.
+    data_dir: PathBuf,
+    canonical_project: String,
+}
+
+/// What the supervisor and the heartbeat share to report an *unexpected* end:
+/// who to tell, where the journal is, the stderr evidence, and the two flags
+/// that keep a deliberate stop quiet and one incident down to one alert.
+#[derive(Clone)]
+struct Reporter {
     events: Arc<dyn DaemonEvents>,
     project_id: String,
     boot_id: String,
+    /// `None` for an adopted daemon: its journal belongs to its own manager.
+    journal: Option<JournalTarget>,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    /// The entry's flag: set before any deliberate teardown.
+    expected_exit: Arc<AtomicBool>,
+    /// Set by whichever task reports the incident first. A heartbeat that is
+    /// lost and then a process that exits are one incident, not two alerts;
+    /// the heartbeat clears it again if the daemon starts answering.
+    down_reported: Arc<AtomicBool>,
+}
+
+impl Reporter {
+    async fn stderr_snapshot(&self) -> Vec<String> {
+        self.stderr_tail.lock().await.iter().cloned().collect()
+    }
+
+    /// Journal first, so the evidence is on disk before anyone is told to go
+    /// and look; then `daemon:down`; then, for the first report of an
+    /// incident only, the OS alert. Quiet if a deliberate stop got here first.
+    fn report(&self, reason: &str, detail: &str, summary: &str, notes: &[String]) {
+        if self.expected_exit.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Some(journal) = &self.journal {
+            // Best effort: a journal that cannot be written must not cost the
+            // user the event or the alert, which are the parts they will see.
+            if let Err(error) =
+                append_daemon_log(&journal.data_dir, &journal.canonical_project, notes)
+            {
+                eprintln!("wsync-desktop: could not append to the daemon journal: {error}");
+            }
+        }
+        let event = DownEvent {
+            project_id: self.project_id.clone(),
+            reason: reason.to_string(),
+            detail: detail.to_string(),
+            boot_id: Some(self.boot_id.clone()),
+        };
+        self.events.down(&event);
+        if !self.down_reported.swap(true, Ordering::SeqCst) {
+            self.events.alert(&event, summary);
+        }
+    }
+}
+
+/// Reaps the child and reports an *unexpected* exit exactly once. A deliberate
+/// teardown sets `expected_exit` and emits its own, richer `daemon:down`.
+fn spawn_supervisor(
     mut child: Child,
     kill_rx: oneshot::Receiver<()>,
     exited_tx: watch::Sender<bool>,
-    stderr_tail: Arc<Mutex<VecDeque<String>>>,
-    expected_exit: Arc<AtomicBool>,
+    stderr_done: oneshot::Receiver<()>,
+    reporter: Reporter,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let detail = tokio::select! {
-            status = child.wait() => {
-                let code = status.ok().and_then(|status| status.code());
-                let tail = stderr_tail.lock().await.iter().cloned().collect::<Vec<_>>();
-                let head = match code {
-                    Some(0) => "The daemon exited.".to_string(),
-                    Some(code) => format!("The daemon exited with code {code}."),
-                    None => "The daemon was terminated.".to_string(),
-                };
-                if tail.is_empty() { head } else { format!("{head}\n{}", tail.join("\n")) }
-            }
+        let status = tokio::select! {
+            status = child.wait() => status,
             _ = kill_rx => {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
-                "The daemon was stopped by WSync.".to_string()
+                let _ = exited_tx.send(true);
+                if !reporter.expected_exit.load(Ordering::SeqCst) {
+                    emit_down(
+                        &reporter.events,
+                        &reporter.project_id,
+                        "exited",
+                        "The daemon was stopped by WSync.",
+                        Some(&reporter.boot_id),
+                    );
+                }
+                return;
             }
         };
 
+        // A waiting `stop` hears first: the drain below is only for a death
+        // nobody asked for, and must never slow a deliberate one down.
         let _ = exited_tx.send(true);
-        if !expected_exit.load(Ordering::SeqCst) {
-            emit_down(&events, &project_id, "exited", &detail, Some(&boot_id));
+        if reporter.expected_exit.load(Ordering::SeqCst) {
+            return;
+        }
+
+        let _ = time::timeout(STDERR_DRAIN_GRACE, stderr_done).await;
+        let stderr = reporter.stderr_snapshot().await;
+        let status = match status {
+            Ok(status) => describe_exit(&status),
+            Err(error) => format!("status unknown: {error}"),
+        };
+        reporter.report(
+            "exited",
+            &with_stderr(
+                format!("The daemon exited unexpectedly: {status}."),
+                &stderr,
+            ),
+            &with_clue(status.clone(), &stderr),
+            &exit_notes(&status, &stderr),
+        );
+    })
+}
+
+/// Design 3.3: one beat per served project while it is served.
+///
+/// Stops once the supervisor has seen the child exit — that death is already
+/// reported, and beating a closed port would only report it a second time.
+fn spawn_heartbeat(
+    session: DaemonSession,
+    token: String,
+    mut exited: Option<watch::Receiver<bool>>,
+    reporter: Reporter,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let body = serde_json::json!({ "token": token });
+        let mut failures = 0u32;
+        loop {
+            time::sleep(HEARTBEAT_INTERVAL).await;
+            if exited
+                .as_mut()
+                .is_some_and(|exited| *exited.borrow_and_update())
+            {
+                return;
+            }
+            // An adopted daemon checks its own manager's token, so a beat
+            // from us could only ever be refused. For it, liveness is `/hello`.
+            let beat = if session.managed {
+                post_json(session.port, "/manager-heartbeat", &body)
+                    .await
+                    .map(|_| ())
+            } else {
+                hello(session.port).await.map(|_| ())
+            };
+            match beat {
+                Ok(()) => {
+                    failures = 0;
+                    // Answering again after being reported down: the daemon
+                    // is back, and the UI waiting on `daemon:up` should hear so.
+                    if reporter.down_reported.swap(false, Ordering::SeqCst)
+                        && !reporter.expected_exit.load(Ordering::SeqCst)
+                    {
+                        reporter.events.up(&session);
+                    }
+                }
+                Err(error) => {
+                    failures += 1;
+                    if failures >= HEARTBEAT_FAILURES_BEFORE_DOWN
+                        && !reporter.down_reported.load(Ordering::SeqCst)
+                    {
+                        let stderr = reporter.stderr_snapshot().await;
+                        let what = if session.managed {
+                            "heartbeats"
+                        } else {
+                            "/hello"
+                        };
+                        reporter.report(
+                            "heartbeat-lost",
+                            &with_stderr(
+                                format!("The daemon stopped answering {what}: {error}"),
+                                &stderr,
+                            ),
+                            &with_clue(format!("stopped answering {what} ({error})"), &stderr),
+                            &heartbeat_notes(&error, &stderr),
+                        );
+                    }
+                }
+            }
         }
     })
 }
@@ -1191,6 +1371,279 @@ fn epoch_millis() -> u64 {
         .unwrap_or_default()
 }
 
+// ------------------------------------------------------------ stderr + exit --
+
+/// One stderr line as it is kept: ANSI colour sequences and other control
+/// characters removed, trailing whitespace trimmed, and at most
+/// `STDERR_LINE_CHARS` characters. What is left is safe to put in a journal
+/// line, a notification body, or the webview.
+fn clean_stderr_line(line: &str) -> String {
+    let mut clean = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // CSI: `ESC [`, parameters, then one final byte in `@`..=`~`.
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if c == '\t' {
+            clean.push(' ');
+        } else if !c.is_control() {
+            clean.push(c);
+        }
+    }
+    truncate(clean.trim_end(), STDERR_LINE_CHARS)
+}
+
+/// The last stderr line worth quoting on its own: the last non-empty one that
+/// is not a `note:` hint (`note: run with RUST_BACKTRACE=1 …` follows a panic's
+/// message). For a stack overflow that is `fatal runtime error: stack overflow`.
+fn telling_line(stderr: &[String]) -> Option<&str> {
+    stderr
+        .iter()
+        .rev()
+        .map(|line| line.trim())
+        .find(|line| !line.is_empty() && !line.starts_with("note:"))
+}
+
+/// A one-line head followed by the stderr tail — the shape `daemon:down`'s
+/// `detail` has always had, and the one the project-error card splits.
+fn with_stderr(head: String, stderr: &[String]) -> String {
+    if stderr.is_empty() {
+        head
+    } else {
+        format!("{head}\n{}", stderr.join("\n"))
+    }
+}
+
+/// A reason plus the stderr line that explains it, for the one-line places.
+fn with_clue(reason: String, stderr: &[String]) -> String {
+    match telling_line(stderr) {
+        Some(clue) => format!("{reason} — {clue}"),
+        None => reason,
+    }
+}
+
+/// How an exit reads: `exit code 101`, or on Unix `signal 6 (SIGABRT)`. A Rust
+/// stack overflow aborts, so for the crash that matters most the signal *is*
+/// the story, and "terminated" would throw it away.
+fn describe_exit(status: &ExitStatus) -> String {
+    #[cfg(unix)]
+    let signal = {
+        use std::os::unix::process::ExitStatusExt as _;
+        status.signal()
+    };
+    #[cfg(not(unix))]
+    let signal = None;
+    render_exit(status.code(), signal)
+}
+
+fn render_exit(code: Option<i32>, signal: Option<i32>) -> String {
+    match (code, signal) {
+        (Some(code), _) => format!("exit code {code}"),
+        (None, Some(signal)) => match signal_name(signal) {
+            Some(name) => format!("signal {signal} ({name})"),
+            None => format!("signal {signal}"),
+        },
+        (None, None) => "status unknown".to_string(),
+    }
+}
+
+/// The signals a dying daemon plausibly reports. Numbered per platform where
+/// they differ (SIGBUS); anything else is printed as a bare number.
+fn signal_name(signal: i32) -> Option<&'static str> {
+    Some(match signal {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        3 => "SIGQUIT",
+        4 => "SIGILL",
+        5 => "SIGTRAP",
+        6 => "SIGABRT",
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        7 => "SIGBUS",
+        8 => "SIGFPE",
+        9 => "SIGKILL",
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        10 => "SIGBUS",
+        11 => "SIGSEGV",
+        13 => "SIGPIPE",
+        14 => "SIGALRM",
+        15 => "SIGTERM",
+        _ => return None,
+    })
+}
+
+// ------------------------------------------------------------------ journal --
+//
+// The daemon keeps a per-project lifecycle journal (`wsync daemon logs`), but a
+// daemon killed by a signal writes nothing on its way out. So on an unexpected
+// end this host, as its manager, appends what it holds: the exit status and the
+// stderr tail. Path, key, stamp and prefixes all copy the engine (`project_key`,
+// `runtime_paths`, `DaemonLog::note` in `src/daemon.rs`), which parses them.
+
+/// Lowercase hex SHA-256 of the canonical project — the engine's `project_key`.
+fn project_key(canonical_project: &str) -> String {
+    let digest = Sha256::digest(canonical_project.as_bytes());
+    let mut key = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(key, "{byte:02x}");
+    }
+    key
+}
+
+/// `<data dir>/daemons/<key>.log` — the engine's `runtime_paths(..).log`.
+fn daemon_log_path(data_dir: &Path, canonical_project: &str) -> PathBuf {
+    data_dir
+        .join("daemons")
+        .join(format!("{}.log", project_key(canonical_project)))
+}
+
+/// One `Manager: stderr | <line>` note per non-empty stderr line. Empty lines
+/// are skipped rather than written as a bare prefix: the engine trims trailing
+/// whitespace before matching, so an empty note would stop matching and end
+/// the evidence early.
+fn stderr_notes(stderr: &[String]) -> impl Iterator<Item = String> + '_ {
+    stderr
+        .iter()
+        .map(|line| line.trim_end())
+        .filter(|line| !line.is_empty())
+        .map(|line| format!("{JOURNAL_STDERR_NOTE}{line}"))
+}
+
+/// `Manager: daemon exited unexpectedly (<status>)[; last stderr lines follow]`
+/// and the stderr notes after it.
+fn exit_notes(status: &str, stderr: &[String]) -> Vec<String> {
+    let mut notes: Vec<String> = stderr_notes(stderr).collect();
+    let follow = if notes.is_empty() {
+        ""
+    } else {
+        "; last stderr lines follow"
+    };
+    notes.insert(0, format!("{JOURNAL_EXIT_NOTE} ({status}){follow}"));
+    notes
+}
+
+/// `Manager: heartbeat lost (<detail>)` and the stderr notes after it.
+fn heartbeat_notes(detail: &str, stderr: &[String]) -> Vec<String> {
+    std::iter::once(format!("{JOURNAL_HEARTBEAT_NOTE} ({detail})"))
+        .chain(stderr_notes(stderr))
+        .collect()
+}
+
+/// `[stamp] message\n` per message, exactly as `DaemonLog::note` writes them.
+/// A message is one journal line by construction: embedded line breaks become
+/// spaces, so nothing a daemon printed can forge a line of its own.
+fn journal_lines(stamp: &str, messages: &[String]) -> String {
+    let mut text = String::new();
+    for message in messages {
+        let message = message.replace(['\r', '\n'], " ");
+        let _ = writeln!(text, "[{stamp}] {}", message.trim_end());
+    }
+    text
+}
+
+/// Append notes to a project's daemon journal. Append-only — an existing file
+/// is never truncated — and private: on Unix a file this creates is 0600 and a
+/// `daemons` directory it has to create is 0700, as the engine makes them. One
+/// `write_all`, so the notes land together rather than interleaved with a
+/// still-running daemon's own lines.
+fn append_daemon_log(
+    data_dir: &Path,
+    canonical_project: &str,
+    messages: &[String],
+) -> std::io::Result<()> {
+    if messages.is_empty() {
+        return Ok(());
+    }
+    let path = daemon_log_path(data_dir, canonical_project);
+    if let Some(directory) = path.parent() {
+        if !directory.is_dir() {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                builder.mode(0o700);
+            }
+            builder.create(directory)?;
+        }
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let stamp = chrono::Local::now()
+        .format(JOURNAL_STAMP_FORMAT)
+        .to_string();
+    options
+        .open(&path)?
+        .write_all(journal_lines(&stamp, messages).as_bytes())
+}
+
+// ------------------------------------------------------------------- alerts --
+
+/// Title and body of the OS notification for an unexpected end, or `None` for
+/// any reason that is not one. Both halves are bounded here, at a known place,
+/// rather than left to however the OS truncates a long banner.
+fn alert_text(reason: &str, project: &str, summary: &str) -> Option<(String, String)> {
+    let title = match reason {
+        "exited" => "WSync daemon stopped unexpectedly",
+        "heartbeat-lost" => "WSync daemon stopped responding",
+        _ => return None,
+    };
+    let summary = truncate(summary.trim().trim_end_matches('.'), ALERT_REASON_CHARS);
+    let body = format!(
+        "{}: {summary}.\nEdits on disk are not syncing to Studio.",
+        truncate(project.trim(), 60)
+    );
+    Some((title.to_string(), body))
+}
+
+/// The name a person knows the project by, from the registry in `state.json`:
+/// its `name`, else its folder's name. `None` when the id is not registered.
+fn label_from_registry(projects: &Value, project_id: &str) -> Option<String> {
+    let record = projects
+        .as_array()?
+        .iter()
+        .find(|project| project.get("id").and_then(Value::as_str) == Some(project_id))?;
+    let name = record
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    match name {
+        Some(name) => Some(name.to_string()),
+        None => record
+            .get("path")
+            .and_then(Value::as_str)
+            .and_then(|path| Path::new(path).file_name())
+            .map(|name| name.to_string_lossy().into_owned()),
+    }
+}
+
+/// The registry read for an alert. Reading `state.json` without the state lock
+/// is safe — every write is an atomic replace — and an alert that has to fall
+/// back to the project id is still an alert.
+fn project_label(app: &AppHandle, project_id: &str) -> String {
+    app.try_state::<crate::AppState>()
+        .and_then(|state| {
+            crate::storage::read_value(&state.paths.state_file, Some("projects")).ok()
+        })
+        .and_then(|projects| label_from_registry(&projects, project_id))
+        .unwrap_or_else(|| project_id.to_string())
+}
+
 // -------------------------------------------------------------------- events --
 
 #[derive(Debug, Clone, Serialize)]
@@ -1212,6 +1665,15 @@ pub(crate) struct DownEvent {
 pub(crate) trait DaemonEvents: Send + Sync + 'static {
     fn up(&self, session: &DaemonSession);
     fn down(&self, event: &DownEvent);
+    /// The first report of an *unexpected* end — the daemon exited on its own
+    /// or stopped answering — always right after the matching `down`. Never
+    /// for a deliberate stop, and once per incident however many ways it is
+    /// observed. `summary` is one line: the status or error, and the stderr
+    /// line that explains it when there is one.
+    ///
+    /// Nothing by default: only the app handle has somewhere to show an alert,
+    /// and a test sink that forgot this method must not start raising real ones.
+    fn alert(&self, _event: &DownEvent, _summary: &str) {}
 }
 
 impl DaemonEvents for AppHandle {
@@ -1221,6 +1683,15 @@ impl DaemonEvents for AppHandle {
 
     fn down(&self, event: &DownEvent) {
         let _ = self.emit("daemon:down", event);
+    }
+
+    /// Sent by the host, not the webview, so `capabilities/main.json` grants
+    /// the webview none of the notification plugin's commands.
+    fn alert(&self, event: &DownEvent, summary: &str) {
+        let project = project_label(self, &event.project_id);
+        if let Some((title, body)) = alert_text(&event.reason, &project, summary) {
+            let _ = self.notification().builder().title(title).body(body).show();
+        }
     }
 }
 
@@ -1604,6 +2075,9 @@ mod tests {
     struct Recorder {
         ups: StdMutex<Vec<DaemonSession>>,
         downs: StdMutex<Vec<DownEvent>>,
+        /// `(reason, summary)` per alert — what would have become an OS
+        /// notification. Recorded instead, so no test ever raises a real one.
+        alerts: StdMutex<Vec<(String, String)>>,
     }
 
     impl DaemonEvents for Recorder {
@@ -1612,6 +2086,12 @@ mod tests {
         }
         fn down(&self, event: &DownEvent) {
             self.downs.lock().unwrap().push(event.clone());
+        }
+        fn alert(&self, event: &DownEvent, summary: &str) {
+            self.alerts
+                .lock()
+                .unwrap()
+                .push((event.reason.clone(), summary.to_string()));
         }
     }
 
@@ -1626,6 +2106,9 @@ mod tests {
                 .iter()
                 .map(|event| event.reason.clone())
                 .collect()
+        }
+        fn alerts(&self) -> Vec<(String, String)> {
+            self.alerts.lock().unwrap().clone()
         }
     }
 
@@ -1871,6 +2354,333 @@ exec sleep 30"#,
         assert!(
             registry.session_of("p_exit").await.is_none(),
             "app exit must leave no tracked daemon behind"
+        );
+    }
+
+    // --- unexpected ends: journal, exit status, alert ----------------------
+
+    #[test]
+    fn the_journal_key_and_path_match_the_engine() {
+        // The engine's `project_key` is lowercase hex SHA-256 of the canonical
+        // project; a different key would write evidence nobody reads.
+        assert_eq!(
+            project_key("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            daemon_log_path(
+                Path::new("/data/WSync"),
+                "/Users/dev/Game/default.project.json"
+            ),
+            Path::new("/data/WSync")
+                .join("daemons")
+                .join("222a8a689092f2195d4d578e94140f173c8b854650889011b27e4f4ef02f601e.log")
+        );
+    }
+
+    #[test]
+    fn journal_notes_use_the_engines_exact_prefixes_and_layout() {
+        let stderr = vec![
+            "thread 'main' has overflowed its stack".to_string(),
+            "fatal runtime error: stack overflow".to_string(),
+        ];
+        assert_eq!(
+            journal_lines("2026-09-22 20:28:05", &exit_notes("signal 6 (SIGABRT)", &stderr)),
+            "[2026-09-22 20:28:05] Manager: daemon exited unexpectedly (signal 6 (SIGABRT)); last stderr lines follow\n\
+             [2026-09-22 20:28:05] Manager: stderr | thread 'main' has overflowed its stack\n\
+             [2026-09-22 20:28:05] Manager: stderr | fatal runtime error: stack overflow\n"
+        );
+
+        // No stderr: no promise of lines that do not follow.
+        assert_eq!(
+            exit_notes("exit code 101", &[]),
+            vec!["Manager: daemon exited unexpectedly (exit code 101)".to_string()]
+        );
+
+        assert_eq!(
+            heartbeat_notes("/manager-heartbeat answered 403", &stderr[1..]),
+            vec![
+                "Manager: heartbeat lost (/manager-heartbeat answered 403)".to_string(),
+                "Manager: stderr | fatal runtime error: stack overflow".to_string(),
+            ]
+        );
+
+        // A blank stderr line is skipped, not written as a bare prefix the
+        // engine would stop matching; an embedded line break cannot forge a
+        // journal line of its own.
+        let tricky = vec![
+            String::new(),
+            "   ".to_string(),
+            "one\r\n[2026-01-01 00:00:00] Daemon stopped".to_string(),
+        ];
+        let text = journal_lines("S", &exit_notes("exit code 1", &tricky));
+        assert_eq!(text.lines().count(), 2, "{text}");
+        assert!(text.ends_with("[S] Manager: stderr | one  [2026-01-01 00:00:00] Daemon stopped\n"));
+    }
+
+    #[test]
+    fn append_daemon_log_appends_privately_and_never_truncates() {
+        let directory = tempfile::tempdir().unwrap();
+        let canonical = "/Users/dev/Game/default.project.json";
+        let path = daemon_log_path(directory.path(), canonical);
+
+        // The `daemons` directory does not exist yet: the append creates it.
+        append_daemon_log(directory.path(), canonical, &exit_notes("exit code 1", &[])).unwrap();
+        append_daemon_log(
+            directory.path(),
+            canonical,
+            &heartbeat_notes("timed out", &["last words".to_string()]),
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        for (line, message) in lines.iter().zip([
+            "Manager: daemon exited unexpectedly (exit code 1)",
+            "Manager: heartbeat lost (timed out)",
+            "Manager: stderr | last words",
+        ]) {
+            // `[YYYY-MM-DD HH:MM:SS] ` — the stamp `DaemonLog::note` writes.
+            let (stamp, rest) = line.split_at(22);
+            let digits: String = stamp.chars().filter(char::is_ascii_digit).collect();
+            assert_eq!(digits.len(), 14, "{line}");
+            assert!(stamp.starts_with('[') && stamp.ends_with("] "), "{line}");
+            assert_eq!(&stamp[5..6], "-");
+            assert_eq!(&stamp[11..12], " ");
+            assert_eq!(&stamp[14..15], ":");
+            assert_eq!(rest, message);
+        }
+
+        // An existing journal — the daemon's own lines — survives untouched.
+        let own = "[2026-09-22 20:01:00] Listening on localhost:7978 (PID 42)\n";
+        std::fs::write(&path, own).unwrap();
+        append_daemon_log(directory.path(), canonical, &exit_notes("exit code 2", &[])).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with(own), "{text}");
+        assert!(text.ends_with("] Manager: daemon exited unexpectedly (exit code 2)\n"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(path.parent().unwrap()), 0o700);
+            // The file was replaced by the test's `fs::write`, so check a
+            // fresh one the append itself created.
+            let fresh = daemon_log_path(directory.path(), "/another");
+            append_daemon_log(
+                directory.path(),
+                "/another",
+                &exit_notes("exit code 3", &[]),
+            )
+            .unwrap();
+            assert_eq!(mode(&fresh), 0o600);
+        }
+    }
+
+    #[test]
+    fn exit_statuses_name_their_signal() {
+        assert_eq!(render_exit(Some(101), None), "exit code 101");
+        assert_eq!(render_exit(Some(0), None), "exit code 0");
+        assert_eq!(render_exit(None, Some(6)), "signal 6 (SIGABRT)");
+        assert_eq!(render_exit(None, Some(11)), "signal 11 (SIGSEGV)");
+        assert_eq!(render_exit(None, Some(9)), "signal 9 (SIGKILL)");
+        assert_eq!(render_exit(None, Some(63)), "signal 63");
+        assert_eq!(render_exit(None, None), "status unknown");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            // Raw wait statuses: a signal in the low bits, a code in the next byte.
+            assert_eq!(
+                describe_exit(&ExitStatus::from_raw(6)),
+                "signal 6 (SIGABRT)"
+            );
+            assert_eq!(
+                describe_exit(&ExitStatus::from_raw(9)),
+                "signal 9 (SIGKILL)"
+            );
+            assert_eq!(
+                describe_exit(&ExitStatus::from_raw(101 << 8)),
+                "exit code 101"
+            );
+        }
+    }
+
+    #[test]
+    fn stderr_lines_are_cleaned_bounded_and_quoted_by_their_last_word() {
+        assert_eq!(
+            clean_stderr_line("\u{1b}[31mERROR\u{1b}[0m\tboom \r"),
+            "ERROR boom"
+        );
+        assert_eq!(clean_stderr_line("   "), "");
+        let long = clean_stderr_line(&"x".repeat(STDERR_LINE_CHARS * 2));
+        assert_eq!(
+            long.chars().count(),
+            STDERR_LINE_CHARS + 1,
+            "cut, with an ellipsis"
+        );
+
+        let panic = vec![
+            "thread 'main' panicked at src/main.rs:2:5:".to_string(),
+            "explicit panic".to_string(),
+            "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace"
+                .to_string(),
+        ];
+        assert_eq!(telling_line(&panic), Some("explicit panic"));
+        assert_eq!(telling_line(&[]), None);
+        assert_eq!(
+            with_clue(
+                "signal 6 (SIGABRT)".into(),
+                &["fatal runtime error: stack overflow".into()]
+            ),
+            "signal 6 (SIGABRT) — fatal runtime error: stack overflow"
+        );
+    }
+
+    #[test]
+    fn alerts_are_only_for_unexpected_ends_and_stay_bounded() {
+        let (title, body) =
+            alert_text("exited", "My Game", "signal 6 (SIGABRT) — stack overflow").unwrap();
+        assert_eq!(title, "WSync daemon stopped unexpectedly");
+        assert_eq!(
+            body,
+            "My Game: signal 6 (SIGABRT) — stack overflow.\nEdits on disk are not syncing to Studio."
+        );
+
+        let (title, _) = alert_text("heartbeat-lost", "My Game", "timed out").unwrap();
+        assert_eq!(title, "WSync daemon stopped responding");
+        assert!(alert_text("stopped", "My Game", "The daemon shut down.").is_none());
+
+        let (_, body) = alert_text("exited", &"n".repeat(500), &"r".repeat(5000)).unwrap();
+        assert!(body.chars().count() < 300, "{} chars", body.chars().count());
+    }
+
+    #[test]
+    fn alerts_name_the_project_the_way_the_registry_does() {
+        let projects = serde_json::json!([
+            { "id": "p_named", "name": "Obby", "path": "/Users/dev/obby" },
+            { "id": "p_unnamed", "name": "  ", "path": "/Users/dev/tycoon" },
+        ]);
+        assert_eq!(
+            label_from_registry(&projects, "p_named").as_deref(),
+            Some("Obby")
+        );
+        assert_eq!(
+            label_from_registry(&projects, "p_unnamed").as_deref(),
+            Some("tycoon")
+        );
+        assert_eq!(label_from_registry(&projects, "p_gone"), None);
+        assert_eq!(label_from_registry(&Value::Null, "p_named"), None);
+    }
+
+    /// Wait for the supervisor to report, without a fixed sleep.
+    async fn until_down(events: &Recorder) {
+        for _ in 0..100 {
+            if !events.down_reasons().is_empty() {
+                return;
+            }
+            time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("no daemon:down within 5 s");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unexpected_death_is_journalled_evented_and_alerted_once() {
+        let directory = tempfile::tempdir().unwrap();
+        // Port 1: nothing listens there, so no stray request reaches a real
+        // daemon. The last stderr lines are written immediately before the
+        // kill — the ones a read taken the moment `wait()` returns can miss.
+        // SIGKILL rather than SIGABRT so the OS files no crash report per run.
+        let binary = scripted_daemon(
+            directory.path(),
+            r#"echo '{"ok":true,"port":1,"pid":1,"bootId":"b-dead","project":"/p","canonicalProject":"/canon/p"}'
+printf 'booting\n\n' >&2
+echo "thread 'main' has overflowed its stack" >&2
+echo 'fatal runtime error: stack overflow' >&2
+kill -9 $$"#,
+        );
+        let (events, registry) = registry_for(binary);
+
+        registry
+            .start("p_dead", "/p", directory.path(), None)
+            .await
+            .unwrap();
+        until_down(&events).await;
+
+        assert_eq!(events.down_reasons(), vec!["exited"]);
+        let detail = events.downs.lock().unwrap()[0].detail.clone();
+        assert_eq!(
+            detail,
+            "The daemon exited unexpectedly: signal 9 (SIGKILL).\n\
+             booting\n\
+             thread 'main' has overflowed its stack\n\
+             fatal runtime error: stack overflow"
+        );
+        assert_eq!(
+            events.alerts(),
+            vec![(
+                "exited".to_string(),
+                "signal 9 (SIGKILL) — fatal runtime error: stack overflow".to_string()
+            )],
+            "one alert, carrying the status and the line that explains it"
+        );
+
+        // Keyed on the ready line's canonical project, under `--data-dir`.
+        let journal = std::fs::read_to_string(directory.path().join("daemons").join(format!(
+            "{}.log",
+            "426d17e3b09ffc1b4ac1f0cc8bac33f34c30b8b6f7d4d2cf44f300e13ad2e99d"
+        )))
+        .expect("the death must leave a journal note");
+        let messages: Vec<&str> = journal
+            .lines()
+            .map(|line| line.split_once("] ").unwrap().1)
+            .collect();
+        assert_eq!(
+            messages,
+            vec![
+                "Manager: daemon exited unexpectedly (signal 9 (SIGKILL)); last stderr lines follow",
+                "Manager: stderr | booting",
+                "Manager: stderr | thread 'main' has overflowed its stack",
+                "Manager: stderr | fatal runtime error: stack overflow",
+            ]
+        );
+
+        registry.shutdown_all().await;
+        assert_eq!(
+            events.alerts().len(),
+            1,
+            "tearing down a dead entry is not news"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_deliberate_stop_writes_no_journal_and_raises_no_alert() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = scripted_daemon(
+            directory.path(),
+            r#"echo '{"ok":true,"port":1,"pid":1,"bootId":"b-live","project":"/p","canonicalProject":"/canon/p"}'
+echo 'serving' >&2
+exec sleep 30"#,
+        );
+        let (events, registry) = registry_for(binary);
+
+        registry
+            .start("p_live", "/p", directory.path(), None)
+            .await
+            .unwrap();
+        // `/stop` cannot land on port 1, so this is the kill fallback — still
+        // the user's own decision, and still not an incident.
+        registry.stop("p_live").await.unwrap();
+        time::sleep(STDERR_DRAIN_GRACE + Duration::from_millis(200)).await;
+
+        assert_eq!(events.down_reasons(), vec!["stopped"]);
+        assert!(events.alerts().is_empty(), "a stop is never an alert");
+        assert!(
+            !directory.path().join("daemons").exists(),
+            "a deliberate stop writes nothing to the journal"
         );
     }
 }

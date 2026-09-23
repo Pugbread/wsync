@@ -1,13 +1,11 @@
 --!strict
--- Change-history ops: `waypoint`, `undo`, `redo`, `transaction_begin`,
--- `transaction_finish` (waypoint.json, undo.json, redo.json; Design §5.4).
+-- Change-history ops: `undo`, `redo`, `transaction_begin`,
+-- `transaction_finish` (undo.json, redo.json; Design §5.4).
 --
--- This module also owns the ChangeHistory side of the write guardrails
--- (Design §6.4): every mutating op in Handlers/Write brackets itself with
--- `History.opWaypoint` — a `WSync: <op> "<target>"` waypoint matching the
--- write-processor convention (Helpers/setWaypoint) — unless an explicit
--- transaction is open, in which case the transaction's recording brackets
--- everything until transaction_finish.
+-- `undo`/`redo` drive Studio's own undo stack. The only ChangeHistory entries
+-- WSync creates itself are recordings: an explicit transaction (so a
+-- daemon-driven bulk replay is one Studio undo) and a clipboard paste
+-- (Handlers/Clipboard).
 --
 -- Transactions are ChangeHistoryService recordings
 -- (TryBeginRecording/FinishRecording): exactly one may be open at a time
@@ -21,7 +19,6 @@ local ChangeHistoryService = game:GetService("ChangeHistoryService")
 local WSync = script:FindFirstAncestor("WSync")
 
 local Log = require(WSync.Log)
-local setWaypoint = require(WSync.Helpers.setWaypoint)
 
 local Error = require(script.Parent.Parent.Error)
 local WriteRules = require(script.Parent.Parent.WriteRules)
@@ -29,10 +26,6 @@ local WriteRules = require(script.Parent.Parent.WriteRules)
 type Args = { [string]: any }
 
 local History = {}
-
-History.LIMITS = {
-	maxWaypointNameBytes = WriteRules.LIMITS.maxWaypointNameBytes,
-}
 
 local transactionState = WriteRules.newTransactionState()
 
@@ -65,39 +58,15 @@ local function finishRecording(recordingId: string, commit: boolean): boolean
 end
 
 --------------------------------------------------------------------------------
--- Shared write-guardrail surface (used by Handlers/Write)
+-- Shared recording surface (used by Core and Handlers/Clipboard)
 --------------------------------------------------------------------------------
 
 function History.isTransactionOpen(): boolean
 	return WriteRules.isTransactionOpen(transactionState)
 end
 
---- The sync-frame waypoint gate (pinned wave-4 contract): while a
---- transaction recording is open, `Core/Processor/Write` skips its per-batch
---- waypoints so a daemon-driven bulk application (Keep Disk replayed as sync
---- frames inside one `transaction_begin`/`transaction_finish` bracket) is
---- exactly one Studio Undo.
-function History.shouldSuppressBatchWaypoints(): boolean
-	return WriteRules.shouldSuppressBatchWaypoints(transactionState)
-end
-
---- Bracket one mutating op with a `WSync: <op> "<target>"` waypoint (the
---- write-processor convention), unless an explicit transaction is open — its
---- recording already brackets every write until transaction_finish.
-function History.opWaypoint(op: string, target: string?)
-	if History.isTransactionOpen() then
-		return
-	end
-
-	local ok, err = pcall(setWaypoint, op, target)
-
-	if not ok then
-		Log.debug("Failed to set the op waypoint:", err)
-	end
-end
-
---- Begin a named recording for a `set_batch --waypoint` bracket (set.json:
---- one Studio undo reverses the batch). Returns nil when Studio refuses.
+--- Begin a named recording that makes one multi-instance change a single
+--- Studio undo (clipboard paste). Returns nil when Studio refuses.
 function History.tryBeginBatchRecording(name: string): string?
 	return tryBeginRecording(name)
 end
@@ -126,31 +95,6 @@ end
 --------------------------------------------------------------------------------
 
 History.ops = {} :: { [string]: (args: Args, ctx: any) -> any }
-
---- `waypoint {name}` — a named change-history waypoint, verbatim (the label
---- is the user's own; auto-waypoints are the ones that get the WSync prefix).
-function History.ops.waypoint(args: Args, ctx)
-	local name = args.name
-
-	if type(name) ~= "string" or name == "" or #name > History.LIMITS.maxWaypointNameBytes then
-		error(
-			Error.new(Error.INVALID_ARGUMENT, `name must be a string of 1-{History.LIMITS.maxWaypointNameBytes} bytes`),
-			0
-		)
-	end
-
-	local ok, err = pcall(function()
-		(ChangeHistoryService :: any):SetWaypoint(name)
-	end)
-
-	if not ok then
-		error(Error.new(Error.PLUGIN_ERROR, `SetWaypoint failed: {tostring(err)}`), 0)
-	end
-
-	ctx.audit(WriteRules.shapeAudit("waypoint", "", { prop = name }))
-
-	return { name = name }
-end
 
 --- `undo` — request one change-history undo. The API reports nothing, so the
 --- response acks the request (undo.json).

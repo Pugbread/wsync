@@ -44,6 +44,7 @@ enum Command {
 	Stop(Stop),
 	Restart(Restart),
 	Logs(Logs),
+	Resume(Resume),
 }
 
 impl Daemon {
@@ -54,6 +55,7 @@ impl Daemon {
 			Command::Stop(command) => command.main(),
 			Command::Restart(command) => command.main(),
 			Command::Logs(command) => command.main(),
+			Command::Resume(command) => command.main(),
 		}
 	}
 }
@@ -136,6 +138,46 @@ struct Stop {
 	/// Print machine-readable JSON
 	#[arg(long)]
 	raw: bool,
+}
+
+/// Leave safe mode: the daemon came up refusing connects because the previous
+/// one died applying a connect. Run it once the cause is fixed; the next
+/// connect applies normally
+#[derive(Parser)]
+struct Resume {
+	/// Project path
+	#[arg(long)]
+	project: Option<PathBuf>,
+
+	/// Daemon port
+	#[arg(short = 'P', long)]
+	port: Option<u16>,
+
+	/// Print machine-readable JSON
+	#[arg(long)]
+	raw: bool,
+}
+
+impl Resume {
+	fn main(self) -> Result<()> {
+		let client = crate::cli::client::Client::connect(&crate::cli::client::Targeting {
+			project: self.project,
+			port: self.port,
+		})?;
+
+		let endpoint = client.post_endpoint("/safe-mode/resume", &serde_json::json!({}))?;
+		let value = endpoint.json("/safe-mode/resume")?.clone();
+
+		if self.raw {
+			crate::cli::client::print_json(&value);
+		} else if value.get("wasInSafeMode").and_then(serde_json::Value::as_bool) == Some(true) {
+			crate::wsync_info!("Safe mode ended — reconnect the Studio plugin and the connect applies normally");
+		} else {
+			crate::wsync_info!("The daemon was not in safe mode; nothing changed");
+		}
+
+		Ok(())
+	}
 }
 
 /// Restart the project daemon, preferring its previous port
@@ -501,7 +543,8 @@ impl Start {
 			bail!("--managed-by cannot be empty");
 		}
 
-		let core = Arc::new(crate::core::Core::new(project, true)?);
+		// The journal opens before the first snapshot, so a crash or error
+		// while loading the project is recorded where `daemon logs` looks
 		let boot_id = Uuid::new_v4().to_string();
 		let journal = Arc::new(daemon::DaemonLog::open(&paths.log)?);
 
@@ -509,6 +552,14 @@ impl Start {
 			"Starting daemon for {canonical} (managed by {}, boot {boot_id})",
 			self.managed_by
 		));
+
+		let core = match crate::core::Core::new(project, true) {
+			Ok(core) => Arc::new(core),
+			Err(err) => {
+				journal.note(&format!("Failed to load the project: {err}"));
+				return Err(err);
+			}
+		};
 
 		let identity = ServerIdentity {
 			boot_id: boot_id.clone(),

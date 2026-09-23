@@ -3,6 +3,7 @@ use std::{
 	io::Result,
 	path::{Path, PathBuf},
 	sync::Mutex,
+	time::Instant,
 };
 
 use self::{mem_backend::MemBackend, std_backend::StdBackend};
@@ -39,6 +40,22 @@ pub trait VfsBackend: Send {
 	fn resume(&mut self);
 
 	fn receiver(&self) -> Receiver<VfsEvent>;
+
+	/// When the watcher's debouncer last completed a flush pass (`None` for
+	/// backends without a debouncing watcher)
+	fn last_flush(&self) -> Option<Instant> {
+		None
+	}
+
+	/// Watcher events dropped as echoes of the processor's own writes
+	fn suppressed_events(&self) -> u64 {
+		0
+	}
+
+	/// Watcher events held until the processor's write window closes
+	fn held_events(&self) -> usize {
+		0
+	}
 }
 
 impl VfsEvent {
@@ -124,5 +141,88 @@ impl Vfs {
 
 	pub fn receiver(&self) -> Receiver<VfsEvent> {
 		lock!(self.inner).receiver()
+	}
+
+	/// See [`VfsBackend::last_flush`]
+	pub fn last_flush(&self) -> Option<Instant> {
+		lock!(self.inner).last_flush()
+	}
+
+	/// Watcher events handed to the processor but not yet processed
+	pub fn pending_events(&self) -> usize {
+		self.receiver().len()
+	}
+
+	/// See [`VfsBackend::suppressed_events`]
+	pub fn suppressed_events(&self) -> u64 {
+		lock!(self.inner).suppressed_events()
+	}
+
+	/// See [`VfsBackend::held_events`]
+	pub fn held_events(&self) -> usize {
+		lock!(self.inner).held_events()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::{fs, time::Duration};
+
+	/// An edit that lands while the processor is writing is held and
+	/// delivered afterwards; the processor's own write is dropped as its echo
+	#[test]
+	fn edits_during_a_sync_write_are_delivered_and_echoes_are_not() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path().canonicalize().unwrap();
+
+		fs::write(root.join("mine.luau"), "old").unwrap();
+		fs::write(root.join("theirs.luau"), "old").unwrap();
+
+		let vfs = Vfs::new(true);
+		vfs.watch(&root, true).unwrap();
+
+		let receiver = vfs.receiver();
+
+		// Let the watcher settle, then drain anything the setup produced
+		std::thread::sleep(Duration::from_millis(500));
+		while receiver.try_recv().is_ok() {}
+
+		vfs.pause();
+		vfs.write(&root.join("mine.luau"), b"written by the processor").unwrap();
+		fs::write(root.join("theirs.luau"), "an agent's edit").unwrap();
+		std::thread::sleep(Duration::from_millis(400));
+		vfs.resume();
+
+		let deadline = std::time::Instant::now() + Duration::from_secs(5);
+		let mut seen = Vec::new();
+
+		while std::time::Instant::now() < deadline {
+			if let Ok(event) = receiver.recv_timeout(Duration::from_millis(100)) {
+				seen.push(event.path().to_owned());
+			}
+
+			if seen.iter().any(|path| path.ends_with("theirs.luau")) {
+				// Give a straggling echo the chance to show up too
+				std::thread::sleep(Duration::from_millis(300));
+
+				while let Ok(event) = receiver.try_recv() {
+					seen.push(event.path().to_owned());
+				}
+
+				break;
+			}
+		}
+
+		assert!(
+			seen.iter().any(|path| path.ends_with("theirs.luau")),
+			"the edit made during the sync write was never delivered: {seen:?}"
+		);
+		assert!(
+			!seen.iter().any(|path| path.ends_with("mine.luau")),
+			"the processor's own write came back as an event: {seen:?}"
+		);
+		assert!(vfs.suppressed_events() >= 1);
+		assert_eq!(vfs.held_events(), 0);
 	}
 }

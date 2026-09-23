@@ -3,16 +3,18 @@
   "title": "wsync source",
   "category": "Live inspection",
   "description": "Prints an instance's script source from live Studio, or the content of the file backing it on disk.",
-  "usage": "wsync source [<studio-path> | --path <studio-path>] [--project <path>] [--port <port>] [--disk] [--output <file>] [--raw]",
+  "usage": "wsync source (<studio-path> | --path <studio-path>) [--project <path>] [--port <port>] [--disk] [--output <file>] [--raw]",
   "examples": [
-    "wsync source --path ReplicatedStorage/Client/UIController",
+    "wsync source ReplicatedStorage/Client/UIController",
     "wsync source --project . --path ReplicatedStorage/Client/UIController --disk",
     "wsync source ReplicatedStorage/Client/UIController --project . --output ./UIController.live.luau"
   ],
   "notes": [
     "Without `--disk`, reads the live `Source` through the plugin's `ScriptEditorService` path. Live source is unreliable while an editor draft is open for that script, so a mismatch is not by itself proof of divergence.",
+    "Drafts caveat: WSync writes editor/draft text through `ScriptEditorService`, and live `source` reads that editor text — but an edit-mode `require` runs the committed `.Source`, which can lag behind it. To run what `source` shows, use `wsync eval --drafts`.",
     "`--disk` resolves the target through the sync middleware, so `.model.json`, `.rbxm`, and `.data.json`-backed instances answer as well as plain script files.",
     "This is a loose divergence diagnostic, not a verification step. To verify an edit, use the narrowest `wsync lint --path` plus a local file read.",
-    "Prefer --output to shell redirection for saved source: it writes only after a successful string response, using an atomic replacement. A failed read leaves an existing destination untouched. --raw preserves structured diagnostics; do not merge stderr into saved source. Output paths are relative to cwd."
+    "Prefer --output to shell redirection for saved source: it writes only after a successful string response, using an atomic replacement. A failed read leaves an existing destination untouched. --raw preserves structured diagnostics; do not merge stderr into saved source. Output paths are relative to cwd.",
+    "The Studio path is positional or `--path` — every single-instance command takes both forms; passing both is accepted only when they name the same path."
   ]
 }

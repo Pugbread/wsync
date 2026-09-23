@@ -26,8 +26,8 @@ local Error = {
 	ReadFailed = "Failed to read property: $1 from instance: $2, reason: $3",
 	WriteFailed = "Failed to write property: $1 for instance: $2, reason: $3",
 	NoInstanceAdd = "Tried to add an instance whose parent that does not exist in the tree: $1",
-	NoInstanceUpdate = "Tried to update an instance that does not exist in the tree: $1",
-	NoInstanceRemove = "Tried to remove an instance that does not exist in the tree: $1",
+	NoInstanceUpdate = "Tried to update an instance that does not exist in the tree: $1 — the change was not applied in Studio",
+	NoInstanceRemove = "Tried to remove an instance that does not exist in the tree: $1 — already gone from Studio",
 	NotCreatable = "Tried to create an instance of class: $1 that is not creatable",
 	NotRemovable = "Tried to remove an instance of class: $1 that is not removable",
 	HydrationFailed = "Failed to hydrate root service, snapshot: $1",
@@ -44,14 +44,21 @@ function Error.__new(message: string, kind: string): Error
 	return err
 end
 
+--- A copy of `err` with its `$n` placeholders filled. Safe for any argument
+--- text (Util.interpolate): a raw ref once carried a `%` byte into a `gsub`
+--- replacement string here, and the error that raised from inside the
+--- sync loop dropped the connection.
 function Error.new(err: Error, ...): Error
 	err = table.clone(err)
-
-	for i, v in { ... } do
-		err.message = err.message:gsub("$" .. i, Util.stringify(v))
-	end
+	err.message = Util.interpolate(err.message, ...)
 
 	return err
+end
+
+--- Is `value` one of these errors (as opposed to a runtime error string or
+--- another module's error object)?
+function Error.is(value: any): boolean
+	return type(value) == "table" and getmetatable(value) == Error
 end
 
 function Error:__eq(other: Error): boolean

@@ -19,7 +19,7 @@
     "Phase 5 adds the read-only live surface (handshake/diagnostics, inspection,",
     "search, reflection, session state, source) plus the conflict/decision commands,",
     "the live write surface (set/new/rm/mv/attr/tag/call/eval and the",
-    "save/waypoint/undo/redo change-history family), the path tools (path/meta/where),",
+    "undo/redo change-history family), the path tools (path/meta/where),",
     "the registry surface (commands/context, plus the tail alias-command), the",
     "cross-project clipboard (copy/paste), capture, the agent runtime",
     "(playtest, run workflows), plan, refresh (with the plugin-connect",
@@ -75,7 +75,6 @@
     "repair",
     "rm",
     "run",
-    "save",
     "select",
     "serve",
     "services",
@@ -93,9 +92,10 @@
     "undo",
     "update",
     "upload",
+    "verify",
     "version",
+    "wait-synced",
     "watch",
-    "waypoint",
     "where"
   ],
   "aliases": {}

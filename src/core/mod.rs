@@ -21,6 +21,7 @@ use crate::{core::snapshot::Snapshot, lock, middleware::new_snapshot, project::P
 
 pub mod changes;
 pub mod conflict;
+pub mod hazards;
 pub mod helpers;
 pub mod meta;
 pub mod processor;
@@ -45,6 +46,13 @@ impl Core {
 		trace!("Initializing VFS");
 
 		let vfs = Vfs::new(watch);
+
+		// A daemon (the watching core) settles flat/folder reshapes an
+		// earlier daemon left interrupted before it reads anything; one-shot
+		// readers (lint, sourcemap, build) leave the disk alone
+		if watch {
+			helpers::reshape::recover_project(&project, &vfs);
+		}
 
 		trace!("Snapshotting root project");
 

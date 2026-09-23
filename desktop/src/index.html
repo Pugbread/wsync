@@ -135,6 +135,10 @@
         </div>
       </header>
 
+      <!-- Daemons that died or stopped answering (app.js). In the shell, not a
+           view, so the alert survives every navigation until it is resolved. -->
+      <section id="daemon-alerts" class="daemon-alerts" aria-label="Daemon alerts" hidden></section>
+
       <main
         id="view"
         class="view"

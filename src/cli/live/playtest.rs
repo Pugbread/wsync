@@ -24,6 +24,14 @@
 //! job is cancelled and the run exits 3 — a vanished Studio can never hang the
 //! command forever.
 //!
+//! The terminal record is self-contained: every client failure the stream
+//! reported (a failed `clientResult` with its traceback, an error-level `log`
+//! from a PlayClient) is repeated under `clientFailures`. A client that errored
+//! is usually *why* the main script sat waiting until the timeout, and a
+//! caller reading only the last line must still see it. The plugin attaches
+//! the list itself; the CLI fills it in only for a terminal that lacks it (one
+//! it synthesized, or one from an older plugin).
+//!
 //! `playtest capture` accepts only a PlayClient context and reuses the edit
 //! capture pipeline verbatim: the same `capture_read` chunk pump, the same
 //! SHA-256 verification, and the same encode-then-decode-back PNG proof.
@@ -33,6 +41,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 use serde_json::{json, Value};
 use std::{
+	collections::HashSet,
 	fs,
 	path::PathBuf,
 	process, thread,
@@ -68,6 +77,13 @@ const STOP_TIMEOUT_MS: u64 = 45_000;
 
 /// The input contract's action cap (playtest.json)
 const INPUT_MAX_ACTIONS: usize = 200;
+
+/// Bounds on the client failures a terminal record repeats — the progress
+/// records keep the full text. Keep in sync with Playtest/RunState.LIMITS
+const CLIENT_FAILURE_RESULTS_MAX: usize = 32;
+const CLIENT_FAILURE_LOGS_MAX: usize = 16;
+const CLIENT_FAILURE_ERROR_BYTES: usize = 8 * 1024;
+const CLIENT_FAILURE_TRACEBACK_BYTES: usize = 32 * 1024;
 
 /// Run playscript-owned playtest sessions or control lower-level Studio
 /// playtests and runtime agents
@@ -380,7 +396,7 @@ impl PlaytestRun {
 		if !start.ok {
 			let record = boot_failure_record(&start, started.elapsed());
 
-			self.print_terminal(&record);
+			self.print_terminal(&record, &HashSet::new());
 
 			process::exit(5);
 		}
@@ -396,7 +412,7 @@ impl PlaytestRun {
 				"elapsed": started.elapsed().as_secs_f64(),
 			});
 
-			self.print_terminal(&record);
+			self.print_terminal(&record, &HashSet::new());
 
 			process::exit(5);
 		};
@@ -408,8 +424,21 @@ impl PlaytestRun {
 		// rather than be fetched afterwards
 		let collector = capture::MediaCollector::start();
 
-		let polled = poll_run(&client, &job_id, deadline, |record| {
+		// Client failures seen on the stream, for a terminal that must repeat
+		// them; `shown` is the subset whose full text already streamed as
+		// human progress, so the summary can point at it instead of repeating it
+		let mut failures = ClientFailures::default();
+		let mut shown: HashSet<u64> = HashSet::new();
+		let streams_progress = !self.raw && self.quiet == 0;
+
+		let polled = poll_run_observed(&client, &job_id, deadline, &mut failures, |record| {
 			self.print_progress(record);
+
+			if streams_progress && client_failure_source(record).is_some() {
+				if let Some(seq) = record.get("seq").and_then(Value::as_u64) {
+					shown.insert(seq);
+				}
+			}
 
 			if record.get("type").and_then(Value::as_str) == Some("capture") {
 				self.collect_media(collector.as_ref(), record);
@@ -427,15 +456,12 @@ impl PlaytestRun {
 
 				RunTerminal {
 					exit_code: 3,
-					record: json!({
-						"type": "result",
-						"ok": false,
-						"kind": "timeout",
-						"exitCode": 3,
-						"error": format!("no terminal record within --timeout {}s (plus grace)", self.timeout),
-						"jobStatus": fetch_job_status(&client, &job_id),
-						"elapsed": started.elapsed().as_secs_f64(),
-					}),
+					record: deadline_record(
+						self.timeout,
+						fetch_job_status(&client, &job_id),
+						started.elapsed(),
+						&failures,
+					),
 				}
 			}
 			Err(err) => {
@@ -443,16 +469,17 @@ impl PlaytestRun {
 				// unknown, which is the aborted exit, never a fake success
 				client.request("playtest_run_cancel", json!({ "jobId": job_id })).ok();
 
-				RunTerminal {
-					exit_code: 4,
-					record: json!({
-						"type": "aborted",
-						"reason": format!("lost the run stream: {err:#}"),
-						"jobStatus": fetch_job_status(&client, &job_id),
-						"exitCode": 4,
-						"elapsed": started.elapsed().as_secs_f64(),
-					}),
-				}
+				let mut record = json!({
+					"type": "aborted",
+					"reason": format!("lost the run stream: {err:#}"),
+					"jobStatus": fetch_job_status(&client, &job_id),
+					"exitCode": 4,
+					"elapsed": started.elapsed().as_secs_f64(),
+				});
+
+				failures.attach(&mut record);
+
+				RunTerminal { exit_code: 4, record }
 			}
 		};
 
@@ -473,7 +500,7 @@ impl PlaytestRun {
 			}
 		}
 
-		self.print_terminal(&terminal.record);
+		self.print_terminal(&terminal.record, &shown);
 
 		if terminal.exit_code == 0 {
 			Ok(())
@@ -545,6 +572,23 @@ impl PlaytestRun {
 					));
 				}
 			}
+			// A failed client prints its traceback the moment it arrives: the
+			// main script may keep waiting for minutes, and the terminal summary
+			// then points back here instead of repeating it
+			"clientResult" if client_failure_source(record).is_some() => {
+				print_line(&format!(
+					"✖ client {} failed: {}",
+					record.get("context").and_then(Value::as_str).unwrap_or("?"),
+					record
+						.get("error")
+						.and_then(Value::as_str)
+						.unwrap_or("client playscript failed"),
+				));
+
+				if let Some(traceback) = record.get("traceback").and_then(Value::as_str) {
+					print_line(traceback);
+				}
+			}
 			"clientResult" => print_line(&format!(
 				"client {} returned {}",
 				record.get("context").and_then(Value::as_str).unwrap_or("?"),
@@ -563,38 +607,52 @@ impl PlaytestRun {
 	}
 
 	/// The terminal record: always printed, even under `--quiet`
-	fn print_terminal(&self, record: &Value) {
+	fn print_terminal(&self, record: &Value, shown: &HashSet<u64>) {
 		if self.raw {
 			print_line(&record.to_string());
 
 			return;
 		}
 
-		let elapsed = record.get("elapsed").and_then(Value::as_f64).unwrap_or(0.0);
-
-		if record.get("type").and_then(Value::as_str) == Some("aborted") {
-			print_line(&format!(
-				"✖ aborted ({elapsed:.1}s): {} (job: {})",
-				record
-					.get("reason")
-					.and_then(Value::as_str)
-					.unwrap_or("job ended externally"),
-				record.get("jobStatus").and_then(Value::as_str).unwrap_or("unknown"),
-			));
-
-			return;
+		for line in terminal_lines(record, shown) {
+			print_line(&line);
 		}
+	}
+}
 
-		if record.get("ok").and_then(Value::as_bool) == Some(true) {
-			print_line(&format!("✔ result ({elapsed:.1}s):"));
-			print_line(&serde_json::to_string_pretty(record.get("value").unwrap_or(&Value::Null)).unwrap_or_default());
+/// The human rendering of a terminal record, one string per printed line.
+///
+/// A terminal carrying `clientFailures` ends with a section listing each one,
+/// so the last thing on screen explains a run that timed out while a client
+/// had already failed. `shown` holds the `seq`s of failures whose full text
+/// already streamed as progress: their tracebacks are pointed at rather than
+/// printed twice, and under `--quiet` (nothing shown) they print in full.
+fn terminal_lines(record: &Value, shown: &HashSet<u64>) -> Vec<String> {
+	let mut lines = Vec::new();
+	let elapsed = record.get("elapsed").and_then(Value::as_f64).unwrap_or(0.0);
 
-			return;
-		}
-
-		print_line(&format!(
+	if record.get("type").and_then(Value::as_str) == Some("aborted") {
+		lines.push(format!(
+			"✖ aborted ({elapsed:.1}s): {} (job: {})",
+			record
+				.get("reason")
+				.and_then(Value::as_str)
+				.unwrap_or("job ended externally"),
+			record.get("jobStatus").and_then(Value::as_str).unwrap_or("unknown"),
+		));
+	} else if record.get("ok").and_then(Value::as_bool) == Some(true) {
+		lines.push(format!("✔ result ({elapsed:.1}s):"));
+		lines.push(serde_json::to_string_pretty(record.get("value").unwrap_or(&Value::Null)).unwrap_or_default());
+	} else {
+		// CLI-authored terminals name the outcome `kind`, plugin-authored ones
+		// `outcome`
+		lines.push(format!(
 			"✖ {} ({elapsed:.1}s): {}{}",
-			record.get("kind").and_then(Value::as_str).unwrap_or("failure"),
+			record
+				.get("kind")
+				.or_else(|| record.get("outcome"))
+				.and_then(Value::as_str)
+				.unwrap_or("failure"),
 			record
 				.get("error")
 				.and_then(Value::as_str)
@@ -606,9 +664,256 @@ impl PlaytestRun {
 		));
 
 		if let Some(traceback) = record.get("traceback").and_then(Value::as_str) {
-			print_line(traceback);
+			lines.push(traceback.to_owned());
 		}
 	}
+
+	lines.extend(client_failure_lines(record, shown));
+
+	lines
+}
+
+/// The `clientFailures` section of the human terminal (empty without any)
+fn client_failure_lines(record: &Value, shown: &HashSet<u64>) -> Vec<String> {
+	let Some(failures) = record
+		.get("clientFailures")
+		.and_then(Value::as_array)
+		.filter(|failures| !failures.is_empty())
+	else {
+		return Vec::new();
+	};
+
+	let omitted = record.get("clientFailuresOmitted").and_then(Value::as_u64).unwrap_or(0);
+	let mut lines = vec![format!(
+		"{} client failure(s) reported during the run:",
+		failures.len() as u64 + omitted
+	)];
+
+	for failure in failures {
+		let context = failure.get("context").and_then(Value::as_str).unwrap_or("client");
+		let error = failure.get("error").and_then(Value::as_str).unwrap_or("client failure");
+		let at = match failure.get("t").and_then(Value::as_f64) {
+			Some(t) => format!(" at {t:.1}s"),
+			None => String::new(),
+		};
+
+		if failure.get("source").and_then(Value::as_str) == Some("log") {
+			let repeated = match failure.get("count").and_then(Value::as_u64) {
+				Some(count) if count > 1 => format!(" ×{count}"),
+				_ => String::new(),
+			};
+
+			lines.push(format!("  ✖ {context} error log{repeated}{at}: {error}"));
+
+			continue;
+		}
+
+		lines.push(format!("  ✖ {context}{at}: {error}"));
+
+		let Some(traceback) = failure.get("traceback").and_then(Value::as_str) else {
+			continue;
+		};
+
+		let streamed = failure
+			.get("seq")
+			.and_then(Value::as_u64)
+			.is_some_and(|seq| shown.contains(&seq));
+
+		if streamed {
+			lines.push("    (traceback printed above)".to_owned());
+		} else {
+			lines.extend(traceback.lines().map(|line| format!("    {line}")));
+		}
+	}
+
+	if omitted > 0 {
+		lines.push(format!("  … and {omitted} more (see the clientResult and log records)"));
+	}
+
+	lines
+}
+
+// ---------------------------------------------------------------------------
+// Client failures — repeated on the terminal record
+// ---------------------------------------------------------------------------
+
+/// Which client failure a progress record reports, if any: a `clientResult`
+/// that did not succeed (a client playscript error, an escaped task error, a
+/// client boot failure, an unreadable result), or an error-level `log` line
+/// from a PlayClient. Mirrors `clientFailureSource` in Playtest/RunState
+pub(crate) fn client_failure_source(record: &Value) -> Option<&'static str> {
+	let context = record.get("context").and_then(Value::as_str);
+
+	match record.get("type").and_then(Value::as_str)? {
+		"clientResult" if record.get("ok").and_then(Value::as_bool) != Some(true) => Some("clientResult"),
+		"log"
+			if record.get("level").and_then(Value::as_str) == Some("error")
+				&& context.is_some_and(|context| context.starts_with("client:")) =>
+		{
+			Some("log")
+		}
+		_ => None,
+	}
+}
+
+/// `text` cut to at most `limit` bytes on a char boundary, the cut marked the
+/// way the plugin marks its own (`<truncated>`)
+fn cap_text(text: &str, limit: usize) -> String {
+	if text.len() <= limit {
+		return text.to_owned();
+	}
+
+	let mut cut = limit;
+
+	while !text.is_char_boundary(cut) {
+		cut -= 1;
+	}
+
+	format!("{}<truncated>", &text[..cut])
+}
+
+/// The client failures a run stream reported, in arrival order — the same
+/// bounded, collapsed list the plugin attaches to its own terminal record, so
+/// a terminal the CLI authors (or one from an older plugin) is just as
+/// self-contained
+#[derive(Default)]
+pub(crate) struct ClientFailures {
+	entries: Vec<Value>,
+	results: usize,
+	logs: usize,
+	omitted: u64,
+	/// Highest `seq` observed: delivery is at-least-once, so a record at or
+	/// below it is a redelivery, never a second failure
+	high_water: Option<u64>,
+}
+
+impl ClientFailures {
+	/// Feeds one non-terminal record; anything but a client failure is ignored
+	pub(crate) fn observe(&mut self, record: &Value) {
+		let seq = record.get("seq").and_then(Value::as_u64);
+
+		if let Some(seq) = seq {
+			if self.high_water.is_some_and(|high| seq <= high) {
+				return;
+			}
+
+			self.high_water = Some(seq);
+		}
+
+		let Some(source) = client_failure_source(record) else {
+			return;
+		};
+
+		let context = record.get("context").and_then(Value::as_str).unwrap_or("client");
+		let t = record.get("t").and_then(Value::as_f64);
+
+		let mut entry = if source == "log" {
+			let error = cap_text(
+				record.get("message").and_then(Value::as_str).unwrap_or_default(),
+				CLIENT_FAILURE_ERROR_BYTES,
+			);
+
+			// A client erroring every frame is one failure, not a flood
+			if let Some(existing) = self.entries.iter_mut().find(|entry| {
+				entry["source"] == "log" && entry["context"] == context && entry["error"] == error.as_str()
+			}) {
+				existing["count"] = json!(existing["count"].as_u64().unwrap_or(1) + 1);
+
+				return;
+			}
+
+			if self.logs >= CLIENT_FAILURE_LOGS_MAX {
+				self.omitted += 1;
+
+				return;
+			}
+
+			self.logs += 1;
+
+			json!({ "context": context, "source": "log", "error": error, "count": 1 })
+		} else {
+			if self.results >= CLIENT_FAILURE_RESULTS_MAX {
+				self.omitted += 1;
+
+				return;
+			}
+
+			self.results += 1;
+
+			let mut entry = json!({
+				"context": context,
+				"source": "clientResult",
+				"error": cap_text(
+					record
+						.get("error")
+						.and_then(Value::as_str)
+						.unwrap_or("client playscript failed"),
+					CLIENT_FAILURE_ERROR_BYTES,
+				),
+			});
+
+			if let Some(traceback) = record.get("traceback").and_then(Value::as_str) {
+				entry["traceback"] = json!(cap_text(traceback, CLIENT_FAILURE_TRACEBACK_BYTES));
+			}
+
+			entry
+		};
+
+		if let Some(seq) = seq {
+			entry["seq"] = json!(seq);
+		}
+
+		if let Some(t) = t {
+			entry["t"] = json!(t);
+		}
+
+		self.entries.push(entry);
+	}
+
+	/// Adds `clientFailures` (and `clientFailuresOmitted` past the caps) to a
+	/// terminal record. A record that already carries the field — the
+	/// plugin's own — is left alone: the plugin saw every record, including
+	/// telemetry evicted before it reached this stream
+	pub(crate) fn attach(&self, record: &mut Value) {
+		if self.entries.is_empty() {
+			return;
+		}
+
+		let Some(object) = record.as_object_mut() else {
+			return;
+		};
+
+		if object.contains_key("clientFailures") {
+			return;
+		}
+
+		object.insert("clientFailures".to_owned(), Value::Array(self.entries.clone()));
+
+		if self.omitted > 0 {
+			object.insert("clientFailuresOmitted".to_owned(), json!(self.omitted));
+		}
+	}
+}
+
+/// The terminal the CLI authors when its own deadline passes without one from
+/// the plugin: exit 3 like the plugin's timeout (`kind` for the CLI's own
+/// terminals, `outcome` for parity with the plugin's), carrying every client
+/// failure the stream had already reported
+fn deadline_record(timeout: u64, job_status: String, elapsed: Duration, failures: &ClientFailures) -> Value {
+	let mut record = json!({
+		"type": "result",
+		"ok": false,
+		"kind": "timeout",
+		"outcome": "timeout",
+		"exitCode": 3,
+		"error": format!("no terminal record within --timeout {timeout}s (plus grace)"),
+		"jobStatus": job_status,
+		"elapsed": elapsed.as_secs_f64(),
+	});
+
+	failures.attach(&mut record);
+
+	record
 }
 
 fn read_script(path: &PathBuf, flag: &str) -> Result<String> {
@@ -643,15 +948,19 @@ fn fetch_job_status(client: &Client, job_id: &str) -> String {
 }
 
 /// Pages `playtest_run_poll` forward until the job reports `done`, feeding
-/// every non-terminal record to `on_record` in arrival order. Shared by
-/// `playtest run` and the workflow `playtest` step.
+/// every non-terminal record to `on_record` in arrival order and collecting
+/// client failures into `failures` as they stream past. Shared by `playtest
+/// run` and the workflow `playtest` step. A `Done` terminal already carries
+/// the failures (see [`ClientFailures::attach`]); on `DeadlineExpired` or
+/// `Err` the caller authors the outcome and attaches them itself.
 ///
 /// `Err` means the poll transport failed and stayed failed across the retry
 /// budget — the record stream is lost, not merely quiet.
-pub(crate) fn poll_run(
+pub(crate) fn poll_run_observed(
 	client: &Client,
 	job_id: &str,
 	deadline: Instant,
+	failures: &mut ClientFailures,
 	mut on_record: impl FnMut(&Value) -> Result<()>,
 ) -> Result<RunEnd> {
 	let mut since_seq: u64 = 0;
@@ -696,6 +1005,7 @@ pub(crate) fn poll_run(
 				// a stream that carries it in `records` cannot duplicate it
 				terminal = Some(record.clone());
 			} else {
+				failures.observe(record);
 				on_record(record)?;
 			}
 		}
@@ -705,7 +1015,7 @@ pub(crate) fn poll_run(
 		}
 
 		if value.get("done").and_then(Value::as_bool) == Some(true) {
-			let record = terminal.unwrap_or_else(|| {
+			let mut record = terminal.unwrap_or_else(|| {
 				json!({
 					"type": "aborted",
 					"reason": "the job ended without a terminal record",
@@ -713,6 +1023,8 @@ pub(crate) fn poll_run(
 					"exitCode": 4,
 				})
 			});
+
+			failures.attach(&mut record);
 
 			// The poll's own `exit` wins when it is a valid code; the record
 			// mapping is the fallback contract
@@ -1750,6 +2062,212 @@ mod tests {
 			record_exit_code(&json!({ "type": "result", "kind": "failure", "exitCode": 99 })),
 			2
 		);
+	}
+
+	/// The stream a client failure typically arrives on: the main script waits
+	/// while a client's companion script errors
+	fn failing_client_stream() -> Vec<Value> {
+		vec![
+			json!({ "type": "started", "jobId": "job-1", "seq": 1, "t": 0.0 }),
+			json!({ "type": "ready", "context": "client:1", "seq": 2, "t": 1.0 }),
+			json!({
+				"type": "clientResult", "context": "client:1", "ok": false,
+				"error": "Workspace.Door:12: attempt to index nil with 'Open'",
+				"traceback": "Workspace.Door:12: attempt to index nil with 'Open'\nRunner:3 function __wsync_run",
+				"seq": 3, "t": 3.2,
+			}),
+			json!({ "type": "clientResult", "context": "client:2", "ok": true, "value": 7, "seq": 4, "t": 3.5 }),
+			json!({ "type": "log", "context": "client:2", "level": "error", "message": "LocalScript:4: nope", "seq": 5, "t": 4.0 }),
+			json!({ "type": "log", "context": "client:2", "level": "error", "message": "LocalScript:4: nope", "seq": 6, "t": 4.1 }),
+			json!({ "type": "log", "context": "server", "level": "error", "message": "server noise", "seq": 7 }),
+			json!({ "type": "log", "context": "client:1", "level": "warn", "message": "a warning", "seq": 8 }),
+			json!({ "type": "clientResult", "context": "client:2", "ok": false, "error": "client playscript failed to boot", "seq": 9 }),
+		]
+	}
+
+	fn observed(records: &[Value]) -> ClientFailures {
+		let mut failures = ClientFailures::default();
+
+		for record in records {
+			failures.observe(record);
+		}
+
+		failures
+	}
+
+	#[test]
+	fn client_failures_collect_failed_results_and_client_error_logs() {
+		let mut stream = failing_client_stream();
+
+		// An at-least-once redelivery of seq 3 is not a second failure
+		stream.push(stream[2].clone());
+
+		let mut terminal = json!({ "type": "result", "ok": false, "kind": "timeout" });
+
+		observed(&stream).attach(&mut terminal);
+
+		assert_eq!(
+			terminal["clientFailures"],
+			json!([
+				{
+					"context": "client:1", "source": "clientResult",
+					"error": "Workspace.Door:12: attempt to index nil with 'Open'",
+					"traceback": "Workspace.Door:12: attempt to index nil with 'Open'\nRunner:3 function __wsync_run",
+					"seq": 3, "t": 3.2,
+				},
+				// Identical error lines from one client collapse into a count
+				{ "context": "client:2", "source": "log", "error": "LocalScript:4: nope", "count": 2, "seq": 5, "t": 4.0 },
+				// A client boot failure has no traceback to carry
+				{ "context": "client:2", "source": "clientResult", "error": "client playscript failed to boot", "seq": 9 },
+			]),
+			"successes, server errors and client warnings are not client failures"
+		);
+		assert!(terminal.get("clientFailuresOmitted").is_none());
+
+		// A stream without client failures leaves the record's shape untouched
+		let mut clean = json!({ "type": "result", "ok": true, "kind": "success" });
+
+		observed(&stream[..2]).attach(&mut clean);
+		assert_eq!(clean, json!({ "type": "result", "ok": true, "kind": "success" }));
+	}
+
+	#[test]
+	fn client_failures_attach_never_overrides_the_plugin_list() {
+		let plugin_list = json!([{ "context": "client:1", "source": "clientResult", "error": "from the plugin" }]);
+		let mut terminal = json!({ "type": "result", "outcome": "timeout", "clientFailures": plugin_list });
+
+		observed(&failing_client_stream()).attach(&mut terminal);
+
+		assert_eq!(terminal["clientFailures"], plugin_list);
+		assert!(terminal.get("clientFailuresOmitted").is_none());
+	}
+
+	#[test]
+	fn client_failures_are_bounded_and_char_safe() {
+		let mut failures = ClientFailures::default();
+
+		for index in 0..(CLIENT_FAILURE_RESULTS_MAX + 3) {
+			failures.observe(
+				&json!({ "type": "clientResult", "context": "client:1", "ok": false, "error": format!("boom {index}") }),
+			);
+		}
+
+		for index in 0..(CLIENT_FAILURE_LOGS_MAX + 2) {
+			failures.observe(
+				&json!({ "type": "log", "context": "client:1", "level": "error", "message": format!("line {index}") }),
+			);
+		}
+
+		// A repeat of a kept line still collapses once the log cap is reached
+		failures.observe(&json!({ "type": "log", "context": "client:1", "level": "error", "message": "line 0" }));
+
+		let mut terminal = json!({ "type": "aborted" });
+
+		failures.attach(&mut terminal);
+
+		let entries = terminal["clientFailures"].as_array().unwrap();
+
+		assert_eq!(entries.len(), CLIENT_FAILURE_RESULTS_MAX + CLIENT_FAILURE_LOGS_MAX);
+		assert_eq!(terminal["clientFailuresOmitted"], 5);
+		assert_eq!(entries[CLIENT_FAILURE_RESULTS_MAX]["count"], 2);
+
+		// Text is cut on a char boundary, never mid-code-point
+		let wide = "é".repeat(CLIENT_FAILURE_TRACEBACK_BYTES);
+		let mut failures = ClientFailures::default();
+
+		failures.observe(
+			&json!({ "type": "clientResult", "context": "client:1", "ok": false, "error": wide, "traceback": wide }),
+		);
+
+		let mut terminal = json!({});
+
+		failures.attach(&mut terminal);
+
+		let entry = &terminal["clientFailures"][0];
+		let error = entry["error"].as_str().unwrap();
+		let traceback = entry["traceback"].as_str().unwrap();
+
+		assert!(error.ends_with("<truncated>") && error.len() <= CLIENT_FAILURE_ERROR_BYTES + "<truncated>".len());
+		assert!(
+			traceback.ends_with("<truncated>")
+				&& traceback.len() <= CLIENT_FAILURE_TRACEBACK_BYTES + "<truncated>".len()
+		);
+		assert_eq!(cap_text("héllo", 2), "h<truncated>");
+		assert_eq!(cap_text("short", 64), "short");
+	}
+
+	#[test]
+	fn the_cli_deadline_terminal_is_self_contained() {
+		let failures = observed(&failing_client_stream());
+		let record = deadline_record(60, "running".to_owned(), Duration::from_secs(70), &failures);
+
+		assert_eq!(record["type"], "result");
+		assert_eq!(record["kind"], "timeout");
+		assert_eq!(record["outcome"], "timeout");
+		assert_eq!(record["jobStatus"], "running");
+		assert_eq!(
+			record_exit_code(&record),
+			3,
+			"a timeout with client failures still exits 3"
+		);
+		assert_eq!(record["clientFailures"].as_array().map(Vec::len), Some(3));
+		assert_eq!(
+			record["clientFailures"][0]["traceback"],
+			"Workspace.Door:12: attempt to index nil with 'Open'\nRunner:3 function __wsync_run"
+		);
+
+		// Nothing to report adds nothing
+		let quiet = deadline_record(
+			60,
+			"running".to_owned(),
+			Duration::from_secs(70),
+			&ClientFailures::default(),
+		);
+
+		assert!(quiet.get("clientFailures").is_none());
+	}
+
+	#[test]
+	fn the_human_terminal_points_at_streamed_tracebacks_and_prints_the_rest() {
+		let mut record = json!({
+			"type": "result", "ok": false, "outcome": "timeout",
+			"error": "playtest run timed out after 60s", "jobStatus": "stopped", "elapsed": 61.0,
+		});
+
+		observed(&failing_client_stream()).attach(&mut record);
+
+		// Under --quiet nothing streamed: the traceback prints in full
+		let quiet = terminal_lines(&record, &HashSet::new());
+
+		assert_eq!(
+			quiet,
+			vec![
+				"✖ timeout (61.0s): playtest run timed out after 60s (job: stopped)",
+				"3 client failure(s) reported during the run:",
+				"  ✖ client:1 at 3.2s: Workspace.Door:12: attempt to index nil with 'Open'",
+				"    Workspace.Door:12: attempt to index nil with 'Open'",
+				"    Runner:3 function __wsync_run",
+				"  ✖ client:2 error log ×2 at 4.0s: LocalScript:4: nope",
+				"  ✖ client:2: client playscript failed to boot",
+			],
+			"the plugin's `outcome` names the failure when `kind` is absent"
+		);
+
+		// Streamed as progress: the summary points back instead of repeating it
+		let streamed = terminal_lines(&record, &HashSet::from([3]));
+
+		assert_eq!(streamed[3], "    (traceback printed above)");
+		assert_eq!(streamed.len(), quiet.len() - 1);
+
+		// A success with a failed client still says so
+		let mut success = json!({ "type": "result", "ok": true, "outcome": "success", "value": 1, "elapsed": 2.0 });
+
+		observed(&failing_client_stream()).attach(&mut success);
+
+		let lines = terminal_lines(&success, &HashSet::new());
+
+		assert_eq!(lines[..2], ["✔ result (2.0s):", "1"]);
+		assert_eq!(lines[2], "3 client failure(s) reported during the run:");
 	}
 
 	#[test]

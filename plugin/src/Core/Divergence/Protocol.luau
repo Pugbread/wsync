@@ -23,12 +23,27 @@ Protocol.LIMITS = {
 
 --- One `/compare` entry (pinned shape): `add` = disk/server has it, Studio
 --- lacks it; `update` = differs; `remove` = Studio-only.
+---
+--- The Studio side also reports what the daemon's three-way comparison needs
+--- to tell which side moved since the last sync: the SHA-256 of a script's
+--- LF-normalized editor source (`update`/`remove`), and for a `remove` root
+--- every synced descendant with its own class and hash, so a disk deletion
+--- only wins over a Studio subtree nobody touched.
+export type Descendant = {
+	path: string, -- relative to the entry's instancePath
+	class: string,
+	sourceSha256: string?,
+}
+
 export type Entry = {
 	ref: string, -- 32-char lowercase hex
 	change: "add" | "update" | "remove",
 	class: string,
 	name: string,
 	instancePath: string,
+	sourceSha256: string?,
+	descendants: { Descendant }?,
+	descendantsTruncated: boolean?,
 }
 
 --- Injected environment: how the mapper touches refs and instances. In
@@ -42,6 +57,11 @@ export type Env = {
 	instanceName: (instance: any) -> string?,
 	instanceClass: (instance: any) -> string?,
 	pathOf: (instance: any) -> string?,
+	-- Optional (older callers and tests may omit them): the Studio-side
+	-- source hash of a script, and the synced descendants of an instance
+	-- (second return: truncated at the bound)
+	sourceHashOf: ((instance: any) -> string?)?,
+	descendantsOf: ((instance: any) -> ({ Descendant }, boolean))?,
 }
 
 export type MappedEntries = {
@@ -111,6 +131,7 @@ function Protocol.mapEntries(changes: any, env: Env): MappedEntries
 			class = env.instanceClass(instance) or "",
 			name = name,
 			instancePath = env.pathOf(instance) or name,
+			sourceSha256 = if env.sourceHashOf then env.sourceHashOf(instance) else nil,
 		})
 	end
 
@@ -143,12 +164,25 @@ function Protocol.mapEntries(changes: any, env: Env): MappedEntries
 			pendingRemovals[refHex] = instance
 		end
 
+		local descendants: { Descendant }? = nil
+		local truncated: boolean? = nil
+
+		if env.descendantsOf then
+			local found, cut = env.descendantsOf(instance)
+
+			descendants = found
+			truncated = if cut then true else nil
+		end
+
 		table.insert(entries, {
 			ref = refHex,
 			change = "remove" :: "remove",
 			class = env.instanceClass(instance) or "",
 			name = name,
 			instancePath = env.pathOf(instance) or name,
+			sourceSha256 = if env.sourceHashOf then env.sourceHashOf(instance) else nil,
+			descendants = descendants,
+			descendantsTruncated = truncated,
 		})
 	end
 
@@ -167,7 +201,17 @@ end
 --- plus a margin for string escaping). The coordinator injects an exact
 --- JSON-encoded measurement instead; this keeps the pure module testable.
 function Protocol.estimateEntryBytes(entry: Entry): number
-	return 64 + #entry.ref + #entry.change + 2 * (#entry.class + #entry.name + #entry.instancePath)
+	local bytes = 64 + #entry.ref + #entry.change + 2 * (#entry.class + #entry.name + #entry.instancePath)
+
+	if entry.sourceSha256 then
+		bytes += 84
+	end
+
+	for _, descendant in entry.descendants or {} do
+		bytes += 48 + 2 * (#descendant.path + #descendant.class) + (if descendant.sourceSha256 then 84 else 0)
+	end
+
+	return bytes
 end
 
 --- Pack entries into ordered chunks bounded by both limits. `measure` maps an
@@ -195,7 +239,10 @@ function Protocol.planChunks(entries: { Entry }, measure: ((entry: Entry) -> num
 		currentBytes += bytes
 	end
 
-	if #current > 0 then
+	-- An empty diff still uploads one empty final chunk: the committed
+	-- receipt is how the daemon learns the two sides agree (it records its
+	-- sync base then)
+	if #current > 0 or #chunks == 0 then
 		table.insert(chunks, current)
 	end
 
@@ -206,8 +253,16 @@ end
 -- Upload state machine (chunked POST /compare with verified receipts)
 --------------------------------------------------------------------------------
 
+--- The connecting place, so the daemon only reads a sync base recorded
+--- against the same one
+export type Place = {
+	placeId: number,
+	gameId: number,
+}
+
 export type Upload = {
 	chunks: { { Entry } },
+	place: Place?,
 	submissionId: string,
 	nextIndex: number, -- 0-based index of the next chunk to send
 	restarted: boolean,
@@ -220,6 +275,7 @@ export type Request = {
 	chunkIndex: number,
 	finalChunk: boolean,
 	restart: boolean?,
+	place: Place?,
 	entries: { Entry },
 }
 
@@ -229,11 +285,15 @@ export type Verdict = {
 	choiceId: string?,
 	reviewId: string?,
 	resolver: string?,
+	-- The daemon rewrote disk from Studio during the commit: the plugin must
+	-- re-pair its instances with the daemon's before live sync starts
+	rehydrate: boolean?,
 }
 
-function Protocol.newUpload(chunks: { { Entry } }, newId: () -> string): Upload
+function Protocol.newUpload(chunks: { { Entry } }, newId: () -> string, place: Place?): Upload
 	return {
 		chunks = chunks,
+		place = place,
 		submissionId = newId(),
 		nextIndex = 0,
 		restarted = false,
@@ -255,6 +315,7 @@ function Protocol.nextRequest(upload: Upload): Request?
 		chunkIndex = upload.nextIndex,
 		finalChunk = upload.nextIndex == #upload.chunks - 1,
 		restart = if upload.nextIndex == 0 then true else nil,
+		place = upload.place,
 		entries = upload.chunks[upload.nextIndex + 1],
 	}
 end
@@ -323,7 +384,23 @@ function Protocol.applyReceipt(upload: Upload, receipt: any): Verdict
 		upload.done = true
 		upload.nextIndex += 1
 
-		return { kind = "committed", reason = nil, choiceId = nil, reviewId = reviewId, resolver = "studio-first" }
+		return {
+			kind = "committed",
+			reason = nil,
+			choiceId = nil,
+			reviewId = reviewId,
+			resolver = "studio-first",
+			rehydrate = receipt.rehydrate == true,
+		}
+	end
+
+	if receipt.clean == true then
+		-- Nothing differed (or nothing the daemon's scope keeps): the sides
+		-- agree and the daemon recorded that; there is nothing to apply
+		upload.done = true
+		upload.nextIndex += 1
+
+		return { kind = "committed", reason = nil, choiceId = nil, reviewId = nil, resolver = "studio-first" }
 	end
 
 	if type(receipt.choiceId) ~= "string" or receipt.choiceId == "" then

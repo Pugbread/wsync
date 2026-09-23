@@ -1,10 +1,10 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use log::error;
 use rbx_dom_weak::{types::Tags, ustr, HashMapExt, Ustr, UstrMap};
 use serde::Deserialize;
 use std::path::Path;
 
-use super::helpers;
+use super::{helpers, model_depth_allowed, stack_position};
 use crate::{core::snapshot::Snapshot, resolution::UnresolvedValue, vfs::Vfs};
 
 #[derive(Debug, Deserialize)]
@@ -35,12 +35,19 @@ pub fn read_json_model(path: &Path, vfs: &Vfs) -> Result<Snapshot> {
 	}
 
 	let model = serde_json::from_str(&contents)?;
-	let snapshot = walk(model, path)?;
+	let snapshot = walk(model, path, 0, stack_position())?;
 
 	Ok(snapshot)
 }
 
-fn walk(model: JsonModel, path: &Path) -> Result<Snapshot> {
+fn walk(model: JsonModel, path: &Path, depth: usize, base: usize) -> Result<Snapshot> {
+	if !model_depth_allowed(depth, base) {
+		bail!(
+			"{} nests instances deeper than WSync follows ({depth} levels)",
+			path.display()
+		);
+	}
+
 	let mut snapshot = Snapshot::new();
 	let mut properties = UstrMap::new();
 
@@ -92,7 +99,7 @@ fn walk(model: JsonModel, path: &Path) -> Result<Snapshot> {
 
 	// Append children
 	for child in model.children.unwrap_or_default() {
-		snapshot.add_child(walk(child, path)?);
+		snapshot.add_child(walk(child, path, depth + 1, base)?);
 	}
 
 	Ok(snapshot)

@@ -171,20 +171,7 @@ impl Target {
 	}
 
 	pub fn probe(&self) -> Result<Hello> {
-		let response = reqwest::blocking::Client::builder()
-			// Loopback traffic must never invoke platform proxy discovery (which
-			// can panic under macOS sandbox restrictions) or leave this host.
-			.no_proxy()
-			.timeout(PROBE_TIMEOUT)
-			// Unknown routes answer with a redirect to `/`; following it
-			// would turn "endpoint not implemented" into a bogus 200
-			.redirect(reqwest::redirect::Policy::none())
-			.build()?
-			.get(format!("http://localhost:{}/hello", self.port))
-			.send()?
-			.error_for_status()?;
-
-		Ok(response.json()?)
+		probe_port(self.port)
 	}
 
 	pub fn writes_log(&self) -> PathBuf {
@@ -195,6 +182,24 @@ impl Target {
 	pub fn sourcemap(&self) -> PathBuf {
 		self.project_path.get_parent().join("sourcemap.json")
 	}
+}
+
+/// `GET /hello` on one loopback port, with the discovery probe's short timeout
+pub fn probe_port(port: u16) -> Result<Hello> {
+	let response = reqwest::blocking::Client::builder()
+		// Loopback traffic must never invoke platform proxy discovery (which
+		// can panic under macOS sandbox restrictions) or leave this host.
+		.no_proxy()
+		.timeout(PROBE_TIMEOUT)
+		// Unknown routes answer with a redirect to `/`; following it
+		// would turn "endpoint not implemented" into a bogus 200
+		.redirect(reqwest::redirect::Policy::none())
+		.build()?
+		.get(format!("http://localhost:{port}/hello"))
+		.send()?
+		.error_for_status()?;
+
+	Ok(response.json()?)
 }
 
 /// `GET /hello` — the daemon's JSON identity (Design §5.2)
@@ -229,6 +234,10 @@ pub struct Hello {
 	/// confirmed
 	#[serde(default)]
 	pub writes_log: Option<String>,
+	/// Present while the daemon refuses to apply connects because the last
+	/// daemon died applying one (`wsync daemon resume` ends it)
+	#[serde(default)]
+	pub safe_mode: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -608,6 +617,24 @@ pub fn print_ok(value: &Value) {
 /// be spelled `--value '"Red"'`
 pub fn parse_literal(literal: &str) -> Value {
 	serde_json::from_str(literal).unwrap_or_else(|_| Value::String(literal.to_owned()))
+}
+
+/// Every command that addresses one instance takes its path positionally or
+/// as `--path` (`wsync get Workspace/Camera` ≡ `wsync get --path
+/// Workspace/Camera`) — agents should not have to remember which command
+/// spells it which way. Both forms together are accepted only when they
+/// agree; two different paths are a usage error rather than a silent pick.
+/// Where a path is required, the pair is declared as the required,
+/// `multiple` ArgGroup `studio_path`, so clap's usage error names both
+/// spellings (`<--path <STUDIO-PATH>|STUDIO-PATH>`)
+pub fn path_arg(flag: Option<String>, positional: Option<String>) -> Result<Option<String>> {
+	match (flag, positional) {
+		(Some(flag), Some(positional)) if flag != positional => bail!(
+			"Two different paths were given: `--path {flag}` and the positional `{positional}`. Pass the path once, \
+			 either positionally or with --path"
+		),
+		(flag, positional) => Ok(flag.or(positional)),
+	}
 }
 
 /// Names a JSON value's type for usage errors ("--args must be a JSON array,

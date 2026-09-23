@@ -11,11 +11,12 @@
 // impure ones by loading each source through `loadstring` with its own
 // `script` and `require` (plugin/tests/harness/loader.luau).
 //
-// What is real: Watcher, ReadProcessor, Tree, Changes, Snapshot, Meta, Error,
-// Util, SyncScope, the equals/generateRef helpers. What is stubbed: Log, Config,
-// Dom (property defaults for the code-scope classes), the Signal package, and
-// the Roblox globals. A scenario fails by calling `error`; its output is
-// reported verbatim.
+// What is real: Watcher, the Processor with its Read and Write halves, Tree,
+// Changes, Snapshot, Meta, both Error modules, Util, Transport/Hex, SyncScope,
+// the equals/generateRef helpers (and Log, loadable as `RealLog`). What is
+// stubbed: Log, Config, Dom (property defaults for the code-scope classes),
+// the Signal package, and the Roblox globals. A scenario fails by calling
+// `error`; its output is reported verbatim.
 //
 // Runner resolution, in order:
 //   1. --luau <path>
@@ -44,12 +45,19 @@ const MODULES = {
 	Meta: "Core/Meta.luau",
 	Snapshot: "Core/Snapshot.luau",
 	Error: "Core/Error.luau",
+	TransportError: "Transport/Error.luau",
+	Hex: "Transport/Hex.luau",
 	Util: "Util.luau",
+	RealLog: "Log.luau",
 	equals: "Helpers/equals.luau",
 	generateRef: "Helpers/generateRef.luau",
 	SyncScope: "SyncScope.luau",
+	Processor: "Core/Processor/init.luau",
 	Read: "Core/Processor/Read.luau",
+	Write: "Core/Processor/Write.luau",
 	Watcher: "Watcher.luau",
+	DivergenceProtocol: "Core/Divergence/Protocol.luau",
+	DraftRequire: "Remote/DraftRequire.luau",
 };
 
 const SPEC = {

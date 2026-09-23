@@ -2,13 +2,16 @@
   "name": "doctor",
   "title": "wsync doctor",
   "category": "Live diagnostics",
-  "description": "Runs a broader health check over project files, daemon, plugin, linter, and sourcemap setup.",
+  "description": "Runs a broader health check over project files, daemon, plugin, and disk-side layout hazards; the disk checks also run offline, with no daemon.",
   "usage": "wsync doctor [--project <path>] [--port <port>] [--raw]",
   "examples": [
     "wsync doctor --project .",
     "wsync doctor --project . --raw"
   ],
   "notes": [
-    "Use after `status` when setup or connectivity looks suspicious."
+    "Use after `status` when setup or connectivity looks suspicious, or before starting a daemon to check the project's layout.",
+    "Without a daemon, doctor reports it as a warning (`offline: true` in `--raw`) and still runs the offline checks: it loads the project and scans every mapped directory for disk hazards. The exit code then reflects the disk checks alone.",
+    "Disk hazards: `ambiguous-init` (several init files in one folder; the first sync rule wins, e.g. `init.client.luau` over `init.luau`), `flat-folder-pair` (`X.luau` beside `X/init.luau`; the folder wins), `empty-folder` (an empty `X/` beside `X.luau`; ignored), `reshape-leftover` (an interrupted `.X.wsync-reshape` staging directory the next daemon start finishes or rolls back) and `scan-error` are errors; `duplicate-sibling` (different files projecting same-named siblings) and `oversized-file` (unignored scripts or data over 1 MiB, models or unsynced files over 16 MiB) are warnings.",
+    "Any error-level hazard fails the `disk-hazards` check and exits non-zero; warnings alone pass with a warning. `--raw` adds `hazards` with every finding's `kind`, `severity`, absolute `paths`, the `winner` WSync projects, a `message`, and a suggested `fix`; the human report lists them with project-relative paths."
   ]
 }

@@ -148,8 +148,13 @@ pub struct Open {
 	targeting: Targeting,
 
 	/// Studio path(s) to select, `/`-separated
-	#[arg(value_name = "STUDIO-PATH", required = true)]
+	#[arg(value_name = "STUDIO-PATH", required_unless_present = "flagged")]
 	paths: Vec<String>,
+
+	/// Studio path to select (repeatable; the named form of the positional
+	/// paths)
+	#[arg(long = "path", value_name = "STUDIO-PATH")]
+	flagged: Vec<String>,
 
 	/// Print machine-readable JSON
 	#[arg(long)]
@@ -158,9 +163,19 @@ pub struct Open {
 
 impl Open {
 	pub fn main(self) -> Result<()> {
+		// Positional and `--path` paths merge in order; a path given both
+		// ways is selected once
+		let mut paths = self.paths;
+
+		for path in self.flagged {
+			if !paths.contains(&path) {
+				paths.push(path);
+			}
+		}
+
 		SelectSet {
 			targeting: self.targeting,
-			paths: serde_json::to_string(&self.paths)?,
+			paths: serde_json::to_string(&paths)?,
 			raw: self.raw,
 		}
 		.main()

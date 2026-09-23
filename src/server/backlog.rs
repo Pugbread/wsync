@@ -12,10 +12,13 @@
 //! put an entry back — restoring the file and pushing it to Studio, which is
 //! the old "keep disk" answer, deferred until you actually want it.
 //!
-//! Entries expire a day after capture. That is deliberately short: the backlog
-//! is a safety net for the edit you did not mean to lose, not a version
-//! history, and one left to grow forever would quietly accumulate every stale
-//! file the project ever disagreed about.
+//! Entries expire a day after capture by default (`backlog_ttl_hours`). That is
+//! deliberately short: the backlog is a safety net for the edit you did not
+//! mean to lose, not a version history, and one left to grow forever would
+//! quietly accumulate every stale file the project ever disagreed about. An
+//! entry you mean to come back to can be pinned, and a pinned entry never
+//! expires. Capturing bytes identical to an entry already held for the same
+//! path refreshes that entry instead of adding a second copy of it.
 
 use anyhow::{Context, Result};
 use log::{debug, warn};
@@ -30,7 +33,7 @@ use std::{
 
 use uuid::Uuid;
 
-use crate::{constants::BACKUPS_DIR, lock};
+use crate::{config::Config, constants::BACKUPS_DIR, lock};
 
 /// Directory under `.wsync-backups` that holds the backlog
 const BACKLOG_DIR: &str = "backlog";
@@ -38,9 +41,18 @@ const BACKLOG_DIR: &str = "backlog";
 /// The persisted index inside [`BACKLOG_DIR`]
 const BACKLOG_INDEX: &str = "index.json";
 
-/// How long an entry survives. Short on purpose: this is a safety net for a
-/// loss you have not noticed yet, not a history you can browse next week.
+/// How long an entry survives by default. Short on purpose: this is a safety
+/// net for a loss you have not noticed yet, not a history you can browse next
+/// week. `backlog_ttl_hours` overrides it; pinning exempts one entry
 pub const ENTRY_TTL_SECONDS: u64 = 24 * 60 * 60;
+
+/// The configured entry lifetime
+fn ttl_seconds() -> u64 {
+	match Config::new().backlog_ttl_hours {
+		0 => ENTRY_TTL_SECONDS,
+		hours => hours.saturating_mul(60 * 60),
+	}
+}
 
 /// Why a piece of disk content lost
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,25 +82,48 @@ pub struct Entry {
 	/// puts it back
 	pub path: String,
 	pub reason: Reason,
-	/// Unix seconds; an entry is swept `ENTRY_TTL_SECONDS` after this
+	/// Unix seconds; an entry is swept the configured lifetime after this
 	pub captured_at: u64,
 	pub bytes: u64,
+	/// A pinned entry never expires
+	#[serde(default)]
+	pub pinned: bool,
+	/// How many times these exact bytes were captured for this path; repeat
+	/// captures refresh the entry instead of adding another copy
+	#[serde(default = "one")]
+	pub captures: u32,
+}
+
+fn one() -> u32 {
+	1
 }
 
 impl Entry {
-	pub fn expires_at(&self) -> u64 {
-		self.captured_at + ENTRY_TTL_SECONDS
+	pub fn expires_at(&self, ttl: u64) -> Option<u64> {
+		(!self.pinned).then(|| self.captured_at + ttl)
 	}
 
-	pub fn to_json(&self, now: u64) -> Value {
+	fn expired(&self, now: u64, ttl: u64) -> bool {
+		self.expires_at(ttl).is_some_and(|expires_at| expires_at <= now)
+	}
+
+	/// `olderVersions` counts entries for the same path captured before this
+	/// one (different bytes — identical ones collapse on capture)
+	pub fn to_json(&self, now: u64, ttl: u64, older_versions: usize) -> Value {
+		let expires_at = self.expires_at(ttl);
+
 		json!({
 			"id": self.id,
 			"path": self.path,
 			"reason": self.reason.as_str(),
 			"capturedAt": self.captured_at,
-			"expiresAt": self.expires_at(),
-			"secondsRemaining": self.expires_at().saturating_sub(now),
+			"expiresAt": expires_at,
+			// Pinned entries report no deadline at all rather than a fake one
+			"secondsRemaining": expires_at.map(|expires_at| expires_at.saturating_sub(now)),
 			"bytes": self.bytes,
+			"pinned": self.pinned,
+			"captures": self.captures,
+			"olderVersions": older_versions,
 		})
 	}
 }
@@ -171,11 +206,12 @@ impl BacklogStore {
 	/// every read, so an expiry never depends on the app being open.
 	pub fn sweep(&self) {
 		let now = now_seconds();
+		let ttl = ttl_seconds();
 		let mut entries = lock!(self.entries);
 		let before = entries.len();
 
 		entries.retain(|entry| {
-			if entry.expires_at() > now {
+			if !entry.expired(now, ttl) {
 				return true;
 			}
 
@@ -199,6 +235,30 @@ impl BacklogStore {
 	pub fn capture(&self, rel_path: &str, source: &Path, reason: Reason) -> Option<Entry> {
 		if !safe_rel_path(rel_path) || !source.exists() {
 			return None;
+		}
+
+		// The same bytes already held for this path (a file that lost the same
+		// way on two connects): refresh that entry rather than keep two copies
+		if let Some(entry) = self.identical_entry(rel_path, source) {
+			remove_any(source);
+
+			let mut entries = lock!(self.entries);
+
+			if let Some(held) = entries.iter_mut().find(|held| held.id == entry.id) {
+				held.captured_at = now_seconds();
+				held.captures = held.captures.saturating_add(1);
+				held.reason = reason;
+			}
+
+			let refreshed = entries.iter().find(|held| held.id == entry.id).cloned();
+			let snapshot = entries.clone();
+
+			drop(entries);
+			self.persist(&snapshot);
+
+			debug!("Backlog already held these bytes for {rel_path}; refreshed that entry");
+
+			return refreshed;
 		}
 
 		let id = Uuid::new_v4().to_string();
@@ -229,6 +289,8 @@ impl BacklogStore {
 			reason,
 			captured_at: now_seconds(),
 			bytes,
+			pinned: false,
+			captures: 1,
 		};
 
 		let mut entries = lock!(self.entries);
@@ -245,10 +307,40 @@ impl BacklogStore {
 		Some(entry)
 	}
 
+	/// The held entry for `rel_path` whose stored bytes equal `source`'s
+	fn identical_entry(&self, rel_path: &str, source: &Path) -> Option<Entry> {
+		let candidates: Vec<Entry> = lock!(self.entries)
+			.iter()
+			.filter(|entry| entry.path == rel_path)
+			.cloned()
+			.collect();
+
+		candidates
+			.into_iter()
+			.find(|entry| same_tree(&self.stored_path(entry), source))
+	}
+
 	pub fn list(&self) -> Vec<Entry> {
 		self.sweep();
 
 		lock!(self.entries).clone()
+	}
+
+	/// Pins or unpins an entry. Pinning also restarts nothing: an unpinned
+	/// entry expires on its original schedule (and may go on the next sweep)
+	pub fn set_pinned(&self, id: &str, pinned: bool) -> Option<Entry> {
+		let mut entries = lock!(self.entries);
+		let entry = entries.iter_mut().find(|entry| entry.id == id)?;
+
+		entry.pinned = pinned;
+
+		let updated = entry.clone();
+		let snapshot = entries.clone();
+
+		drop(entries);
+		self.persist(&snapshot);
+
+		Some(updated)
 	}
 
 	pub fn get(&self, id: &str) -> Option<Entry> {
@@ -315,19 +407,63 @@ impl BacklogStore {
 
 	pub fn to_json(&self) -> Value {
 		let now = now_seconds();
+		let ttl = ttl_seconds();
 		// Inspection must not delete stored content. Expired entries are hidden
 		// here; load and mutation paths retain responsibility for maintenance.
 		let entries: Vec<Entry> = lock!(self.entries)
 			.iter()
-			.filter(|entry| entry.expires_at() > now)
+			.filter(|entry| !entry.expired(now, ttl))
 			.cloned()
+			.collect();
+
+		let rendered: Vec<Value> = entries
+			.iter()
+			.enumerate()
+			.map(|(index, entry)| {
+				// Capture order breaks same-second ties
+				let older = entries
+					.iter()
+					.enumerate()
+					.filter(|(other_index, other)| {
+						other.path == entry.path && (other.captured_at, *other_index) < (entry.captured_at, index)
+					})
+					.count();
+
+				entry.to_json(now, ttl, older)
+			})
 			.collect();
 
 		json!({
 			"total": entries.len(),
-			"ttlSeconds": ENTRY_TTL_SECONDS,
-			"entries": entries.iter().map(|entry| entry.to_json(now)).collect::<Vec<Value>>(),
+			"ttlSeconds": ttl,
+			"entries": rendered,
 		})
+	}
+}
+
+/// Whether two paths hold the same bytes (files) or the same file tree
+fn same_tree(a: &Path, b: &Path) -> bool {
+	match (a.is_dir(), b.is_dir()) {
+		(false, false) => matches!((fs::read(a), fs::read(b)), (Ok(a), Ok(b)) if a == b),
+		(true, true) => {
+			let listing = |dir: &Path| -> Option<Vec<std::ffi::OsString>> {
+				let mut names: Vec<_> = fs::read_dir(dir)
+					.ok()?
+					.filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+					.collect();
+
+				names.sort();
+				Some(names)
+			};
+
+			match (listing(a), listing(b)) {
+				(Some(left), Some(right)) if left == right => {
+					left.iter().all(|name| same_tree(&a.join(name), &b.join(name)))
+				}
+				_ => false,
+			}
+		}
+		_ => false,
 	}
 }
 
@@ -494,6 +630,91 @@ pub async fn drop_entry(State(state): State<AppState>, body: Bytes) -> Response 
 	Json(json!({ "ok": true, "dropped": 1 })).into_response()
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PinRequest {
+	pub id: String,
+	pub pinned: bool,
+}
+
+/// `POST /backlog/pin {id, pinned}` — keep an entry past its expiry, or let it
+/// expire again
+pub async fn pin(State(state): State<AppState>, body: Bytes) -> Response {
+	let request: PinRequest = match serde_json::from_slice(&body) {
+		Ok(request) => request,
+		Err(err) => return error(StatusCode::BAD_REQUEST, &format!("Malformed pin request: {err}")),
+	};
+
+	if state.backlog.get(&request.id).is_none() {
+		return error(StatusCode::NOT_FOUND, "No such backlog entry (it may have expired)");
+	}
+
+	match state.backlog.set_pinned(&request.id, request.pinned) {
+		Some(entry) => {
+			state.ws.emit(Event::Backlog {
+				total: state.backlog.list().len(),
+				added: 0,
+			});
+
+			Json(json!({ "ok": true, "id": entry.id, "path": entry.path, "pinned": entry.pinned })).into_response()
+		}
+		None => error(StatusCode::NOT_FOUND, "No such backlog entry"),
+	}
+}
+
+/// Largest file `GET /backlog/diff` returns as text, per side
+const DIFF_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+#[derive(Deserialize)]
+pub struct DiffQuery {
+	pub id: String,
+}
+
+/// One side of a diff: absent, a directory, binary/too large, or text
+fn diff_side(path: &Path) -> Value {
+	if !path.exists() {
+		return json!({ "exists": false });
+	}
+
+	if path.is_dir() {
+		return json!({ "exists": true, "directory": true });
+	}
+
+	let bytes = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+
+	if bytes > DIFF_MAX_BYTES {
+		return json!({ "exists": true, "bytes": bytes, "tooLarge": true });
+	}
+
+	match fs::read(path).map(String::from_utf8) {
+		Ok(Ok(text)) => json!({ "exists": true, "bytes": bytes, "text": text }),
+		_ => json!({ "exists": true, "bytes": bytes, "binary": true }),
+	}
+}
+
+/// `GET /backlog/diff?id=` — an entry's stored bytes beside what is at its
+/// path now, for the CLI to render as a diff
+pub async fn diff(
+	State(state): State<AppState>,
+	axum::extract::Query(query): axum::extract::Query<DiffQuery>,
+) -> Response {
+	let Some(entry) = state.backlog.get(&query.id) else {
+		return error(StatusCode::NOT_FOUND, "No such backlog entry (it may have expired)");
+	};
+
+	let stored = state.backlog.stored_path(&entry);
+	let current = state.backlog.workspace_dir.join(&entry.path);
+
+	Json(json!({
+		"ok": true,
+		"id": entry.id,
+		"path": entry.path,
+		"stored": diff_side(&stored),
+		"current": diff_side(&current),
+	}))
+	.into_response()
+}
+
 #[cfg(test)]
 mod inspection_tests {
 	use super::*;
@@ -510,5 +731,52 @@ mod inspection_tests {
 		assert_eq!(store.to_json()["total"], 0);
 		assert_eq!(fs::read_to_string(store.stored_path(&entry)).unwrap(), "return 42");
 		assert_eq!(fs::read(store.index_path()).unwrap(), original_index);
+	}
+	#[test]
+	fn identical_captures_of_one_path_collapse_and_different_ones_do_not() {
+		let workspace = tempfile::tempdir().unwrap();
+		let store = BacklogStore::load(workspace.path());
+		let source = workspace.path().join("Example.luau");
+
+		fs::write(&source, "return 1").unwrap();
+		let first = store.capture("Example.luau", &source, Reason::InitialSync).unwrap();
+		assert!(!source.exists(), "a capture moves the file out");
+
+		fs::write(&source, "return 1").unwrap();
+		let again = store.capture("Example.luau", &source, Reason::InitialSync).unwrap();
+
+		assert_eq!(again.id, first.id, "the same bytes refresh the held entry");
+		assert_eq!(again.captures, 2);
+		assert!(!source.exists(), "the repeat still leaves the workspace");
+		assert_eq!(store.list().len(), 1);
+
+		fs::write(&source, "return 2").unwrap();
+		store.capture("Example.luau", &source, Reason::Conflict).unwrap();
+
+		assert_eq!(store.list().len(), 2, "different bytes are a second version");
+		assert_eq!(store.to_json()["entries"][1]["olderVersions"], 1);
+	}
+
+	#[test]
+	fn a_pinned_entry_outlives_its_expiry() {
+		let workspace = tempfile::tempdir().unwrap();
+		let store = BacklogStore::load(workspace.path());
+		let source = workspace.path().join("Keep.luau");
+
+		fs::write(&source, "return 'keep'").unwrap();
+		let entry = store.capture("Keep.luau", &source, Reason::InitialSync).unwrap();
+
+		assert!(store.set_pinned(&entry.id, true).unwrap().pinned);
+		lock!(store.entries)[0].captured_at = 1;
+
+		store.sweep();
+
+		assert_eq!(store.list().len(), 1, "pinned entries are never swept");
+		assert_eq!(store.to_json()["entries"][0]["secondsRemaining"], Value::Null);
+
+		store.set_pinned(&entry.id, false);
+		store.sweep();
+
+		assert!(store.list().is_empty(), "unpinned, it expires on its original schedule");
 	}
 }

@@ -2,6 +2,7 @@ local CollectionService = game:GetService("CollectionService")
 local ScriptEditorService = game:GetService("ScriptEditorService")
 
 local Error = require(script.Parent.Error)
+local SourceWrites = require(script.Parent.SourceWrites)
 
 --- A list of `Enum.Material` values that are used for Terrain.MaterialColors
 local TERRAIN_MATERIAL_COLORS = {
@@ -184,7 +185,8 @@ return {
 				return true, ScriptEditorService:GetEditorSource(instance)
 			end,
 			write = function(instance: Script, _, value: string)
-				task.spawn(function()
+				-- Counted until it lands, so `sync_barrier` can wait it out
+				SourceWrites.spawn(function()
 					ScriptEditorService:UpdateSourceAsync(instance, function()
 						return value
 					end)
@@ -199,7 +201,8 @@ return {
 				return true, ScriptEditorService:GetEditorSource(instance)
 			end,
 			write = function(instance: ModuleScript, _, value: string)
-				task.spawn(function()
+				-- Counted until it lands, so `sync_barrier` can wait it out
+				SourceWrites.spawn(function()
 					ScriptEditorService:UpdateSourceAsync(instance, function()
 						return value
 					end)

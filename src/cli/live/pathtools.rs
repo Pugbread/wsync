@@ -8,13 +8,13 @@
 //! refusal for instances outside the projection — surfaces as the op error
 //! before the non-zero exit.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use colored::Colorize;
 use serde_json::{json, Value};
 
 use crate::{
-	cli::client::{clip, field, print_json, Client, Targeting},
+	cli::client::{clip, field, path_arg, print_json, Client, Targeting},
 	wsync_warn,
 };
 
@@ -37,13 +37,18 @@ impl From {
 
 /// Translate between a Studio instance path and the files backing it on disk
 #[derive(Parser)]
+#[command(group(clap::ArgGroup::new("studio_path").required(true).multiple(true).args(["path", "target"])))]
 pub struct Path {
 	#[command(flatten)]
 	targeting: Targeting,
 
 	/// Studio path or workspace-relative filesystem path
 	#[arg(value_name = "TARGET")]
-	target: String,
+	target: Option<String>,
+
+	/// TARGET as a flag (the named form of the positional target)
+	#[arg(long, value_name = "TARGET")]
+	path: Option<String>,
 
 	/// How to read TARGET; `auto` tries a Studio path first, then a
 	/// filesystem path
@@ -57,8 +62,9 @@ pub struct Path {
 
 impl Path {
 	pub fn main(self) -> Result<()> {
+		let target = path_arg(self.path, self.target)?.context("A target path is required")?;
 		let client = Client::connect(&self.targeting)?;
-		let args = json!({ "target": self.target, "from": self.from.as_str() });
+		let args = json!({ "target": target, "from": self.from.as_str() });
 		let value = client.value("path", args, self.raw)?;
 
 		if self.raw {
@@ -92,13 +98,18 @@ impl Path {
 
 /// Show the Studio path, class, and backing files for a syncable target
 #[derive(Parser)]
+#[command(group(clap::ArgGroup::new("studio_path").required(true).multiple(true).args(["path", "target"])))]
 pub struct Meta {
 	#[command(flatten)]
 	targeting: Targeting,
 
 	/// Studio path or workspace-relative filesystem path
 	#[arg(value_name = "TARGET")]
-	target: String,
+	target: Option<String>,
+
+	/// TARGET as a flag (the named form of the positional target)
+	#[arg(long, value_name = "TARGET")]
+	path: Option<String>,
 
 	/// How to read TARGET; `auto` tries a Studio path first, then a
 	/// filesystem path
@@ -112,8 +123,9 @@ pub struct Meta {
 
 impl Meta {
 	pub fn main(self) -> Result<()> {
+		let target = path_arg(self.path, self.target)?.context("A target path is required")?;
 		let client = Client::connect(&self.targeting)?;
-		let args = json!({ "target": self.target, "from": self.from.as_str() });
+		let args = json!({ "target": target, "from": self.from.as_str() });
 		let value = client.value("meta", args, self.raw)?;
 
 		if self.raw {

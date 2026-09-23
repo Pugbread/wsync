@@ -3,11 +3,14 @@ local WSync = script:FindFirstAncestor("WSync")
 
 local Util = require(WSync.Util)
 
+--- One log line from any values. Never throws: a log call sits inside every
+--- sync path, and a value that cannot be printed must cost that value's text,
+--- not the connection (Util.safeStringify). Refs print as hex.
 local function format(...: any): string
 	local args = ""
 
-	for _, arg in { ... } do
-		args ..= " " .. Util.stringify(arg)
+	for i = 1, select("#", ...) do
+		args ..= " " .. Util.safeStringify((select(i, ...)))
 	end
 
 	return args

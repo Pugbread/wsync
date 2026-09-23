@@ -3,13 +3,14 @@
   "title": "wsync ls",
   "category": "Live inspection",
   "description": "Lists the direct children of a live Studio instance.",
-  "usage": "wsync ls [--project <path>] [--port <port>] [--path <studio-path>] [--raw]",
+  "usage": "wsync ls [--project <path>] [--port <port>] [<studio-path> | --path <studio-path>] [--raw]",
   "examples": [
-    "wsync ls --project . --path ReplicatedStorage",
-    "wsync ls --project . --path \"\""
+    "wsync ls ReplicatedStorage --project .",
+    "wsync ls --project ."
   ],
   "notes": [
-    "An empty path lists top-level DataModel services.",
-    "Use `tree` when you need recursive output."
+    "An omitted or empty path lists top-level DataModel services.",
+    "Use `tree` when you need recursive output.",
+    "The Studio path is positional or `--path` — every single-instance command takes both forms; passing both is accepted only when they name the same path."
   ]
 }

@@ -115,6 +115,8 @@ pub struct Config {
 	/// Route connect-time divergence prompts to the desktop app when running
 	// TODO(phase-6): consumed by the desktop app divergence modal flow
 	pub auto_open_app_modal: bool,
+	/// Hours a backlog entry is kept before it expires (pinned entries never do)
+	pub backlog_ttl_hours: u64,
 
 	#[serde(skip)]
 	/// Internal
@@ -164,6 +166,7 @@ impl Default for Config {
 			compat_argon: false,
 			port_scan_max: 7990,
 			auto_open_app_modal: true,
+			backlog_ttl_hours: 24,
 
 			kind: ConfigKind::default(),
 		}

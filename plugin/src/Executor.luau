@@ -3,8 +3,6 @@ local WSync = script:FindFirstAncestor("WSync")
 
 local Log = require(WSync.Log)
 
-local setWaypoint = require(WSync.Helpers.setWaypoint)
-
 type ExecutorImpl = {
 	__index: ExecutorImpl,
 	new: () -> Executor,
@@ -38,9 +36,7 @@ function Executor:execute(code)
 			local fn = loadstring(code)
 
 			if fn then
-				setWaypoint("Execute")
 				fn()
-				setWaypoint("Execute")
 			else
 				Log.error("Code execution error: 'loadstring' did not return a function!")
 			end

@@ -197,6 +197,230 @@ fn run_failure_timeout_and_aborted_map_to_their_exit_codes() {
 	}
 }
 
+const CLIENT_TRACEBACK: &str = "Workspace.Door:12: attempt to index nil with 'Open'\nRunner:3 function __wsync_run";
+
+/// A client's companion script failing while the main script keeps waiting —
+/// a client error never ends the session, so the server times out
+fn failed_client_record(seq: u64) -> Value {
+	json!({
+		"type": "clientResult", "context": "client:1", "ok": false,
+		"error": "Workspace.Door:12: attempt to index nil with 'Open'",
+		"traceback": CLIENT_TRACEBACK, "seq": seq, "t": 3.2,
+	})
+}
+
+/// The plugin's timeout terminal as a plugin without `clientFailures` wrote it
+fn plugin_timeout_record(seq: u64) -> Value {
+	json!({
+		"type": "result", "ok": false, "outcome": "timeout",
+		"error": "playtest run timed out after 60s", "elapsed": 61.0, "seq": seq,
+	})
+}
+
+#[test]
+fn run_timeout_repeats_client_failures_in_the_final_raw_line() {
+	let daemon = start_daemon(None);
+
+	let progress = vec![
+		json!({ "type": "started", "jobId": "job-1", "mode": "play", "seq": 1 }),
+		failed_client_record(2),
+		json!({ "type": "log", "context": "server", "level": "error", "message": "server noise", "seq": 3 }),
+	];
+	let _journal = run_plugin(
+		&daemon,
+		"run-timeout-clients",
+		vec![
+			(progress.clone(), false, None),
+			(vec![plugin_timeout_record(4)], true, Some(3)),
+		],
+	);
+
+	let sandbox = CliSandbox::new();
+	let script = script_file(&sandbox, "wait.server.luau", "playtest.await('door-open')");
+	let args = run_args(&daemon, &script.to_string_lossy(), &["--raw"]);
+	let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+
+	let output = sandbox.run(&arg_refs);
+
+	assert_eq!(
+		output.status.code(),
+		Some(3),
+		"a timeout stays exit 3: {}",
+		cli_stderr(&output)
+	);
+
+	// Progress still passes through verbatim; the terminal is the plugin's
+	// own record plus the client failures it lacked, so a caller reading only
+	// the last line sees the client traceback
+	let lines = ndjson_lines(&output);
+
+	assert_eq!(lines[..3], progress[..]);
+
+	let mut expected = plugin_timeout_record(4);
+
+	expected["clientFailures"] = json!([{
+		"context": "client:1", "source": "clientResult",
+		"error": "Workspace.Door:12: attempt to index nil with 'Open'",
+		"traceback": CLIENT_TRACEBACK, "seq": 2, "t": 3.2,
+	}]);
+	assert_eq!(lines.last(), Some(&expected));
+}
+
+#[test]
+fn run_keeps_a_plugin_authored_client_failure_list_verbatim() {
+	let daemon = start_daemon(None);
+
+	let mut terminal = plugin_timeout_record(3);
+
+	terminal["exitCode"] = json!(3);
+	terminal["jobStatus"] = json!("stopped");
+	terminal["clientFailures"] = json!([
+		{ "context": "client:1", "source": "clientResult", "error": "boom", "traceback": "boom\nRunner:1", "seq": 2, "t": 3.2 },
+		// Evicted telemetry the CLI never saw — only the plugin knows it
+		{ "context": "client:2", "source": "log", "error": "LocalScript:4: nope", "count": 9, "t": 4.0 },
+	]);
+
+	let _journal = run_plugin(
+		&daemon,
+		"run-plugin-failures",
+		vec![(vec![failed_client_record(2), terminal.clone()], true, Some(3))],
+	);
+
+	let sandbox = CliSandbox::new();
+	let script = script_file(&sandbox, "wait.server.luau", "playtest.await('door-open')");
+	let args = run_args(&daemon, &script.to_string_lossy(), &["--raw"]);
+	let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+
+	let output = sandbox.run(&arg_refs);
+
+	assert_eq!(output.status.code(), Some(3));
+	assert_eq!(ndjson_lines(&output).last(), Some(&terminal));
+}
+
+#[test]
+fn run_human_timeout_summarizes_client_failures_without_repeating_tracebacks() {
+	let daemon = start_daemon(None);
+	let batches = vec![(vec![failed_client_record(1), plugin_timeout_record(2)], true, Some(3))];
+
+	// Streaming: the traceback prints once, as progress, and the summary
+	// points back at it
+	let _journal = run_plugin(&daemon, "run-human-clients", batches.clone());
+	let sandbox = CliSandbox::new();
+	let script = script_file(&sandbox, "wait.server.luau", "playtest.await('door-open')");
+	let args = run_args(&daemon, &script.to_string_lossy(), &[]);
+	let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+
+	let output = sandbox.run(&arg_refs);
+	let stdout = cli_stdout(&output);
+
+	assert_eq!(output.status.code(), Some(3));
+	assert!(
+		stdout.contains("✖ client client:1 failed: Workspace.Door:12"),
+		"{stdout}"
+	);
+	assert!(
+		stdout.contains("✖ timeout (61.0s): playtest run timed out after 60s"),
+		"{stdout}"
+	);
+	assert!(
+		stdout.contains("1 client failure(s) reported during the run:"),
+		"{stdout}"
+	);
+	assert!(stdout.contains("  ✖ client:1 at 3.2s: Workspace.Door:12"), "{stdout}");
+	assert!(stdout.contains("(traceback printed above)"), "{stdout}");
+	assert_eq!(
+		stdout.matches("Runner:3 function __wsync_run").count(),
+		1,
+		"the traceback must not print twice: {stdout}"
+	);
+
+	// --quiet streamed nothing, so the summary carries the traceback itself
+	let daemon = start_daemon(None);
+	let _journal = run_plugin(&daemon, "run-human-quiet", batches);
+	let args = run_args(&daemon, &script.to_string_lossy(), &["--quiet"]);
+	let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+
+	let output = sandbox.run(&arg_refs);
+	let stdout = cli_stdout(&output);
+
+	assert_eq!(output.status.code(), Some(3));
+	assert!(
+		!stdout.contains("✖ client client:1 failed"),
+		"--quiet suppresses progress: {stdout}"
+	);
+	assert!(stdout.contains("    Runner:3 function __wsync_run"), "{stdout}");
+	assert!(!stdout.contains("(traceback printed above)"), "{stdout}");
+}
+
+#[test]
+fn run_cli_deadline_timeout_carries_client_failures() {
+	// The plugin's own terminal never arrives (Studio wedged mid-teardown):
+	// the CLI's deadline — `--timeout` plus its 10 s grace — authors the
+	// timeout, and it must still carry the client failure that streamed first
+	let daemon = start_daemon(None);
+	let progress = vec![
+		json!({ "type": "started", "jobId": "job-1", "mode": "play", "seq": 1 }),
+		failed_client_record(2),
+	];
+	let polls = Mutex::new(0_usize);
+	let first_page = progress.clone();
+
+	let journal = spawn_cli_plugin(
+		&daemon,
+		"run-cli-deadline",
+		Arc::new(move |op, _args| match op {
+			"playtest_run_start" => CliAnswer::Value(json!({ "jobId": "job-1" })),
+			"playtest_run_poll" => {
+				let mut polls = polls.lock().unwrap();
+
+				*polls += 1;
+
+				let records = if *polls == 1 { first_page.clone() } else { Vec::new() };
+
+				CliAnswer::Value(json!({ "records": records, "nextSeq": 2, "done": false }))
+			}
+			"playtest_status" => CliAnswer::Value(json!({ "jobStatus": "stopping" })),
+			"playtest_run_cancel" | "playtest_stop" => CliAnswer::Value(json!({})),
+			_ => CliAnswer::Failure("UNKNOWN_OP", "the fake plugin does not implement this op"),
+		}),
+	);
+
+	let sandbox = CliSandbox::new();
+	let script = script_file(&sandbox, "wait.server.luau", "playtest.await('door-open')");
+	let args = run_args(&daemon, &script.to_string_lossy(), &["--timeout", "1", "--raw"]);
+	let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+
+	let output = sandbox.run(&arg_refs);
+
+	assert_eq!(
+		output.status.code(),
+		Some(3),
+		"the CLI deadline exits 3: {}",
+		cli_stderr(&output)
+	);
+	assert!(journal_ops(&journal).contains(&"playtest_run_cancel".to_owned()));
+
+	let lines = ndjson_lines(&output);
+
+	assert_eq!(lines[..2], progress[..]);
+
+	let terminal = lines.last().unwrap();
+
+	assert_eq!(terminal["type"], "result");
+	assert_eq!(terminal["kind"], "timeout");
+	assert_eq!(terminal["outcome"], "timeout");
+	assert_eq!(terminal["exitCode"], 3);
+	assert_eq!(terminal["jobStatus"], "stopping");
+	assert_eq!(
+		terminal["clientFailures"],
+		json!([{
+			"context": "client:1", "source": "clientResult",
+			"error": "Workspace.Door:12: attempt to index nil with 'Open'",
+			"traceback": CLIENT_TRACEBACK, "seq": 2, "t": 3.2,
+		}])
+	);
+}
+
 #[test]
 fn run_boot_failure_exits_five() {
 	let daemon = start_daemon(None);
@@ -632,4 +856,75 @@ fn playtest_capture_reads_the_engine_screenshot_file() {
 
 	assert!(!output.status.success());
 	assert!(cli_stderr(&output).contains("PlayClient"));
+}
+
+/// The workflow `playtest` step shares the poll loop: when its own deadline
+/// passes without a terminal record, the step's error response still carries
+/// the client failures (with tracebacks) that streamed first
+#[test]
+fn workflow_playtest_timeout_carries_client_failures() {
+	let daemon = start_daemon(None);
+	let polls = Mutex::new(0_usize);
+
+	spawn_cli_plugin(
+		&daemon,
+		"workflow-deadline",
+		Arc::new(move |op, _args| match op {
+			"playtest_run_start" => CliAnswer::Value(json!({ "jobId": "job-1" })),
+			"playtest_run_poll" => {
+				let mut polls = polls.lock().unwrap();
+
+				*polls += 1;
+
+				let records = if *polls == 1 {
+					vec![
+						json!({ "type": "started", "jobId": "job-1", "mode": "play", "seq": 1 }),
+						failed_client_record(2),
+					]
+				} else {
+					Vec::new()
+				};
+
+				CliAnswer::Value(json!({ "records": records, "nextSeq": 2, "done": false }))
+			}
+			"playtest_run_cancel" | "playtest_stop" | "playtest_status" => CliAnswer::Value(json!({})),
+			_ => CliAnswer::Failure("UNKNOWN_OP", "the fake plugin does not implement this op"),
+		}),
+	);
+
+	let sandbox = CliSandbox::new();
+	let workflow = sandbox.work.path().join("playtest.json");
+
+	fs::write(
+		&workflow,
+		json!({
+			"version": 1,
+			"steps": [{ "id": "run", "op": "playtest", "script": "playtest.await('door-open')", "timeoutSec": 1 }],
+		})
+		.to_string(),
+	)
+	.unwrap();
+
+	let output = sandbox.run(&[
+		"run",
+		"--file",
+		&workflow.to_string_lossy(),
+		"--project",
+		&daemon.root.to_string_lossy(),
+		"--port",
+		&daemon.port.to_string(),
+		"--raw",
+	]);
+
+	assert!(!output.status.success(), "a timed-out step must fail the workflow");
+
+	let outcome: Value = serde_json::from_str(cli_stdout(&output).trim())
+		.unwrap_or_else(|err| panic!("stdout is not JSON ({err}): {}", cli_stdout(&output)));
+	let text = outcome.to_string();
+
+	assert!(text.contains("PLAYTEST_TIMEOUT"), "unexpected outcome: {outcome}");
+	assert!(
+		text.contains("\"clientFailures\"") && text.contains("Runner:3 function __wsync_run"),
+		"the step's error response must carry the client failure and its traceback: {outcome}"
+	);
 }

@@ -16,12 +16,12 @@ Docs view renders it from `docs/client-commands.generated.json`.
 - [Agent runtime](#agent-runtime) (4) — `capabilities`, `capture`, `playtest`, `run`
 - [Live inspection](#live-inspection) (14) — `query`, `get`, `ls`, `tree`, `snapshot`, `backlog`, `services`, `props`, `source`, `find`, `find-attr`, `classinfo`, `enums`, `enum`
 - [Path tools](#path-tools) (3) — `path`, `meta`, `where`
-- [Live diagnostics](#live-diagnostics) (8) — `lint`, `tail`, `watch`, `logs`, `status`, `doctor`, `ping`, `version`
+- [Live diagnostics](#live-diagnostics) (10) — `lint`, `tail`, `watch`, `logs`, `status`, `doctor`, `ping`, `version`, `wait-synced`, `verify`
 - [Open Cloud](#open-cloud) (2) — `upload`, `monetization`
 - [Studio control](#studio-control) (5) — `open`, `transmit`, `exec`, `studio`, `debug`
 - [Maintenance](#maintenance) (1) — `repair`
 - [Project docs](#project-docs) (1) — `refresh`
-- [Live writes](#live-writes) (13) — `set`, `new`, `rm`, `mv`, `attr`, `tag`, `call`, `select`, `eval`, `save`, `waypoint`, `undo`, `redo`
+- [Live writes](#live-writes) (11) — `set`, `new`, `rm`, `mv`, `attr`, `tag`, `call`, `select`, `eval`, `undo`, `redo`
 - [Studio clipboard](#studio-clipboard) (2) — `copy`, `paste`
 - [Build & sourcemap](#build--sourcemap) (2) — `build`, `sourcemap`
 - [Tool management](#tool-management) (4) — `update`, `install`, `config`, `doc`
@@ -126,12 +126,12 @@ wsync auth clear --raw
 
 ### `wsync daemon`
 
-Starts, inspects, stops, restarts or reads logs from a project-scoped daemon with a lifecycle record.
+Starts, inspects, stops, restarts, resumes or reads logs from a project-scoped daemon with a lifecycle record.
 
 **Usage**
 
 ```sh
-wsync daemon <start|status|stop|restart|logs> [--project <path>] [options]
+wsync daemon <start|status|stop|restart|logs|resume> [--project <path>] [options]
 ```
 
 **Subcommands**
@@ -141,6 +141,7 @@ wsync daemon <start|status|stop|restart|logs> [--project <path>] [options]
 - `stop` — safety `controls-local-service`, requires `project`
 - `restart` — safety `controls-local-service`, requires `project`
 - `logs` — safety `read-only`, requires `project`
+- `resume` — safety `controls-local-service`, requires `project`, `daemon`
 
 **Examples**
 
@@ -151,6 +152,7 @@ wsync daemon stop --project . --timeout 10 --raw
 wsync daemon restart --project . --port 7978 --timeout 10 --raw
 wsync daemon logs --project . --lines 100
 wsync daemon start --project . --game-id 123 --place-id 456 --raw
+wsync daemon resume --project .
 ```
 
 **Notes**
@@ -163,6 +165,9 @@ wsync daemon start --project . --game-id 123 --place-id 456 --raw
 - Stop verifies the exact live canonical project and boot ID before graceful shutdown. On graceful timeout it can use an OS-kill fallback only for that verified process; a stale PID record alone is insufficient.
 - Runtime records live in the platform data directory under WSync/daemons, alongside start locks and lifecycle logs. The mutation audit log is WSync/writes.log.
 - Desktop managers can supply an owner token through --owner-token-env <ENV>. Lifecycle JSON does not disclose the token. No --projects-root flag is implemented in this CLI family.
+- When no live daemon serves a project, every other command that addresses it (`--project`, a positional project, or the project in the working directory) prints a banner on stderr before running — offline commands such as `lint`, `build`, `sourcemap` and `doctor` included — with the last known state (crashed, heartbeat lost, stopped, not answering, never started), when, and the start command. stdout is never touched. `daemon`, `serve`, `status`, `stop`, the install/config/auth surface and the legacy session commands skip it; `WSYNC_NO_DAEMON_BANNER=1` turns it off for scripts that never run a daemon.
+- A desktop-managed daemon that exits unexpectedly or stops answering heartbeats gets `Manager: …` notes appended to its lifecycle log — the exit status (e.g. `signal 6 (SIGABRT)`) and the last stderr lines — so `daemon logs` shows why it died even when the daemon could not write anything itself.
+- A daemon that dies while applying a connect (or within 30 seconds of it) leaves a marker in `.wsync-backups/`; the next daemon starts in safe mode. In safe mode a connect still compares and decides, but applies nothing to disk or Studio: it writes what it would have done to `.wsync-backups/safe-mode-report.json` and refuses the connect with that explanation, so a crash cannot turn into a crash loop that rewrites the project on every restart. `/hello` reports `safeMode` while it lasts. Fix the cause (`wsync doctor` checks the usual disk hazards), then `wsync daemon resume` and reconnect the plugin. A graceful stop never triggers it.
 
 ---
 
@@ -291,9 +296,9 @@ Builds a read-only JSON plan for a mutating command without executing it.
 **Usage**
 
 ```sh
-wsync plan set --path <studio-path> --prop <property> --value <json>
-wsync plan new --path <parent-path> --class <ClassName> [--name <Name>] [--props <json-object>]
-wsync plan rm --path <studio-path>
+wsync plan set (<studio-path> | --path <studio-path>) --prop <property> --value <json>
+wsync plan new (<parent-path> | --path <parent-path>) --class <ClassName> [--name <Name>] [--props <json-object>]
+wsync plan rm (<studio-path> | --path <studio-path>)
 wsync plan mv --from <studio-path> --to <parent-path> [--force]
 wsync plan resolve --path <filesystem-path> (--disk | --studio)
 ```
@@ -311,7 +316,7 @@ wsync plan resolve --path <filesystem-path> (--disk | --studio)
 ```sh
 wsync plan set --path ReplicatedStorage/Config --prop Source --value '"return {}"'
 wsync plan new --path ReplicatedStorage --class Folder --name Shared
-wsync plan rm --path Workspace/OldPart
+wsync plan rm Workspace/OldPart
 wsync plan resolve --path src/Client/UIController.client.luau --studio
 ```
 
@@ -320,6 +325,7 @@ wsync plan resolve --path src/Client/UIController.client.luau --studio
 - Does not mutate disk or Studio.
 - Returns `mutates`, `requires`, `risks`, and an `executeCommand` string.
 - Available as a dry-run explanation before a risky write; it is not a mandatory ritual before every mutation.
+- `plan set`, `plan new` and `plan rm` take the Studio path positionally or as `--path`, exactly like the commands they explain.
 
 ---
 
@@ -358,7 +364,7 @@ Captures transparent UI, a model or scene, or the current 3D viewport through WS
 **Usage**
 
 ```sh
-wsync capture <ui|model|viewport> [TARGET] [--project <path>] [--port <port>] [--size WxH] [--region x,y,w,h] [--view <preset>] [--direction x,y,z] [--camera-cframe <12 floats>] [--padding 1.0-4.0] [--fov 1-120] [--world] [--skybox] [--framed] [--ui none|overlay] [-o|--output <file>] [--timeout <seconds>] [--raw]
+wsync capture <ui|model|viewport> [TARGET | --path <TARGET>] [--project <path>] [--port <port>] [--size WxH] [--region x,y,w,h] [--view <preset>] [--direction x,y,z] [--camera-cframe <12 floats>] [--padding 1.0-4.0] [--fov 1-120] [--world] [--skybox] [--framed] [--ui none|overlay] [-o|--output <file>] [--timeout <seconds>] [--raw]
 ```
 
 **Subcommands**
@@ -375,6 +381,7 @@ wsync capture ui StarterGui/HUD/InventoryPanel --project . --size 1200x800 --out
 wsync capture ui --project . --region 120,80,1280,720 --size 1920x1080 -o ./captures/hud-region.png --raw
 wsync capture model Workspace/Map/Boss --project . --view isometric --size 1024x1024 --padding 1.25 --fov 32 --output ./captures/boss.png --raw
 wsync capture model Workspace/Map/Boss --project . --camera-cframe '0,10,20,1,0,0,0,1,0,0,0,1' --framed --size 1600x900 --output ./captures/boss-authored.png --raw
+wsync capture model --path Workspace/Map/Boss --project . --view front --size 1024x1024 --output ./captures/boss-front.png --raw
 wsync capture model Workspace/Vehicle --project . --world --skybox --direction 1,-0.65,1 --size 1600x900 --output ./captures/vehicle-scene.png
 wsync capture viewport --project . --region 120,80,1280,720 --size 1920x1080 --output ./captures/viewport-transparent.png --raw
 wsync capture viewport --project . --skybox --ui overlay --size 1920x1080 --output ./captures/viewport-world.png --raw
@@ -391,6 +398,7 @@ wsync capture viewport --project . --skybox --ui overlay --size 1920x1080 --outp
 - `--size WIDTHxHEIGHT` is optional and requests exact output dimensions. Without it, model captures use the focused-render default of 1024x1024 while UI and viewport captures keep their native/current render dimensions. `--output`/`-o`, `--timeout`, and `--raw` are common to every capture type; default files are `wsync-ui.png`, `wsync-model.png`, and `wsync-viewport.png`. Each axis is limited to 4096 pixels and the image to 16777216 pixels.
 - The plugin sends tightly packed RGBA8 in bounded chunks. The CLI checks dimensions, exact byte length, offsets, and EOF, then encodes and verifies the PNG locally. Raw output includes the absolute output path, MIME type, byte size, dimensions, SHA-256, and prepared capture metadata without placing pixels on stdout.
 - Negative camera vectors and CFrame components are accepted as separate option values, for example --direction -1,0,0. The equals form --direction=-1,0,0 works too.
+- `ui` and `model` take TARGET positionally or as `--path`, like every single-instance command; passing both is accepted only when they agree.
 
 ---
 
@@ -449,6 +457,7 @@ wsync playtest wait --project . --job job-id --context client:1 --timeout 30 --r
 - The first completion wins. Main return or `done` exits 0; a main-script error or `fail` exits 2; hard timeout exits 3; an externally ended job exits 4 with its fetched `jobStatus`; and boot or required-context failure exits 5. Runs stop automatically except with `--keep-open`, which prints the job ID for later `exec`, `logs`, `capture`, and `stop` use.
 - `--client-script` runs once in every client as it becomes ready. Each return is a `clientResult`; a client error is an event and never ends the main session. The main script decides whether missing or failed client work matters.
 - `--raw` is live NDJSON with `started`, `ready`, `event`, `log`, `clientResult`, `capture`, `dropped`, `aborted`, and `result` records. Each physical line is independently valid JSON. Events are not deduplicated or sampled by the CLI; source rate limiting is visible through accurate `dropped` counts.
+- The terminal `result` or `aborted` record (the last `--raw` line) is self-contained for every outcome, including a hard timeout while the main script waits and the timeout the CLI authors itself when no terminal arrives within `--timeout` plus grace: every client failure reported during the run is repeated in `clientFailures`, an array of `{context, source, error, traceback?, count?, seq?, t?}`. `source` is `clientResult` (a failed client script or client boot, with its traceback when one exists) or `log` (an error-level PlayClient log line; identical lines collapse into `count`), and `seq` names the progress record that already carried it. At most 32 results and 16 distinct log lines are kept, each text capped at 8 KiB (error) or 32 KiB (traceback), with any overflow counted in `clientFailuresOmitted`; a run without client failures has neither field and the exit code never changes. Human output lists them after the terminal line and points at tracebacks already printed as progress instead of repeating them.
 - Inside a playscript, `playtest.capture(name)` and `playtest.clip(seconds, name)` record the client viewport mid-session and return `{ok, name, media}`. The bytes never travel through the run: each call emits a `capture` record and `playtest run` saves the file as `<name>.png` or `<name>.mp4` under `--capture-dir`. Names may use letters, digits, `-`, `_`, and `.` only. Both are PlayClient-only, a clip is capped at 30 seconds by Roblox, and a capture that cannot be saved warns without failing the run.
 - Runtime heartbeats distinguish quiet scripts from vanished jobs. Missing heartbeats cause a status confirmation before `aborted` is emitted, and every failure reports the final observed job status instead of an empty exec-style value.
 - Encoded main/client results are capped at 1 MiB. An oversized value is replaced by `{"truncated":true,"bytes":N}` with its original byte count; stream bulk telemetry through `emit` instead.
@@ -532,13 +541,13 @@ Reads an instance view or one property from the live Studio session.
 **Usage**
 
 ```sh
-wsync get [--project <path>] [--port <port>] --path <studio-path> [--prop <property>] [--raw]
+wsync get [--project <path>] [--port <port>] (<studio-path> | --path <studio-path>) [--prop <property>] [--raw]
 ```
 
 **Examples**
 
 ```sh
-wsync get --project . --path Workspace/Camera --prop FieldOfView
+wsync get Workspace/Camera --project . --prop FieldOfView
 wsync get --project . --path ReplicatedStorage/Shared --raw
 ```
 
@@ -546,6 +555,7 @@ wsync get --project . --path ReplicatedStorage/Shared --raw
 
 - Requires the daemon and Studio plugin to be connected.
 - Reads the whole live DataModel, including instances the project does not project to disk.
+- The Studio path is positional or `--path` — every single-instance command takes both forms; passing both is accepted only when they name the same path.
 
 ---
 
@@ -556,20 +566,21 @@ Lists the direct children of a live Studio instance.
 **Usage**
 
 ```sh
-wsync ls [--project <path>] [--port <port>] [--path <studio-path>] [--raw]
+wsync ls [--project <path>] [--port <port>] [<studio-path> | --path <studio-path>] [--raw]
 ```
 
 **Examples**
 
 ```sh
-wsync ls --project . --path ReplicatedStorage
-wsync ls --project . --path ""
+wsync ls ReplicatedStorage --project .
+wsync ls --project .
 ```
 
 **Notes**
 
-- An empty path lists top-level DataModel services.
+- An omitted or empty path lists top-level DataModel services.
 - Use `tree` when you need recursive output.
+- The Studio path is positional or `--path` — every single-instance command takes both forms; passing both is accepted only when they name the same path.
 
 ---
 
@@ -580,13 +591,13 @@ Prints a class and name tree below a live Studio instance.
 **Usage**
 
 ```sh
-wsync tree [--project <path>] [--port <port>] [--path <studio-path>] [--depth <n>] [--raw]
+wsync tree [--project <path>] [--port <port>] [<studio-path> | --path <studio-path>] [--depth <n>] [--raw]
 ```
 
 **Examples**
 
 ```sh
-wsync tree --project . --path Workspace --depth 3
+wsync tree Workspace --project . --depth 3
 wsync tree --project . --path ReplicatedStorage --depth 8 --raw
 ```
 
@@ -595,6 +606,7 @@ wsync tree --project . --path ReplicatedStorage --depth 8 --raw
 - Depth defaults to 3; use 0 for only the root instance.
 - Covers the whole live DataModel. That is a superset of the project's disk projection, because instances outside the project tree, under `ignoreGlobs`, or inside an `AvoidSync` subtree exist in Studio only.
 - The live tree is authoritative. Prefer a bounded `--depth` over a wide dump; wide trees are a higher-token read.
+- The Studio path is positional or `--path` — every single-instance command takes both forms; passing both is accepted only when they name the same path.
 
 ---
 
@@ -626,37 +638,43 @@ wsync snapshot --project . --output snapshots/
 
 ### `wsync backlog`
 
-Reviews, restores, or drops the disk content that lost to Studio. WSync is Studio-first and never stops to ask: a connect applies Studio over the project and a mid-session clash resolves the same way, so the disk bytes that lost are moved to the backlog instead of being dropped or waiting behind a prompt.
+Reviews, compares, restores, pins, or drops the disk content that lost to Studio. A connect keeps whichever side changed since the last sync, so disk work done while the daemon was down reaches Studio; only when both sides changed does Studio win, and the disk bytes that lost move to the backlog instead of being dropped or waiting behind a prompt.
 
 **Usage**
 
 ```sh
-wsync backlog [list|restore <id>|drop <id>|drop --all] [--project <path>] [--port <port>] [--raw]
+wsync backlog [list|diff <id>|restore <id>|pin <id>|unpin <id>|drop <id>|drop --all] [--project <path>] [--port <port>] [--raw]
 ```
 
 **Subcommands**
 
 - `list` — safety `read-only`, requires `project`, `daemon`
+- `diff` — safety `read-only`, requires `project`, `daemon`
 - `restore` — safety `mutates-studio`, requires `project`, `daemon`, `studio-plugin`
+- `pin` — safety `mutates-disk`, requires `project`, `daemon`
+- `unpin` — safety `mutates-disk`, requires `project`, `daemon`
 - `drop` — safety `mutates-disk`, requires `project`, `daemon`
 
 **Examples**
 
 ```sh
 wsync backlog --project . --raw
+wsync backlog diff 5f1c1f6e-2f0e-4a1a-9a5b-7c1d2e3f4a5b --project .
 wsync backlog restore 5f1c1f6e-2f0e-4a1a-9a5b-7c1d2e3f4a5b --project .
+wsync backlog pin 5f1c1f6e-2f0e-4a1a-9a5b-7c1d2e3f4a5b --project .
 wsync backlog drop 5f1c1f6e-2f0e-4a1a-9a5b-7c1d2e3f4a5b --project .
 wsync backlog drop --all --project .
 ```
 
 **Notes**
 
-- Sync is Studio-first with no questions asked. A connect applies Studio over the project, and a change that clashes with Studio mid-session resolves toward Studio the moment it is detected. Neither stops to ask, because being interrupted by a decision you did not plan to make is worse than the loss it guards against.
-- The guard is this backlog. Whenever disk content would be overwritten or dropped, its bytes move to `.wsync-backups/backlog/` first, recorded with the path they came from and whether they lost to the initial sync or to a later conflict.
-- `restore <id>` writes an entry back to its project path and pushes it to Studio, which is the old Keep Disk answer, deferred until you actually want it. It needs a connected Studio plugin: a restore that never reaches Studio would be sent straight back to the backlog by the next connect.
-- Entries expire a day after capture and are swept on every read, so an expiry never depends on the app being open. The backlog is a safety net for the edit you did not notice losing, not a version history.
+- A connect never asks. It compares every difference with the last state both sides agreed on (the sync base in `.wsync-backups/sync-base.json`): a side that did not change yields to the side that did, so edits, new files and deletions made on disk while the daemon was down are pushed to Studio, and Studio-side changes are written to disk. Only when both sides changed the same script — or there is no base yet, or it belongs to another place — does Studio win, and a mid-session clash resolves the same way.
+- The guard for those cases is this backlog. Whenever disk content would be overwritten or dropped, its bytes move to `.wsync-backups/backlog/` first, recorded with the path they came from and whether they lost to a connect or to a later conflict. A file Studio deleted since the last sync also leaves the disk through the backlog.
+- `diff <id>` shows an entry against the file at its path now (unified diff; `--raw` returns both texts).
+- `restore <id>` writes an entry back to its project path and pushes it to Studio. It needs a connected Studio plugin, so the restore reaches Studio rather than waiting on disk.
+- Entries expire `backlog_ttl_hours` (24 by default) after capture and are swept on every read, so an expiry never depends on the app being open. `pin <id>` keeps an entry until it is restored or dropped; `unpin <id>` lets it expire again. Capturing bytes identical to an entry already held for the same path refreshes that entry instead of adding a copy; `list` shows a path's older versions under its newest one.
 - `drop` forgets an entry without restoring it; `drop --all` empties the backlog. Neither touches what is already synced.
-- There is no divergence prompt, no pending review, and no Keep Disk / Keep Studio decision anywhere in WSync. The commands that drove them — `diff`, `changes`, `decision`, `conflicts`, and `resolve` — no longer exist.
+- There is no divergence prompt, no pending review, and no Keep Disk / Keep Studio decision anywhere in WSync. The top-level commands that drove them — `wsync diff`, `changes`, `decision`, `conflicts`, and `resolve` — no longer exist (`backlog diff` only compares a backlog entry with its file).
 
 ---
 
@@ -691,20 +709,21 @@ Prints inspectable live Studio properties for one instance.
 **Usage**
 
 ```sh
-wsync props --path <studio-path> [--project <path>] [--port <port>] [--raw]
+wsync props (<studio-path> | --path <studio-path>) [--project <path>] [--port <port>] [--raw]
 ```
 
 **Examples**
 
 ```sh
-wsync props --path Workspace/Baseplate
+wsync props Workspace/Baseplate
 wsync props --path ReplicatedStorage/Client/UIController --raw
 ```
 
 **Notes**
 
-- This is a focused view over `wsync get --path <path>`.
+- This is a focused view over `wsync get <path>`.
 - `Ref`-typed and `SharedString` properties are not encodable and are omitted.
+- The Studio path is positional or `--path` — every single-instance command takes both forms; passing both is accepted only when they name the same path.
 
 ---
 
@@ -715,13 +734,13 @@ Prints an instance's script source from live Studio, or the content of the file 
 **Usage**
 
 ```sh
-wsync source [<studio-path> | --path <studio-path>] [--project <path>] [--port <port>] [--disk] [--output <file>] [--raw]
+wsync source (<studio-path> | --path <studio-path>) [--project <path>] [--port <port>] [--disk] [--output <file>] [--raw]
 ```
 
 **Examples**
 
 ```sh
-wsync source --path ReplicatedStorage/Client/UIController
+wsync source ReplicatedStorage/Client/UIController
 wsync source --project . --path ReplicatedStorage/Client/UIController --disk
 wsync source ReplicatedStorage/Client/UIController --project . --output ./UIController.live.luau
 ```
@@ -729,9 +748,11 @@ wsync source ReplicatedStorage/Client/UIController --project . --output ./UICont
 **Notes**
 
 - Without `--disk`, reads the live `Source` through the plugin's `ScriptEditorService` path. Live source is unreliable while an editor draft is open for that script, so a mismatch is not by itself proof of divergence.
+- Drafts caveat: WSync writes editor/draft text through `ScriptEditorService`, and live `source` reads that editor text — but an edit-mode `require` runs the committed `.Source`, which can lag behind it. To run what `source` shows, use `wsync eval --drafts`.
 - `--disk` resolves the target through the sync middleware, so `.model.json`, `.rbxm`, and `.data.json`-backed instances answer as well as plain script files.
 - This is a loose divergence diagnostic, not a verification step. To verify an edit, use the narrowest `wsync lint --path` plus a local file read.
 - Prefer --output to shell redirection for saved source: it writes only after a successful string response, using an atomic replacement. A failed read leaves an existing destination untouched. --raw preserves structured diagnostics; do not merge stderr into saved source. Output paths are relative to cwd.
+- The Studio path is positional or `--path` — every single-instance command takes both forms; passing both is accepted only when they name the same path.
 
 ---
 
@@ -862,7 +883,7 @@ Translates between Studio instance paths and syncable filesystem paths using the
 **Usage**
 
 ```sh
-wsync path --project <path> [--port <port>] [--from auto|studio|fs] <target> [--raw]
+wsync path --project <path> [--port <port>] [--from auto|studio|fs] (<target> | --path <target>) [--raw]
 ```
 
 **Examples**
@@ -870,6 +891,7 @@ wsync path --project <path> [--port <port>] [--from auto|studio|fs] <target> [--
 ```sh
 wsync path --project . Workspace/Camera
 wsync path --project . --from fs src/Shared/Config.luau
+wsync path --project . --path Workspace/Camera --raw
 ```
 
 **Notes**
@@ -877,6 +899,7 @@ wsync path --project . --from fs src/Shared/Config.luau
 - Resolution runs through the project's sync rules, so any instance the middleware maps answers — scripts, value modules, `.model.json`/`.rbxm` subtrees, and `.data.json`-backed instances alike.
 - Instances outside the projection — not under a mapped root, excluded by `ignoreGlobs`, or inside an `AvoidSync` subtree — are reported as Studio-only instead of being given an invented path.
 - Generated files such as `wsync.md` are not syncable Studio instances.
+- TARGET is positional or `--path` — the same two forms every single-instance command takes; passing both is accepted only when they agree.
 
 ---
 
@@ -887,7 +910,7 @@ Shows the Studio path, class, filesystem path, and existence status for a syncab
 **Usage**
 
 ```sh
-wsync meta [--project <path>] [--port <port>] [--from auto|studio|fs] [--raw] <target>
+wsync meta [--project <path>] [--port <port>] [--from auto|studio|fs] [--raw] (<target> | --path <target>)
 ```
 
 **Examples**
@@ -895,12 +918,14 @@ wsync meta [--project <path>] [--port <port>] [--from auto|studio|fs] [--raw] <t
 ```sh
 wsync meta --project . ReplicatedStorage/Client/UIController
 wsync meta --project . --from fs src/Client/UIController.client.luau
+wsync meta --project . --path ReplicatedStorage/Client/UIController --raw
 ```
 
 **Notes**
 
 - Uses the live Studio tree; start `wsync serve --project .` and connect the Studio plugin first.
 - Resolves through the same middleware as `path`, so a sidecar-backed or model-backed instance reports every file that backs it, not just a script path.
+- TARGET is positional or `--path` — the same two forms every single-instance command takes; passing both is accepted only when they agree.
 
 ---
 
@@ -1047,7 +1072,7 @@ wsync logs --project . --tail
 
 ### `wsync status`
 
-Summarizes daemon reachability, plugin handshake, project config, sourcemap, and write-log health.
+Summarizes daemon reachability, plugin handshake, pending outbound changes, project config, sourcemap, and write-log health.
 
 **Usage**
 
@@ -1065,12 +1090,13 @@ wsync status --project . --raw
 **Notes**
 
 - Use when the task needs current daemon/plugin health or a failed live operation needs diagnosis. Existing fresh context often makes another status call unnecessary; there is no mandatory context/status startup pair.
+- `outbound` counts changes for Studio the daemon has not seen applied yet: `queuedChanges` not yet on the plugin connection, `unconfirmedChanges` sent since the last `wsync wait-synced` confirmed them, plus `unprocessedEvents` still in the file watcher pipeline. Run `wsync wait-synced` to drain and confirm them.
 
 ---
 
 ### `wsync doctor`
 
-Runs a broader health check over project files, daemon, plugin, linter, and sourcemap setup.
+Runs a broader health check over project files, daemon, plugin, and disk-side layout hazards; the disk checks also run offline, with no daemon.
 
 **Usage**
 
@@ -1087,7 +1113,10 @@ wsync doctor --project . --raw
 
 **Notes**
 
-- Use after `status` when setup or connectivity looks suspicious.
+- Use after `status` when setup or connectivity looks suspicious, or before starting a daemon to check the project's layout.
+- Without a daemon, doctor reports it as a warning (`offline: true` in `--raw`) and still runs the offline checks: it loads the project and scans every mapped directory for disk hazards. The exit code then reflects the disk checks alone.
+- Disk hazards: `ambiguous-init` (several init files in one folder; the first sync rule wins, e.g. `init.client.luau` over `init.luau`), `flat-folder-pair` (`X.luau` beside `X/init.luau`; the folder wins), `empty-folder` (an empty `X/` beside `X.luau`; ignored), `reshape-leftover` (an interrupted `.X.wsync-reshape` staging directory the next daemon start finishes or rolls back) and `scan-error` are errors; `duplicate-sibling` (different files projecting same-named siblings) and `oversized-file` (unignored scripts or data over 1 MiB, models or unsynced files over 16 MiB) are warnings.
+- Any error-level hazard fails the `disk-hazards` check and exits non-zero; warnings alone pass with a warning. `--raw` adds `hazards` with every finding's `kind`, `severity`, absolute `paths`, the `winner` WSync projects, a `message`, and a suggested `fix`; the human report lists them with project-relative paths.
 
 ---
 
@@ -1133,6 +1162,62 @@ wsync version --project .
 
 - Human and raw output include the daemon build commit and dirty state. The connected plugin reports its own build identity in the nested version response.
 - Binary, plugin, protocol number, and generated docs are released from one commit; a mismatch reported here means an unreleased or mixed install.
+
+---
+
+### `wsync wait-synced`
+
+Blocks until Studio has applied every disk change the daemon had seen when it was called — the barrier to put after a batch of file edits and before anything that reads Studio.
+
+**Usage**
+
+```sh
+wsync wait-synced [--project <path>] [--port <port>] [--timeout <secs>] [--raw]
+```
+
+**Examples**
+
+```sh
+wsync wait-synced --project .
+wsync wait-synced --project . --timeout 60 --raw
+```
+
+**Notes**
+
+- A real barrier, not a sleep: the daemon waits for the file watcher's debouncer to flush past the moment the command started, drains the sync processor, confirms every resulting change reached the plugin connection, then asks the plugin a question it only answers after applying everything queued before it — including script source writes still landing in the editor.
+- Exits 0 once synced and reports how many changes were confirmed and how long it took. Exits non-zero with the failing stage (`watcher`, `processor`, `queue`, `studio`) and the pending count on timeout (default 30 s), when no Studio plugin is connected, or when no daemon answers.
+- A disk edit that clashes with Studio is not pending: Studio wins at once and the disk bytes move to the backlog. Entries captured while waiting are listed as never delivered; `wsync backlog restore <id>` puts one back.
+- File events that arrive while a Studio change is being written to disk (or within 300 ms after) are ignored as its echo. The barrier counts the ones it saw as `suppressedEvents` and warns: a real edit caught in that window is not delivered until the file is saved again.
+- `wsync status` shows the pending-outbound count (queued, and sent but not yet confirmed by a `wait-synced`) without waiting.
+- Needs the WebSocket plugin transport and a plugin build that implements `sync_barrier`.
+
+---
+
+### `wsync verify`
+
+Hashes every synced script on disk against Studio's editor text and lists mismatches, scripts missing on either side, duplicate siblings, double-init folders and other disk layout hazards, backlog-stuck paths, and unsaved editor drafts.
+
+**Usage**
+
+```sh
+wsync verify [--project <path>] [--port <port>] [--no-wait] [--timeout <secs>] [--raw]
+```
+
+**Examples**
+
+```sh
+wsync verify --project .
+wsync verify --project . --raw
+wsync verify --project . --no-wait
+```
+
+**Notes**
+
+- Runs the `wait-synced` barrier first so changes still in flight are not reported as drift; `--no-wait` skips it and `--timeout` bounds it.
+- Disk text is read through the sync engine's own VFS path and line-ending normalization; Studio text is `ScriptEditorService:GetEditorSource`, falling back to `Source`. Hashing happens in bounded chunks on the plugin.
+- Problem categories: content mismatch (with both sizes), missing in Studio, missing on disk, daemon behind disk (a file change the watcher never delivered), duplicate same-named siblings in Studio or in the daemon's projection, disk layout hazard errors from the same scanner `wsync doctor` runs (double-init folders, flat+folder pairs, reshape leftovers), and backlog-stuck paths — backlogged files rewritten on disk that never reached Studio. Editor drafts that differ from the committed Source and hazard warnings are informational.
+- Exits 0 only when every problem category is empty. `--raw` prints one JSON report with `clean`, `counts`, and one list per category (each capped, with `truncated` counts).
+- Needs a connected Studio plugin build that implements `verify_sources` and `verify_tree`.
 
 ---
 
@@ -1225,7 +1310,7 @@ Selects one or more Studio instances by path.
 **Usage**
 
 ```sh
-wsync open [--project <path>] [--port <port>] [--raw] <studio-path>...
+wsync open [--project <path>] [--port <port>] [--raw] (<studio-path>... | --path <studio-path>...)
 ```
 
 **Examples**
@@ -1233,12 +1318,14 @@ wsync open [--project <path>] [--port <port>] [--raw] <studio-path>...
 ```sh
 wsync open ReplicatedStorage/Client/UIController
 wsync open Workspace/Baseplate ReplicatedStorage/Client
+wsync open --path Workspace/Baseplate --path ReplicatedStorage/Client
 ```
 
 **Notes**
 
 - This is a shorthand over `wsync select set --paths '[...]'`.
 - With the `OpenInEditor` plugin setting on, selecting a script also opens it in the Studio script editor.
+- Paths are positional, `--path` (repeatable), or both; they merge in order and a path given twice is selected once.
 
 ---
 
@@ -1437,14 +1524,14 @@ Sets one property or applies a batch of property writes in the live Studio sessi
 **Usage**
 
 ```sh
-wsync set [--project <path>] [--port <port>] (--path <studio-path> --prop <property> --value <json> | --batch <file>) [--keep-going] [--waypoint <name>] [--force-parent] [--raw]
+wsync set [--project <path>] [--port <port>] ((<studio-path> | --path <studio-path>) --prop <property> --value <json> | --batch <file>) [--keep-going] [--force-parent] [--raw]
 ```
 
 **Examples**
 
 ```sh
-wsync set --project . --path Workspace/Camera --prop FieldOfView --value 90
-wsync set --project . --batch writes.json --waypoint "refactor camera"
+wsync set Workspace/Camera --project . --prop FieldOfView --value 90
+wsync set --project . --batch writes.json
 wsync set --project . --path Workspace/Box --prop Size --value '{"__type":"Vector3","x":12,"y":8,"z":28}'
 wsync set --project . --path Workspace/Box --prop Color --value '{"__type":"Color3","r":1,"g":0.5,"b":0}'
 wsync set --project . --path Workspace/Box --prop CFrame --value '{"__type":"CFrame","components":[0,5,0]}'
@@ -1453,11 +1540,11 @@ wsync set --project . --path Workspace/Box --prop Material --value '{"__type":"E
 
 **Notes**
 
+- The Studio path is positional or `--path` — every single-instance command takes both forms; passing both is accepted only when they name the same path.
 - Every successful write is appended to `writes.log`.
 - `set Parent` is refused by default; use `wsync mv`, or pass `--force-parent` only when raw parent assignment is intentional.
 - A `--batch` entry setting `Parent` rejects the whole batch before any request is made, with no escape — batches have no `--force-parent`; reparent with `wsync mv` or a single forced `set`.
 - A `Name` write whose value is empty or contains `/` is refused (single writes pre-network, a `--batch` entry rejects the whole file): paths are `/`-separated with no escaping, so such a name could never be addressed by a path-based command again.
-- `--waypoint` brackets the write so one Studio undo can reverse the batch.
 - `--batch` rejects the whole batch before any network call when any entry trips a guardrail; `--keep-going` only relaxes per-entry runtime failures, never the pre-flight guards.
 - Live mutating commands are user-initiated escape hatches. Inspect the exact live target with read-only commands and confirm intent before running one.
 - Offline value schemas and copyable examples for every supported type: `wsync commands types`; narrow with `wsync commands types Vector3` or `wsync commands types Color3`. The live JSON wire format uses the exact `__type` key and lowercase component fields; arrays, constructor strings, and sidecar `{Vector3:[...]}` shapes are not equivalent.
@@ -1473,19 +1560,20 @@ Creates a new live Studio instance under a parent path.
 **Usage**
 
 ```sh
-wsync new [--project <path>] [--port <port>] --path <parent-path> --class <ClassName> [--name <Name>] [--props <json-object>] [--raw]
+wsync new [--project <path>] [--port <port>] (<parent-path> | --path <parent-path>) --class <ClassName> [--name <Name>] [--props <json-object>] [--raw]
 ```
 
 **Examples**
 
 ```sh
 wsync new --project . --path Workspace --class Part --name Box --props '{"Anchored":true}'
-wsync new --project . --path ReplicatedStorage --class RemoteEvent --name DamageEvent
+wsync new ReplicatedStorage --project . --class RemoteEvent --name DamageEvent
 wsync new --project . --path Workspace --class Part --name Box --props '{"Anchored":true,"Size":{"__type":"Vector3","x":12,"y":8,"z":28},"Color":{"__type":"Color3","r":1,"g":0.5,"b":0}}'
 ```
 
 **Notes**
 
+- The parent path is positional or `--path` — every single-instance command takes both forms; passing both is accepted only when they name the same path.
 - `--props` uses the same value codec as `wsync set --value`.
 - `--name` (and a `Name` in `--props`) must not be empty or contain `/`: paths are `/`-separated with no escaping, so such a name could never be addressed by a path-based command. The refusal happens before any request is made, and the plugin refuses the same write again.
 - The created instance is written to `writes.log`.
@@ -1503,12 +1591,13 @@ Destroys a live Studio instance.
 **Usage**
 
 ```sh
-wsync rm [--project <path>] [--port <port>] --path <studio-path> [--raw]
+wsync rm [--project <path>] [--port <port>] (<studio-path> | --path <studio-path>) [--raw]
 ```
 
 **Examples**
 
 ```sh
+wsync rm Workspace/Box --project .
 wsync rm --project . --path Workspace/Box
 ```
 
@@ -1516,6 +1605,7 @@ wsync rm --project . --path Workspace/Box
 
 - Calls `:Destroy()` through the plugin and records the write in `writes.log`.
 - Deletions that reach disk through syncback honor `move_to_bin`; force-overwrite and prune paths back removed trees up to `.wsync-backups/<timestamp>/` first.
+- The Studio path is positional or `--path` — every single-instance command takes both forms; passing both is accepted only when they name the same path.
 
 ---
 
@@ -1551,7 +1641,7 @@ Lists, sets, or removes attributes on a live Studio instance.
 **Usage**
 
 ```sh
-wsync attr <set|rm|ls> [--project <path>] [--port <port>] --path <studio-path> [--name <attribute>] [--value <json>] [--raw]
+wsync attr <set|rm|ls> [--project <path>] [--port <port>] (<studio-path> | --path <studio-path>) [--name <attribute>] [--value <json>] [--raw]
 ```
 
 **Subcommands**
@@ -1565,7 +1655,7 @@ wsync attr <set|rm|ls> [--project <path>] [--port <port>] --path <studio-path> [
 ```sh
 wsync attr set --project . --path Workspace/Box --name Speed --value 12.5
 wsync attr rm --project . --path Workspace/Box --name Speed
-wsync attr ls --project . --path Workspace/Box
+wsync attr ls Workspace/Box --project .
 wsync attr set --project . --path Workspace/Box --name SpawnOffset --value '{"__type":"Vector3","x":0,"y":5,"z":0}'
 ```
 
@@ -1577,6 +1667,7 @@ wsync attr set --project . --path Workspace/Box --name SpawnOffset --value '{"__
 - Offline value schemas and copyable examples for every supported type: `wsync commands types`; narrow with `wsync commands types Vector3` or `wsync commands types Color3`. The live JSON wire format uses the exact `__type` key and lowercase component fields; arrays, constructor strings, and sidecar `{Vector3:[...]}` shapes are not equivalent.
 - Color3 r/g/b use the 0–1 scale, not 0–255. For RGB(255,128,0), use {"__type":"Color3","r":1,"g":0.5019607843137255,"b":0}. Vector3 uses {"__type":"Vector3","x":1,"y":2,"z":3}.
 - Codec support does not imply attribute compatibility: Roblox SetAttribute supports only its attribute datatypes. Instance references, buffers, and output-only markers are not valid attribute values.
+- The Studio path is positional or `--path` — every single-instance command takes both forms; passing both is accepted only when they name the same path.
 
 ---
 
@@ -1587,7 +1678,7 @@ Adds or removes CollectionService tags on a live Studio instance.
 **Usage**
 
 ```sh
-wsync tag <add|rm> [--project <path>] [--port <port>] --path <studio-path> --tag <tag> [--raw]
+wsync tag <add|rm> [--project <path>] [--port <port>] (<studio-path> | --path <studio-path>) --tag <tag> [--raw]
 ```
 
 **Subcommands**
@@ -1598,7 +1689,7 @@ wsync tag <add|rm> [--project <path>] [--port <port>] --path <studio-path> --tag
 **Examples**
 
 ```sh
-wsync tag add --project . --path Workspace/Box --tag Enemy
+wsync tag add Workspace/Box --project . --tag Enemy
 wsync tag rm --project . --path Workspace/Box --tag Enemy
 ```
 
@@ -1606,6 +1697,7 @@ wsync tag rm --project . --path Workspace/Box --tag Enemy
 
 - Successful tag mutations are written to `writes.log`.
 - Tags on projected instances sync back to their `.data.json` sidecar.
+- The Studio path is positional or `--path` — every single-instance command takes both forms; passing both is accepted only when they name the same path.
 
 ---
 
@@ -1616,13 +1708,13 @@ Invokes a method on a live Studio instance and prints the returned value.
 **Usage**
 
 ```sh
-wsync call [--project <path>] [--port <port>] --path <studio-path> --method <MethodName> [--args <json-array>] [--raw]
+wsync call [--project <path>] [--port <port>] (<studio-path> | --path <studio-path>) --method <MethodName> [--args <json-array>] [--raw]
 ```
 
 **Examples**
 
 ```sh
-wsync call --project . --path Workspace/Folder --method FindFirstChild --args '["Box"]'
+wsync call Workspace/Folder --project . --method FindFirstChild --args '["Box"]'
 wsync call --project . --path Workspace/Box --method PivotTo --args '[{"__type":"CFrame","components":[0,5,0]}]'
 ```
 
@@ -1632,6 +1724,7 @@ wsync call --project . --path Workspace/Box --method PivotTo --args '[{"__type":
 - Treat methods with side effects as writes; successful calls are audited.
 - Offline value schemas and copyable examples for every supported type: `wsync commands types`; narrow with `wsync commands types Vector3` or `wsync commands types Color3`. The live JSON wire format uses the exact `__type` key and lowercase component fields; arrays, constructor strings, and sidecar `{Vector3:[...]}` shapes are not equivalent.
 - Content has no JSON input tag: use native `Content.fromUri(...)` in `eval`/`exec` for Content properties, or an available legacy string property. Native Roblox datatype globals are already available there; no extra sandbox permission is needed for Vector3/Color3/CFrame constructors.
+- The Studio path is positional or `--path` — every single-instance command takes both forms; passing both is accepted only when they name the same path.
 
 ---
 
@@ -1671,7 +1764,7 @@ Executes Luau source inside Studio through the plugin sandbox and returns the re
 **Usage**
 
 ```sh
-wsync eval [--project <path>] [--port <port>] (--source <luau> | --source-file <file> | --stdin) [--raw]
+wsync eval [--project <path>] [--port <port>] (--source <luau> | --source-file <file> | --stdin) [--drafts] [--raw]
 ```
 
 **Examples**
@@ -1680,6 +1773,7 @@ wsync eval [--project <path>] [--port <port>] (--source <luau> | --source-file <
 wsync eval --project . --source 'return Vector3.new(1, 2, 3)'
 wsync eval --project . --source-file ./scripts/probe.luau --raw
 wsync eval --project . --stdin --raw
+wsync eval --project . --drafts --source 'return require(game.ReplicatedStorage.Shared.Config)'
 ```
 
 **Notes**
@@ -1688,51 +1782,9 @@ wsync eval --project . --stdin --raw
 - Choose exactly one source input. `--source-file -` also reads stdin. Source file paths are relative to the shell working directory. Leading comments (including --!strict) are accepted by --source; file/stdin avoids shell quoting and argument length limits.
 - `eval` is request/response against one connected Studio session and carries the standard 5 second remote-op timeout. `wsync exec` is the fire-and-forget broadcast form and acknowledges queuing only.
 - Use within the user-authorized task scope. A timeout or execution/encoding failure can follow earlier mutations; inspect affected state before retrying, and use the operation receipt when provided.
-
----
-
-### `wsync save`
-
-Asks Studio to save the current place.
-
-**Usage**
-
-```sh
-wsync save [--project <path>] [--port <port>] [--raw]
-```
-
-**Examples**
-
-```sh
-wsync save --project .
-```
-
-**Notes**
-
-- The CLI returns after Studio accepts the save request; the actual save is asynchronous.
-
----
-
-### `wsync waypoint`
-
-Creates a named Studio change-history waypoint.
-
-**Usage**
-
-```sh
-wsync waypoint [--project <path>] [--port <port>] --name <label> [--raw]
-```
-
-**Examples**
-
-```sh
-wsync waypoint --project . --name "before refactor"
-```
-
-**Notes**
-
-- Use waypoints before and after multi-step edits so Studio undo has a clear boundary.
-- Every applied sync batch already creates its own named waypoint, so a manual waypoint marks agent-driven work specifically.
+- Drafts caveat: WSync writes script text through `ScriptEditorService`, so it lands as editor/draft text, while an edit-mode `require` runs the committed `.Source`. A module WSync just wrote can therefore require as empty ("Module code did not return exactly one value") or run its previous code. Use `--drafts` to test what the editor shows.
+- `--drafts` gives the chunk a `require` that compiles every ModuleScript it reaches — directly or through other modules, including modules with no draft of their own — from its editor text (its `.Source` when there is no draft) and runs it with the real `script`, so `script.Parent` requires resolve. Nothing is committed and no instance is created. Each module runs at most once per eval, must return exactly one value, and a recursive require fails, as with `require`. The response adds `drafts: {modules, fromEditor?}` — the module count and the paths loaded from editor text that differed from `.Source`.
+- `--drafts` limits: only `require(<ModuleScript>)` sees drafts — string requires and asset ids use Studio's own `require` (committed sources), as does a module whose source cannot be read; each eval builds a fresh module graph, so module state is not shared with modules Studio already required or kept between evals; modules run as `loadstring` chunks (`--!native` is ignored, errors name the module by its full name). A plugin that predates `--drafts` ignores it, and the CLI warns.
 
 ---
 
@@ -1754,7 +1806,7 @@ wsync undo --project .
 
 **Notes**
 
-- Pairs naturally with `--waypoint` on `wsync set` for reversible batches.
+- Drives Studio's own undo stack — the same history as Ctrl+Z in Studio — so it can reverse the user's own edits, not only WSync's. Say what you are about to undo before you undo it.
 - A completed bulk disk-to-Studio pull is one recording, so one undo reverses the whole pull.
 
 ---
@@ -1993,7 +2045,7 @@ wsync config port --default
 - `--default` restores the named setting to its built-in value, or every setting when no name is given.
 - `--export <path>` writes the fully resolved configuration (defaults merged with global and workspace overrides) to the given file instead of reading or writing a single key.
 - Unknown setting names and values that fail the setting's type are rejected before anything is written.
-- WSync-specific settings beyond the inherited set are `syncback_model_json` (false), `conflict_engine` (true), `compat_argon` (false), `port_scan_max` (7990), and `auto_open_app_modal` (true). `port` defaults to 7978 and `share_stats` defaults to false — telemetry is strictly opt-in.
+- WSync-specific settings beyond the inherited set are `syncback_model_json` (false), `conflict_engine` (true), `compat_argon` (false), `port_scan_max` (7990), `auto_open_app_modal` (true), and `backlog_ttl_hours` (24 — hours a backlog entry is kept; pinned entries never expire). `port` defaults to 7978 and `share_stats` defaults to false — telemetry is strictly opt-in.
 
 ---
 

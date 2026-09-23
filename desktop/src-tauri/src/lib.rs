@@ -64,7 +64,11 @@ pub(crate) fn embedded_updater_public_key() -> Option<&'static str> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let mut builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
+    // The notification plugin is driven from the host alone (`daemon.rs`, when
+    // a daemon dies or stops answering); the webview is granted none of it.
+    let mut builder = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init());
 
     if let Some(public_key) = embedded_updater_public_key() {
         builder = builder.plugin(

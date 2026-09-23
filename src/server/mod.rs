@@ -26,6 +26,7 @@ use crate::{
 pub mod audit;
 pub mod backlog;
 pub mod bulk;
+pub mod crash_guard;
 mod details;
 pub mod divergence;
 mod exec;
@@ -43,7 +44,11 @@ mod snapshot;
 pub mod snapshot_json;
 mod stop;
 mod subscribe;
+pub mod sync_base;
+pub mod synced;
+pub mod three_way;
 mod unsubscribe;
+pub mod verify;
 mod write;
 pub mod ws;
 
@@ -141,6 +146,8 @@ pub struct AppState {
 	lifecycle: Arc<lifecycle::Lifecycle>,
 	divergence: Arc<divergence::Divergence>,
 	backlog: Arc<backlog::BacklogStore>,
+	sync_base: Arc<sync_base::SyncBase>,
+	crash_guard: Arc<crash_guard::CrashGuard>,
 	audit: Arc<audit::WritesLog>,
 }
 
@@ -243,6 +250,12 @@ impl Server {
 			divergence: Arc::new(divergence::Divergence::new()),
 			// A pending disk review (Design §7.0) persists across restarts
 			backlog: Arc::new(backlog::BacklogStore::load(&workspace_dir)),
+			// What both sides last agreed on, so a connect after a restart can
+			// tell which side moved (the three-way connect)
+			sync_base: Arc::new(sync_base::SyncBase::load(&workspace_dir)),
+			// A daemon that died applying a connect leaves a marker behind;
+			// finding one starts this boot in safe mode
+			crash_guard: Arc::new(crash_guard::CrashGuard::load(&workspace_dir, &self.identity.boot_id)),
 			audit: Arc::new(audit::WritesLog::new(&self.resolve_state_dir())),
 		};
 
@@ -267,6 +280,9 @@ impl Server {
 		}
 
 		lifecycle::spawn_watchdog(state.clone());
+		sync_base::spawn_writer(state.clone());
+
+		let crash_guard = state.crash_guard.clone();
 
 		// The msgpack (Argon-protocol) routes below are protocol v1's
 		// fallback transport and are served unconditionally; `compat_argon`
@@ -327,6 +343,15 @@ impl Server {
 				"/backlog/drop",
 				post(backlog::drop_entry).fallback(Self::default_redirect),
 			)
+			.route(
+				"/safe-mode/resume",
+				post(crash_guard::resume).fallback(Self::default_redirect),
+			)
+			.route("/backlog/pin", post(backlog::pin).fallback(Self::default_redirect))
+			.route("/backlog/diff", get(backlog::diff).fallback(Self::default_redirect))
+			.route("/sync/pending", get(synced::pending).fallback(Self::default_redirect))
+			.route("/sync/wait", post(synced::wait).fallback(Self::default_redirect))
+			.route("/verify", post(verify::main).fallback(Self::default_redirect))
 			.route(
 				"/manager-heartbeat",
 				post(lifecycle::heartbeat).fallback(Self::default_redirect),
@@ -407,6 +432,9 @@ impl Server {
 			result = axum::serve(listener, app).with_graceful_shutdown(graceful) => result?,
 			_ = force_exit => debug!("Forced server loop exit after shutdown drain timeout"),
 		}
+
+		// A daemon that got here stopped on purpose, whatever it was doing
+		crash_guard.on_shutdown();
 
 		Ok(())
 	}

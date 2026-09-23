@@ -3,6 +3,7 @@ use std::{
 	fs,
 	io::{Error, Result},
 	path::{Path, PathBuf},
+	time::Instant,
 };
 
 use super::{debouncer::VfsDebouncer, VfsBackend, VfsEvent};
@@ -49,19 +50,27 @@ impl VfsBackend for StdBackend {
 		Ok(paths)
 	}
 
+	// Every write through the VFS is the processor's own: noted so the event
+	// it causes is dropped as an echo instead of being synced back
+
 	fn write(&mut self, path: &Path, contents: &[u8]) -> Result<()> {
+		self.debouncer.note_self_write(path);
 		fs::write(path, contents)
 	}
 
 	fn create_dir(&mut self, path: &Path) -> Result<()> {
+		self.debouncer.note_self_write(path);
 		fs::create_dir_all(path)
 	}
 
 	fn rename(&mut self, from: &Path, to: &Path) -> Result<()> {
+		self.debouncer.note_self_write(from);
+		self.debouncer.note_self_write(to);
 		fs::rename(from, to)
 	}
 
 	fn remove(&mut self, path: &Path) -> Result<()> {
+		self.debouncer.note_self_write(path);
 		self.unwatch(path)?;
 
 		if Config::new().move_to_bin {
@@ -128,5 +137,17 @@ impl VfsBackend for StdBackend {
 
 	fn receiver(&self) -> Receiver<VfsEvent> {
 		self.debouncer.receiver()
+	}
+
+	fn last_flush(&self) -> Option<Instant> {
+		self.debouncer.last_flush()
+	}
+
+	fn suppressed_events(&self) -> u64 {
+		self.debouncer.suppressed()
+	}
+
+	fn held_events(&self) -> usize {
+		self.debouncer.held()
 	}
 }

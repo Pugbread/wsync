@@ -226,3 +226,168 @@ fn portless_daemon_start_scans_the_port_range() {
 		cli_stderr(&output)
 	);
 }
+
+/// Incident report: a daemon crashed, ~30 minutes of edits landed on disk
+/// with nothing saying they were not syncing, and every command except
+/// `status` stayed quiet. Every project-addressed command now prints a
+/// banner — on stderr only, so `--raw` stdout stays parseable
+#[test]
+fn project_commands_warn_on_stderr_when_no_daemon_serves_the_project() {
+	let sandbox = CliSandbox::new();
+	let project = place_project(sandbox.work.path(), "fixture-down", 5550101);
+	let project_arg = project.to_string_lossy().into_owned();
+	let sourcemap = sandbox.work.path().join("sourcemap.json");
+
+	// An offline-capable command still says it
+	let output = sandbox.run(&[
+		"sourcemap",
+		"--project",
+		&project_arg,
+		"--output",
+		&sourcemap.to_string_lossy(),
+	]);
+	let stderr = cli_stderr(&output);
+
+	assert!(output.status.success(), "sourcemap failed: {stderr}");
+	assert!(
+		stderr.contains("No WSync daemon is running for this project") && stderr.contains("NOT syncing"),
+		"the banner must name the problem; stderr:\n{stderr}"
+	);
+	assert!(
+		stderr.contains(&format!("wsync daemon start --project {project_arg}")),
+		"the banner must say how to start it; stderr:\n{stderr}"
+	);
+	assert!(
+		!common::cli_stdout(&output).contains("WSync daemon"),
+		"the banner must never reach stdout"
+	);
+
+	// A live command against a silent port: the banner, then the command's
+	// own failure, and nothing but JSON-or-nothing on stdout
+	let silent = std::net::TcpListener::bind("127.0.0.1:0")
+		.unwrap()
+		.local_addr()
+		.unwrap()
+		.port();
+	let output = sandbox.run(&[
+		"get",
+		"Workspace",
+		"--project",
+		&project_arg,
+		"--port",
+		&silent.to_string(),
+		"--raw",
+	]);
+
+	assert!(!output.status.success());
+	assert!(cli_stderr(&output).contains("NOT syncing"), "{}", cli_stderr(&output));
+	assert!(!common::cli_stdout(&output).contains("NOT syncing"));
+
+	// The project resolved from the working directory counts too
+	let output = std::process::Command::new(env!("CARGO_BIN_EXE_wsync"))
+		.args(["sourcemap", "--output", &sourcemap.to_string_lossy()])
+		.current_dir(&project)
+		.env("HOME", sandbox.home.path())
+		.env("USERPROFILE", sandbox.home.path())
+		.env("WSYNC_STATE_DIR", sandbox.state.path())
+		.env("NO_COLOR", "1")
+		.output()
+		.unwrap();
+
+	assert!(cli_stderr(&output).contains("NOT syncing"), "{}", cli_stderr(&output));
+
+	// Lifecycle commands report the daemon themselves; the opt-out is honored
+	let status = sandbox.run(&["daemon", "status", "--project", &project_arg]);
+	assert!(!cli_stderr(&status).contains("NOT syncing"), "{}", cli_stderr(&status));
+
+	let opted_out = sandbox.run_with_envs(
+		&[
+			"sourcemap",
+			"--project",
+			&project_arg,
+			"--output",
+			&sourcemap.to_string_lossy(),
+		],
+		&[("WSYNC_NO_DAEMON_BANNER", "1")],
+	);
+	assert!(
+		!cli_stderr(&opted_out).contains("NOT syncing"),
+		"{}",
+		cli_stderr(&opted_out)
+	);
+}
+
+/// A serving daemon keeps every command quiet; once it dies without cleaning
+/// up (SIGKILL, a stack-overflow abort), the banner says so — and when a
+/// manager journalled how it died, the banner carries that evidence
+#[test]
+fn the_banner_tracks_the_daemon_and_reports_how_it_died() {
+	let sandbox = CliSandbox::new();
+
+	// A private port range, clear of real daemons and the scan test's range
+	fs::write(
+		sandbox.home.path().join(".wsync").join("config.toml"),
+		"check_updates = false\ninstall_plugin = false\nport = 18178\nport_scan_max = 18190\n",
+	)
+	.unwrap();
+
+	let project = place_project(sandbox.work.path(), "fixture-banner", 5550102);
+	let project_arg = project.to_string_lossy().into_owned();
+	let sourcemap = sandbox.work.path().join("sourcemap.json");
+	let sourcemap_arg = sourcemap.to_string_lossy().into_owned();
+	let run_sourcemap = || {
+		let output = sandbox.run(&["sourcemap", "--project", &project_arg, "--output", &sourcemap_arg]);
+
+		assert!(output.status.success(), "sourcemap failed: {}", cli_stderr(&output));
+		cli_stderr(&output)
+	};
+
+	let (daemon, report) = start_daemon_process(&sandbox, &project);
+	let port = report["port"].as_u64().unwrap() as u16;
+
+	let stderr = run_sourcemap();
+	assert!(
+		!stderr.contains("NOT syncing"),
+		"a serving daemon must keep commands quiet; stderr:\n{stderr}"
+	);
+
+	// SIGKILL: no stop note, the runtime record left behind
+	drop(daemon);
+
+	let deadline = std::time::Instant::now() + Duration::from_secs(10);
+	while TcpStream::connect(("127.0.0.1", port)).is_ok() && std::time::Instant::now() < deadline {
+		thread::sleep(Duration::from_millis(100));
+	}
+
+	let stderr = run_sourcemap();
+	assert!(
+		stderr.contains("DOWN") && stderr.contains("crashed — exited without a clean shutdown"),
+		"a daemon that died silently must read as crashed; stderr:\n{stderr}"
+	);
+	assert!(stderr.contains("wsync daemon logs --project"), "{stderr}");
+
+	// What the desktop app appends when its sidecar dies (the contract in
+	// `wsync::daemon::MANAGER_EXIT_NOTE`)
+	let canonical = wsync::daemon::canonical_project(&project.join("default.project.json")).unwrap();
+	let log = wsync::daemon::runtime_paths(sandbox.state.path(), &canonical).log;
+	let stamp = chrono::Local::now().format(wsync::daemon::LOG_STAMP_FORMAT);
+	let mut journal = fs::read_to_string(&log).unwrap();
+
+	journal.push_str(&format!(
+		"[{stamp}] Manager: daemon exited unexpectedly (signal 6 (SIGABRT)); last stderr lines follow\n\
+		 [{stamp}] Manager: stderr | thread 'main' has overflowed its stack\n\
+		 [{stamp}] Manager: stderr | fatal runtime error: stack overflow\n"
+	));
+	fs::write(&log, journal).unwrap();
+
+	let stderr = run_sourcemap();
+	assert!(
+		stderr.contains("crashed — signal 6 (SIGABRT)"),
+		"the manager's exit status must reach the banner; stderr:\n{stderr}"
+	);
+	assert!(stderr.contains("thread 'main' has overflowed its stack"), "{stderr}");
+	assert!(
+		stderr.contains("just now"),
+		"the banner must say when; stderr:\n{stderr}"
+	);
+}

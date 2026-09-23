@@ -21,6 +21,7 @@ import { mountBacklog, openBacklogModal } from "./views/backlog.js";
 import { mountDocs } from "./views/docs.js";
 import { mountSettings } from "./views/settings.js";
 import { createLastEditedStore } from "./views/last-edited.js";
+import { el, icon } from "./views/dom.js";
 
 // ------------------------------------------------------------------ DOM ---
 
@@ -35,6 +36,7 @@ const $conflictsBadge = document.getElementById("conflicts-badge");
 const $projectsCount = document.getElementById("projects-count");
 const $updateButton = document.getElementById("update-button");
 const $toasts = document.getElementById("toasts");
+const $daemonAlerts = document.getElementById("daemon-alerts");
 const $tabs = [...document.querySelectorAll(".rail-item")];
 
 // ---------------------------------------------------------------- routes ---
@@ -72,6 +74,13 @@ const app = {
   unmountCurrent: null,
   /** Not persisted: why a serve attempt failed, per project id. */
   daemonFailures: new Map(),
+  /**
+   * Not persisted here — rebuilt from `daemonSessions` at boot: projects whose
+   * daemon died or stopped answering, `{reason, message, at, busy}` per id.
+   * Drives the shell's banner, which has to outlive every view switch and only
+   * goes away when the daemon is back or the user lets the project go.
+   */
+  daemonDown: new Map(),
   /** Not persisted: last known backlog count, or null when unchecked. */
   conflictCount: null,
   /**
@@ -310,14 +319,16 @@ function updateProject(projectId, patch) {
 
 function removeProject(projectId) {
   // Forgetting a project must not leave its daemon running: the app would have
-  // no way left to reach or stop it.
-  if (isProjectServed(projectId) && IS_TAURI) {
+  // no way left to reach or stop it. A daemon that stopped answering may still
+  // be alive, hung, and the host still holds it.
+  if ((isProjectServed(projectId) || app.daemonDown.has(projectId)) && IS_TAURI) {
     void host.daemonStop(projectId).catch(() => {});
   }
   const next = projects().filter((project) => project.id !== projectId);
   const sessions = { ...app.state.daemonSessions };
   delete sessions[projectId];
   app.daemonFailures.delete(projectId);
+  clearDaemonDown(projectId);
   app.conflictsUnsupported.delete(projectId);
   app.plugin.delete(projectId);
   // A forgotten project's edit history is not something to keep paying for.
@@ -428,14 +439,217 @@ function recordFailure(projectId, error) {
   };
   app.daemonFailures.set(projectId, failure);
   // Design 8.3 keeps the last outcome in the session record, so a failed serve
-  // is still visible after a restart rather than quietly forgotten.
+  // is still visible after a restart rather than quietly forgotten. A restart
+  // that failed after a crash carries the crash along: edits are still not
+  // syncing, and the next launch should still say so.
   writeSession(projectId, {
     projectId,
     ok: false,
     error: { code: failure.code, message: failure.message },
     at: failure.at,
+    ...downRecord(projectId),
   });
   return hostError;
+}
+
+// ------------------------------------------------------ unexpected downs ----
+//
+// The host reports a daemon that exited on its own (`exited`) or stopped
+// answering (`heartbeat-lost`) — and raises the OS notification for it itself.
+// This half keeps the in-app banner: persistent, in the shell rather than in a
+// view, and cleared only by the daemon coming back or the user letting go.
+
+/** The `daemon:down` reasons that mean edits have stopped reaching Studio. */
+const DOWN_REASONS = new Set(["exited", "heartbeat-lost"]);
+
+function getDaemonDown(projectId) {
+  return app.daemonDown.get(projectId) ?? null;
+}
+
+/** The alert as the session record carries it (`{}` when there is none). */
+function downRecord(projectId) {
+  const down = app.daemonDown.get(projectId);
+  return down ? { down: { reason: down.reason, message: down.message, at: down.at } } : {};
+}
+
+function markDaemonDown(projectId, { reason, message, at }) {
+  if (!getProject(projectId) || !DOWN_REASONS.has(reason)) return;
+  app.daemonDown.set(projectId, {
+    reason,
+    message: typeof message === "string" ? message : "",
+    at: at ?? new Date().toISOString(),
+    busy: null,
+  });
+  renderDaemonAlerts();
+}
+
+function clearDaemonDown(projectId) {
+  if (!app.daemonDown.delete(projectId)) return;
+  renderDaemonAlerts();
+}
+
+/**
+ * Rebuild the banner from `state.json` at boot. The host's own event is long
+ * gone by then; what survives is the session record the down handler wrote —
+ * `ok: false` with the reason as its error code, or, after a restart that also
+ * failed, the crash kept alongside under `down`.
+ */
+function restoreDaemonDowns() {
+  for (const [projectId, session] of Object.entries(app.state.daemonSessions ?? {})) {
+    if (!session || session.ok !== false) continue;
+    const down =
+      session.down ??
+      (DOWN_REASONS.has(session.error?.code)
+        ? { reason: session.error.code, message: session.error.message, at: session.at }
+        : null);
+    if (!down) continue;
+    markDaemonDown(projectId, down);
+    // The project's error card reads failures, which are not persisted.
+    if (!app.daemonFailures.has(projectId) && session.error) {
+      app.daemonFailures.set(projectId, {
+        code: session.error.code ?? down.reason,
+        message: session.error.message ?? down.message ?? "",
+        pending: false,
+        at: session.at ?? down.at,
+      });
+    }
+  }
+}
+
+/** The explicit restart: the same start path the serve toggle takes. */
+async function restartDaemon(projectId) {
+  const down = app.daemonDown.get(projectId);
+  if (!down || down.busy) return;
+  down.busy = "restart";
+  renderDaemonAlerts();
+  // Success clears the alert inside `serveProject`. A failed restart keeps it —
+  // edits are still not syncing — and the error card says why it failed.
+  if (!(await serveProject(projectId))) {
+    const failure = app.daemonFailures.get(projectId);
+    toast("Restart failed", { kind: "err", body: String(failure?.message ?? "").split("\n")[0] });
+  }
+  const after = app.daemonDown.get(projectId);
+  if (after) {
+    after.busy = null;
+    renderDaemonAlerts();
+  }
+}
+
+/**
+ * The user lets the project go instead of restarting it. The host may still
+ * hold the dead — or hung — child; releasing it is the deliberate stop this
+ * alert was waiting for. After an app restart there is nothing left to
+ * release, and a refusal then is fine.
+ */
+async function dismissDaemonDown(projectId) {
+  const down = app.daemonDown.get(projectId);
+  if (!down || down.busy) return;
+  down.busy = "dismiss";
+  renderDaemonAlerts();
+  if (IS_TAURI) await host.daemonStop(projectId).catch(() => {});
+  app.daemonFailures.delete(projectId);
+  clearDaemonDown(projectId);
+  dropSession(projectId);
+  setStatus(`${getProject(projectId)?.name ?? projectId} is no longer served.`, "");
+  emit("daemon", { projectId, ok: false, outcome: "dismissed" });
+  refreshLink();
+}
+
+/** `14:32` today, a date and time otherwise — the banner is not re-rendered to keep "3m ago" fresh. */
+function formatWhen(iso) {
+  const when = new Date(iso);
+  if (Number.isNaN(when.getTime())) return "";
+  const today = when.toDateString() === new Date().toDateString();
+  return today
+    ? when.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    : when.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+}
+
+/**
+ * The last stderr line worth quoting, as the host picks it for the OS
+ * notification: the last non-empty line that is not a `note:` hint.
+ */
+function tellingLine(lines) {
+  return [...lines].reverse().map((line) => line.trim()).find((line) => line && !line.startsWith("note:")) ?? "";
+}
+
+function renderDaemonAlerts() {
+  const rows = projects()
+    .filter((project) => app.daemonDown.has(project.id))
+    .map((project) => daemonAlert(project, app.daemonDown.get(project.id)));
+  $daemonAlerts.replaceChildren(...rows);
+  $daemonAlerts.hidden = rows.length === 0;
+  refreshShellChrome();
+}
+
+function daemonAlert(project, down) {
+  const [head, ...rest] = String(down.message ?? "").split("\n");
+  // The host's heads are sentences, but its heartbeat error ends wherever the
+  // transport's message did.
+  const summary = !head.trim() ? down.reason : /[.!?]$/.test(head.trim()) ? head.trim() : `${head.trim()}.`;
+  const clue = tellingLine(rest);
+  const heading =
+    down.reason === "heartbeat-lost" ? "daemon stopped responding." : "daemon stopped unexpectedly.";
+  const when = formatWhen(down.at);
+
+  const details = el("details", { class: "diagnostic" });
+  details.append(
+    el("summary", { text: "Last stderr lines" }),
+    el("pre", { class: "diagnostic-body", text: `${down.reason}: ${down.message}` }),
+  );
+
+  return el(
+    "div",
+    { class: "notice notice-danger daemon-alert", role: "alert", data: { projectId: project.id } },
+    icon("alert", 14),
+    el(
+      "div",
+      { class: "notice-body" },
+      el(
+        "div",
+        {},
+        el("strong", { text: `${project.name}: ${heading} ` }),
+        summary,
+        " Edits on disk are not syncing to Studio.",
+      ),
+      clue ? el("div", { class: "daemon-alert-clue", text: clue, title: clue }) : null,
+      rest.length ? details : null,
+      el(
+        "div",
+        { class: "notice-meta" },
+        when ? `Since ${when}. ` : "",
+        "The full record: ",
+        el("code", { text: "wsync daemon logs" }),
+        " in the project folder.",
+      ),
+    ),
+    el(
+      "div",
+      { class: "daemon-alert-actions" },
+      el(
+        "button",
+        {
+          class: "btn btn-sm btn-primary",
+          type: "button",
+          disabled: Boolean(down.busy),
+          on: { click: () => void restartDaemon(project.id) },
+        },
+        icon("refresh", 13),
+        down.busy === "restart" ? "Restarting…" : "Restart daemon",
+      ),
+      el(
+        "button",
+        {
+          class: "btn btn-sm btn-quiet",
+          type: "button",
+          disabled: Boolean(down.busy),
+          title: "Stop serving this project and hide this alert",
+          on: { click: () => void dismissDaemonDown(project.id) },
+        },
+        down.busy === "dismiss" ? "Stopping…" : "Dismiss",
+      ),
+    ),
+  );
 }
 
 /**
@@ -471,6 +685,9 @@ async function serveProject(projectId) {
     const session = await host.daemonStart(projectId, project.path, project.settings?.port ?? null);
     app.daemonFailures.delete(projectId);
     app.conflictsUnsupported.delete(projectId);
+    // Serving again is the daemon coming back, even when the host hands back a
+    // session it was still holding and so emits no `daemon:up`.
+    clearDaemonDown(projectId);
     setState({
       servedProjectIds: [...new Set([...servedProjectIds(), projectId])],
       daemonSessions: { ...app.state.daemonSessions, [projectId]: session },
@@ -505,6 +722,8 @@ async function serveProject(projectId) {
 async function stopProject(projectId) {
   const project = getProject(projectId);
   if (!project) return true;
+  // A deliberate stop is the other way an unexpected-down alert ends.
+  clearDaemonDown(projectId);
   try {
     const outcome = await host.daemonStop(projectId);
     app.daemonFailures.delete(projectId);
@@ -754,6 +973,11 @@ async function daemonPost(projectId, route, body) {
  * the list is cheap and changes nothing, so it rides the same cadence the
  * conflict poll used to.
  */
+/** Backlog badge refresh cadence (the declarations went missing with the
+ *  conflict poll they came from, which threw at startup) */
+const CONFLICT_POLL_MS = 20_000;
+let conflictTimer = null;
+
 async function pollBacklog() {
   await refreshBacklog();
 
@@ -852,6 +1076,12 @@ function refreshShellChrome() {
   } else {
     label = "no projects";
   }
+  // A daemon that died is not "idle": whatever else is serving, the dot says so.
+  const down = app.daemonDown.size;
+  if (down > 0) {
+    kind = "err";
+    label += ` · ${down} stopped unexpectedly`;
+  }
   $daemonDot.className = `dot dot-${kind}`;
   $daemonDot.title = `Daemon: ${label}`;
   $statusRight.textContent = `daemon: ${label}`;
@@ -934,6 +1164,8 @@ function buildApi() {
     getDaemonBase,
     getDaemonSession,
     getDaemonFailure,
+    getDaemonDown,
+    restartDaemon,
     daemonFetch,
 
     // the live WS link (ws.js)
@@ -1063,6 +1295,9 @@ async function boot() {
   // Design 8.5: no compiled-in key => no update affordance at all.
   $updateButton.hidden = !app.info?.updaterConfigured;
 
+  // Before the first view mounts, so a crash recorded in an earlier run is on
+  // the project card from the first paint rather than after a re-render.
+  restoreDaemonDowns();
   refreshShellChrome();
   conflictBadge.invalidate();
   navigate(app.state.lastView ?? DEFAULT_ROUTE);
@@ -1145,6 +1380,9 @@ function installHostEventListeners() {
   onHostEvent("daemon:up", (session) => {
     if (!session?.projectId) return;
     app.daemonFailures.delete(session.projectId);
+    // Includes a daemon that answers heartbeats again after being reported
+    // lost: the host sends `daemon:up` for that too.
+    clearDaemonDown(session.projectId);
     setState({
       servedProjectIds: [...new Set([...servedProjectIds(), session.projectId])],
       daemonSessions: { ...app.state.daemonSessions, [session.projectId]: session },
@@ -1161,22 +1399,29 @@ function installHostEventListeners() {
     // store and said so. Everything else is news.
     if (event.reason !== "stopped") {
       const project = getProject(projectId);
+      const reason = event.reason ?? "exited";
+      const at = new Date().toISOString();
       app.daemonFailures.set(projectId, {
-        code: event.reason ?? "exited",
+        code: reason,
         message: event.detail ?? "The daemon is no longer running.",
         pending: false,
-        at: new Date().toISOString(),
+        at,
       });
+      // The banner replaces the old toast: a toast that fades in five seconds
+      // is exactly how "heartbeat-lost" used to end up only in `state.json`.
+      markDaemonDown(projectId, { reason, message: event.detail ?? "", at });
       writeSession(projectId, {
         projectId,
         ok: false,
-        error: { code: event.reason ?? "exited", message: event.detail ?? "" },
-        at: new Date().toISOString(),
+        error: { code: reason, message: event.detail ?? "" },
+        at,
       });
       setState({ servedProjectIds: servedProjectIds().filter((id) => id !== projectId) });
       setStatus(`${project?.name ?? projectId} stopped serving.`, "err");
-      toast("Daemon stopped", { kind: "err", body: event.detail ?? event.reason ?? "" });
-      emit("daemon", { projectId, ok: false, reason: event.reason });
+      if (!DOWN_REASONS.has(reason)) {
+        toast("Daemon stopped", { kind: "err", body: event.detail ?? reason });
+      }
+      emit("daemon", { projectId, ok: false, reason });
     }
     refreshLink();
     void pollBacklog();

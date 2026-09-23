@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use std::{fs, path::PathBuf};
 
 use crate::{
-	cli::client::{print_json, Client, Target, Targeting},
+	cli::client::{path_arg, print_json, Client, Target, Targeting},
 	config::Config,
 	core::{meta::SourceEntry, Core},
 	ext::PathExt,
@@ -34,24 +34,22 @@ use crate::{
 	              diagnostic only: while an editor draft is open for that script the live Source is unreliable, so a \
 	              mismatch against disk is not by itself proof of divergence. To verify an edit, use the narrowest \
 	              `wsync lint --path` plus a local file read.\n\n\
+	              WSync writes editor/draft text, and an edit-mode `require` runs the committed `.Source`, which can \
+	              lag behind it; `wsync eval --drafts` runs the editor text.\n\n\
 	              --disk resolves the target through the sync middleware and needs no daemon."
 )]
+#[command(group(clap::ArgGroup::new("studio_path").required(true).multiple(true).args(["path", "positional_path"])))]
 pub struct Source {
 	#[command(flatten)]
 	targeting: Targeting,
 
 	/// Studio path, `/`-separated
-	#[arg(
-		long,
-		value_name = "STUDIO-PATH",
-		required_unless_present = "positional_path",
-		conflicts_with = "positional_path"
-	)]
-	path: Option<String>,
-
-	/// Studio path (positional alternative to --path)
 	#[arg(value_name = "STUDIO-PATH")]
 	positional_path: Option<String>,
+
+	/// Studio path (the named form of the positional path)
+	#[arg(long, value_name = "STUDIO-PATH")]
+	path: Option<String>,
 
 	/// Save source only after a successful read, replacing the file atomically
 	#[arg(short, long, value_name = "FILE")]
@@ -68,11 +66,8 @@ pub struct Source {
 
 impl Source {
 	pub fn main(self) -> Result<()> {
-		let path = self
-			.path
-			.as_deref()
-			.or(self.positional_path.as_deref())
-			.context("A Studio path is required")?;
+		let path = path_arg(self.path.clone(), self.positional_path.clone())?.context("A Studio path is required")?;
+		let path = path.as_str();
 		if self.disk {
 			return self.read_disk(path);
 		}

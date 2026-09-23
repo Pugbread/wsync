@@ -2,14 +2,24 @@
   "name": "backlog",
   "title": "wsync backlog",
   "category": "Live inspection",
-  "description": "Reviews, restores, or drops the disk content that lost to Studio. WSync is Studio-first and never stops to ask: a connect applies Studio over the project and a mid-session clash resolves the same way, so the disk bytes that lost are moved to the backlog instead of being dropped or waiting behind a prompt.",
+  "description": "Reviews, compares, restores, pins, or drops the disk content that lost to Studio. A connect keeps whichever side changed since the last sync, so disk work done while the daemon was down reaches Studio; only when both sides changed does Studio win, and the disk bytes that lost move to the backlog instead of being dropped or waiting behind a prompt.",
   "subcommands": [
     "list",
+    "diff",
     "restore",
+    "pin",
+    "unpin",
     "drop"
   ],
   "subcommandMetadata": {
     "list": {
+      "safety": "read-only",
+      "requires": [
+        "project",
+        "daemon"
+      ]
+    },
+    "diff": {
       "safety": "read-only",
       "requires": [
         "project",
@@ -24,6 +34,20 @@
         "studio-plugin"
       ]
     },
+    "pin": {
+      "safety": "mutates-disk",
+      "requires": [
+        "project",
+        "daemon"
+      ]
+    },
+    "unpin": {
+      "safety": "mutates-disk",
+      "requires": [
+        "project",
+        "daemon"
+      ]
+    },
     "drop": {
       "safety": "mutates-disk",
       "requires": [
@@ -32,19 +56,22 @@
       ]
     }
   },
-  "usage": "wsync backlog [list|restore <id>|drop <id>|drop --all] [--project <path>] [--port <port>] [--raw]",
+  "usage": "wsync backlog [list|diff <id>|restore <id>|pin <id>|unpin <id>|drop <id>|drop --all] [--project <path>] [--port <port>] [--raw]",
   "examples": [
     "wsync backlog --project . --raw",
+    "wsync backlog diff 5f1c1f6e-2f0e-4a1a-9a5b-7c1d2e3f4a5b --project .",
     "wsync backlog restore 5f1c1f6e-2f0e-4a1a-9a5b-7c1d2e3f4a5b --project .",
+    "wsync backlog pin 5f1c1f6e-2f0e-4a1a-9a5b-7c1d2e3f4a5b --project .",
     "wsync backlog drop 5f1c1f6e-2f0e-4a1a-9a5b-7c1d2e3f4a5b --project .",
     "wsync backlog drop --all --project ."
   ],
   "notes": [
-    "Sync is Studio-first with no questions asked. A connect applies Studio over the project, and a change that clashes with Studio mid-session resolves toward Studio the moment it is detected. Neither stops to ask, because being interrupted by a decision you did not plan to make is worse than the loss it guards against.",
-    "The guard is this backlog. Whenever disk content would be overwritten or dropped, its bytes move to `.wsync-backups/backlog/` first, recorded with the path they came from and whether they lost to the initial sync or to a later conflict.",
-    "`restore <id>` writes an entry back to its project path and pushes it to Studio, which is the old Keep Disk answer, deferred until you actually want it. It needs a connected Studio plugin: a restore that never reaches Studio would be sent straight back to the backlog by the next connect.",
-    "Entries expire a day after capture and are swept on every read, so an expiry never depends on the app being open. The backlog is a safety net for the edit you did not notice losing, not a version history.",
+    "A connect never asks. It compares every difference with the last state both sides agreed on (the sync base in `.wsync-backups/sync-base.json`): a side that did not change yields to the side that did, so edits, new files and deletions made on disk while the daemon was down are pushed to Studio, and Studio-side changes are written to disk. Only when both sides changed the same script — or there is no base yet, or it belongs to another place — does Studio win, and a mid-session clash resolves the same way.",
+    "The guard for those cases is this backlog. Whenever disk content would be overwritten or dropped, its bytes move to `.wsync-backups/backlog/` first, recorded with the path they came from and whether they lost to a connect or to a later conflict. A file Studio deleted since the last sync also leaves the disk through the backlog.",
+    "`diff <id>` shows an entry against the file at its path now (unified diff; `--raw` returns both texts).",
+    "`restore <id>` writes an entry back to its project path and pushes it to Studio. It needs a connected Studio plugin, so the restore reaches Studio rather than waiting on disk.",
+    "Entries expire `backlog_ttl_hours` (24 by default) after capture and are swept on every read, so an expiry never depends on the app being open. `pin <id>` keeps an entry until it is restored or dropped; `unpin <id>` lets it expire again. Capturing bytes identical to an entry already held for the same path refreshes that entry instead of adding a copy; `list` shows a path's older versions under its newest one.",
     "`drop` forgets an entry without restoring it; `drop --all` empties the backlog. Neither touches what is already synced.",
-    "There is no divergence prompt, no pending review, and no Keep Disk / Keep Studio decision anywhere in WSync. The commands that drove them — `diff`, `changes`, `decision`, `conflicts`, and `resolve` — no longer exist."
+    "There is no divergence prompt, no pending review, and no Keep Disk / Keep Studio decision anywhere in WSync. The top-level commands that drove them — `wsync diff`, `changes`, `decision`, `conflicts`, and `resolve` — no longer exist (`backlog diff` only compares a backlog entry with its file)."
   ]
 }

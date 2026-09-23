@@ -1,10 +1,11 @@
 // views/backlog.js — the disk content that lost to Studio.
 //
-// Sync never asks a question. A connect applies Studio over the project and a
-// mid-session clash resolves the same way, because being interrupted by a
-// decision you did not plan to make is worse than the loss it guards against.
-// This window is what makes that safe: every time disk content would be
-// overwritten or dropped, its bytes are kept, and here they are.
+// Sync never asks a question. A connect keeps whichever side changed since the
+// last sync; only when both changed does Studio win, and a mid-session clash
+// resolves the same way, because being interrupted by a decision you did not
+// plan to make is worse than the loss it guards against. This window is what
+// makes that safe: every time disk content would be overwritten or dropped,
+// its bytes are kept, and here they are.
 //
 // So nothing in this window is a decision that has to be made. It opens when
 // you ask for it, never over your work, and closing it changes nothing — the
@@ -24,8 +25,8 @@
 // A restore **needs Studio**: with no plugin connected the daemon answers 503,
 // which is a wait rather than a dead button — the window parks and replays
 // itself when the plugin connects. That is not pedantry: a file restored while
-// Studio is away would be sent straight back here by the next connect, which
-// is Studio-first like every other one.
+// Studio is away would be a disk-only change the next connect has to sort out,
+// rather than a restore that landed.
 
 import { el, icon, plural } from "./dom.js";
 import {
@@ -61,11 +62,13 @@ const KINDS = {
 
 const TITLE = "Backlog — disk content Studio replaced";
 const SUBTITLE =
-  "Studio always wins, so these never reached the place. Move anything you want back — " +
-  "it returns to its file and syncs up. Entries are deleted a day after they land here.";
+  "Disk content that lost to Studio — both sides changed it, or Studio deleted it. Move anything " +
+  "you want back — it returns to its file and syncs up. Entries are deleted a day after they land " +
+  "here unless pinned (wsync backlog pin).";
 
 /** Turns `secondsRemaining` into the one number worth reading. */
-function expiryLabel(seconds) {
+function expiryLabel(seconds, pinned) {
+  if (pinned) return "pinned";
   if (!Number.isFinite(seconds) || seconds <= 0) return "expiring";
   if (seconds >= 3600) return `${Math.floor(seconds / 3600)}h left`;
   if (seconds >= 60) return `${Math.floor(seconds / 60)}m left`;
@@ -75,7 +78,7 @@ function expiryLabel(seconds) {
 function normalizeEntry(entry) {
   const path = typeof entry.path === "string" && entry.path !== "" ? entry.path : String(entry.id);
   const kind = KINDS[entry.reason] ? entry.reason : "initial-sync";
-  const expiry = expiryLabel(Number(entry.secondsRemaining));
+  const expiry = expiryLabel(Number(entry.secondsRemaining), entry.pinned === true);
 
   return {
     id: entry.id,
@@ -443,8 +446,9 @@ export function mountBacklog(root, api) {
       el(
         "p",
         { class: "muted" },
-        "Sync is Studio-first and never asks: when Studio's version wins, the disk copy is kept here " +
-          "for a day so you can put it back if it mattered.",
+        "Sync never asks: a connect keeps whichever side changed. When both did and Studio's " +
+          "version wins, the disk copy is kept here for a day (or until unpinned) so you can put it " +
+          "back if it mattered.",
       ),
     ]),
     list,

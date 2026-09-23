@@ -133,9 +133,10 @@ code, kbd, .mono { font-family: var(--mono); font-size: 0.92em; }
 .app {
   display: grid;
   grid-template-columns: var(--rail-w) 1fr;
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
   grid-template-areas:
     "rail topbar"
+    "rail alerts"
     "rail view"
     "status status";
   height: 100vh;
@@ -321,6 +322,39 @@ code, kbd, .mono { font-family: var(--mono); font-size: 0.92em; }
 .view-title { font-size: 19px; letter-spacing: -0.02em; }
 .view-sub { margin-top: 3px; color: var(--muted); max-width: 62ch; }
 .view-head-actions { display: flex; gap: 8px; flex: none; }
+
+/* --------------------------------------------------------- daemon alerts -- */
+
+/* A daemon that died or stopped answering (app.js). Its own grid row between
+   the topbar and the view, so no view can scroll it away or unmount it; the
+   row collapses to nothing while `hidden`. Capped, so a pile of dead daemons
+   cannot push the view off screen. */
+.daemon-alerts {
+  grid-area: alerts;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 40vh;
+  overflow: auto;
+  padding: 0 var(--pad) 12px;
+}
+
+/* Doubled class: this block sits above `.notice` in the file and must win. */
+.notice.daemon-alert { background: var(--danger-soft); }
+.daemon-alert > svg { flex: none; margin-top: 2px; color: var(--danger); }
+
+/* The one stderr line that explains the death, quoted as the daemon wrote it. */
+.daemon-alert-clue {
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.daemon-alert-actions { display: flex; gap: 6px; flex: none; align-items: flex-start; }
 
 /* -------------------------------------------------------------- statusbar - */
 

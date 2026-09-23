@@ -10,10 +10,10 @@ pub fn read_rbxm(path: &Path, vfs: &Vfs) -> Result<Snapshot> {
 
 	let snapshot = if dom.root().children().len() == 1 {
 		let id = dom.root().children()[0];
-		helpers::snapshot_from_dom(dom, id)
+		helpers::snapshot_from_dom(dom, id)?
 	} else {
 		let id = dom.root_ref();
-		helpers::snapshot_from_dom(dom, id).with_class("Folder")
+		helpers::snapshot_from_dom(dom, id)?.with_class("Folder")
 	};
 
 	Ok(snapshot)

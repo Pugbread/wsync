@@ -19,9 +19,8 @@ local Http = require(WSync.Transport.Http)
 
 -- Remote-op modules wired into the sync engine (no cycle: the handler chain
 -- never requires back into Core/init): History owns the transaction state
--- that gates per-batch waypoints and threshold prompts during daemon-driven
--- bulk application; Bulk needs the session bridge for read_subtree /
--- source_read (Design §7.4-A).
+-- that gates threshold prompts during daemon-driven bulk application; Bulk
+-- needs the session bridge for read_subtree / source_read (Design §7.4-A).
 local History = require(WSync.Remote.Handlers.History)
 local Bulk = require(WSync.Remote.Handlers.Bulk)
 
@@ -437,7 +436,23 @@ function Core:__startSyncLoop()
 					reject(Error.new(Error.Disconnected, data.message))
 				end
 			else
-				self:__dispatchMessage(kind, data)
+				-- One message, one unit of failure. A Core error is a
+				-- deliberate end of the session (a declined change-threshold
+				-- prompt, a project that no longer matches) and still ends
+				-- it; anything else is logged and the loop reads on. An
+				-- error in applying one sync frame — or in formatting a log
+				-- line about it — used to unwind out of here and drop the
+				-- connection
+				local ok, err = pcall(self.__dispatchMessage, self, kind, data)
+
+				if not ok then
+					if Error.is(err) then
+						reject(err)
+						return
+					end
+
+					Log.warn(`Failed to handle a {kind} message from the server; the session continues:`, err)
+				end
 			end
 		end
 
@@ -491,9 +506,10 @@ function Core:__dispatchMessage(kind: Types.MessageKind, data: any)
 	elseif kind == "ExecuteCode" then
 		self.executor:execute(data.code)
 	elseif kind == "DispatchRequest" then
-		-- Queue-ordered request op (transaction_begin/transaction_finish):
-		-- executing it here — after every earlier queued sync frame applied —
-		-- preserves the daemon's bracket ordering (pinned wave-4 contract)
+		-- Queue-ordered request op (transaction_begin/transaction_finish,
+		-- sync_barrier): executing it here — after every earlier queued sync
+		-- frame applied — preserves the daemon's bracket ordering (pinned
+		-- wave-4 contract) and is what makes `wsync wait-synced` a barrier
 		local transport = self.transport
 
 		if transport and transport.performRequest then
@@ -566,10 +582,9 @@ end
 --- `resolver` ruling routes the decision UX (app wait or local prompt).
 function Core:__resolveDivergence(changes: Types.Changes, initialSyncPriority: string)
 	return Promise.new(function(resolve, reject)
-		if Changes.Total(changes) == 0 then
-			return resolve()
-		end
-
+		-- An empty diff uploads too: its clean commit is how the daemon learns
+		-- the two sides agree, and what it records as the sync base the next
+		-- connect compares against
 		local divergence = Divergence.new(self.tree, self.host, self.port, Config:get("Https"))
 		self.divergence = divergence
 
@@ -587,15 +602,18 @@ function Core:__resolveDivergence(changes: Types.Changes, initialSyncPriority: s
 		end
 
 		if not outcome then
-			-- Nothing was uploadable (all records skipped) — treated like the
-			-- clean fast path
 			return resolve()
 		end
 
 		if SyncScope.isCode() or outcome.resolver == "studio-first" then
-			-- Studio wins automatically — proceed straight to Connected. The
-			-- daemon already applied Studio → disk; disk-only/preserved items
-			-- surface later as a passive `disk-review`.
+			-- No decision to wait for: the daemon already settled every
+			-- difference (three-way against its sync base) and wrote disk.
+			-- What it pushes to Studio is queued behind this and applies once
+			-- the sync loop starts.
+			if outcome.rehydrate then
+				self:__rehydrate():expect()
+			end
+
 			return resolve()
 		end
 
@@ -606,6 +624,35 @@ function Core:__resolveDivergence(changes: Types.Changes, initialSyncPriority: s
 			Log.trace("Resolving the divergence with the local prompt flow..")
 			self:__resolveLocally(divergence, outcome.choiceId, changes, initialSyncPriority):expect()
 		end
+
+		return resolve()
+	end)
+end
+
+--- Re-pair Studio instances with the daemon's tree after a connect that
+--- rewrote disk. Whatever the daemon wrote from Studio was re-read into its
+--- tree under ids this plugin has never seen; without re-pairing, those
+--- instances would be unreachable both ways — a disk edit would target an id
+--- Studio does not know, and a Studio edit would have nothing to report to.
+--- Pairing is by name and class, exactly like the first hydrate; instances
+--- the daemon is about to push (disk won) simply stay unpaired until their
+--- sync frame creates them.
+function Core:__rehydrate()
+	return Promise.new(function(resolve, reject)
+		local ok, snapshot = self.transport:getSnapshot():await()
+
+		if not ok then
+			Log.warn("Connect: could not re-read the daemon tree after the connect apply:", snapshot)
+			return reject(Error.new(Error.DivergenceFailed, snapshot))
+		end
+
+		self.processor:hydrate(snapshot, game)
+
+		for i, id in self.project.rootRefs do
+			self.rootInstances[i] = self.tree:getInstance(id)
+		end
+
+		Log.stage("Connect: re-paired Studio instances with the daemon tree")
 
 		return resolve()
 	end)
@@ -758,8 +805,11 @@ function Core:__awaitAppDecision(divergence, choiceId: string)
 						)
 					end
 					-- choice-needed: the broadcast echo of our own upload
-				elseif kind == "DispatchRequest" then
+				elseif kind == "DispatchRequest" and data.op ~= "sync_barrier" then
 					-- Queue-ordered transaction ops keep executing in order.
+					-- (A `sync_barrier` falls through to the stash instead:
+					-- answering now would vouch for the sync frames stashed
+					-- ahead of it before they applied.)
 					-- A transaction_begin is also proof the daemon started
 					-- applying a disk decision — the authoritative signal
 					-- when the choice-made event was lost.
@@ -955,8 +1005,17 @@ function Core:__startSyncbackLoop()
 
 			-- Event → changes lives on the read processor (ReadProcessor.onEvent)
 			-- so the mapping is exercised by the syncback scenarios outside
-			-- Studio (scripts/check-plugin-syncback.mjs)
-			aggregateChanges:join(self.processor.read:onEvent(event), true)
+			-- Studio (scripts/check-plugin-syncback.mjs). One event is one
+			-- unit of failure, like one sync message: an event that cannot be
+			-- read is logged and skipped rather than ending the loop — and
+			-- with it the session
+			local ok, changes = pcall(self.processor.read.onEvent, self.processor.read, event)
+
+			if ok then
+				aggregateChanges:join(changes, true)
+			else
+				Log.warn(`Failed to read a Studio {event.kind} event for syncback; it was not pushed:`, changes)
+			end
 		end
 
 		resolve()

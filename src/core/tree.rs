@@ -13,6 +13,10 @@ pub struct Tree {
 	dom: WeakDom,
 	path_to_ids: MultiMap<PathBuf, Ref>,
 	id_to_meta: HashMap<Ref, Meta>,
+	/// Bumped on every mutable access. Nothing interprets the value; it only
+	/// answers "has anything changed since I last looked" for the sync base
+	/// writer, which would otherwise rehash the whole tree on every tick
+	generation: u64,
 }
 
 impl Tree {
@@ -25,6 +29,7 @@ impl Tree {
 			dom: WeakDom::new(builder),
 			id_to_meta: HashMap::new(),
 			path_to_ids: MultiMap::new(),
+			generation: 0,
 		};
 
 		let root_ref = tree.dom.root_ref();
@@ -39,6 +44,8 @@ impl Tree {
 	}
 
 	pub fn insert_instance(&mut self, snapshot: Snapshot, parent: Ref) -> Ref {
+		self.generation += 1;
+
 		let builder = InstanceBuilder::new(snapshot.class)
 			.with_name(snapshot.meta.original_name.as_ref().unwrap_or(&snapshot.name))
 			.with_properties(snapshot.properties);
@@ -51,6 +58,8 @@ impl Tree {
 	}
 
 	pub fn insert_instance_recursive(&mut self, snapshot: Snapshot, parent: Ref) -> Ref {
+		self.generation += 1;
+
 		let builder = InstanceBuilder::new(snapshot.class)
 			.with_name(snapshot.meta.original_name.as_ref().unwrap_or(&snapshot.name))
 			.with_properties(snapshot.properties);
@@ -67,6 +76,8 @@ impl Tree {
 	}
 
 	pub fn insert_instance_with_ref(&mut self, snapshot: Snapshot, parent: Ref) {
+		self.generation += 1;
+
 		let builder = InstanceBuilder::new(snapshot.class)
 			.with_name(snapshot.meta.original_name.as_ref().unwrap_or(&snapshot.name))
 			.with_referent(snapshot.id)
@@ -78,6 +89,8 @@ impl Tree {
 	}
 
 	pub fn remove_instance(&mut self, id: Ref) {
+		self.generation += 1;
+
 		if id == self.root_ref() {
 			error!("Attempted to remove root instance: {id:?}");
 			return;
@@ -108,10 +121,13 @@ impl Tree {
 	}
 
 	pub fn get_instance_mut(&mut self, id: Ref) -> Option<&mut Instance> {
+		self.generation += 1;
 		self.dom.get_by_ref_mut(id)
 	}
 
 	pub fn insert_meta(&mut self, id: Ref, meta: Meta) -> Option<Meta> {
+		self.generation += 1;
+
 		for path in meta.source.paths() {
 			self.path_to_ids.insert(path.to_owned(), id);
 		}
@@ -120,6 +136,8 @@ impl Tree {
 	}
 
 	pub fn update_meta(&mut self, id: Ref, meta: Meta) -> Option<Meta> {
+		self.generation += 1;
+
 		let old_meta = self.id_to_meta.remove(&id);
 
 		if let Some(old_meta) = &old_meta {
@@ -138,7 +156,7 @@ impl Tree {
 				.collect();
 
 			for path in removed {
-				self.path_to_ids.remove(path);
+				Self::unmap_path(&mut self.path_to_ids, path, id);
 			}
 
 			for path in added {
@@ -152,15 +170,31 @@ impl Tree {
 	}
 
 	pub fn remove_meta(&mut self, id: Ref) -> Option<Meta> {
+		self.generation += 1;
+
 		let meta = self.id_to_meta.remove(&id);
 
 		if let Some(meta) = &meta {
 			for path in meta.source.paths() {
-				self.path_to_ids.remove(path);
+				Self::unmap_path(&mut self.path_to_ids, path, id);
 			}
 		}
 
 		meta
+	}
+
+	/// Drops one instance from a path's entry. Several instances can share a
+	/// path (a project node and the directory it maps, a class change caught
+	/// mid-flight), and removing one must not unmap the others — a path left
+	/// with no id makes its next event resolve from the parent's level
+	fn unmap_path(path_to_ids: &mut MultiMap<PathBuf, Ref>, path: &Path, id: Ref) {
+		if let Some(ids) = path_to_ids.get_vec_mut(path) {
+			ids.retain(|mapped| *mapped != id);
+
+			if ids.is_empty() {
+				path_to_ids.remove(path);
+			}
+		}
 	}
 
 	pub fn get_meta(&self, id: Ref) -> Option<&Meta> {
@@ -168,6 +202,7 @@ impl Tree {
 	}
 
 	pub fn get_meta_mut(&mut self, id: Ref) -> Option<&mut Meta> {
+		self.generation += 1;
 		self.id_to_meta.get_mut(&id)
 	}
 
@@ -201,5 +236,9 @@ impl Tree {
 
 	pub fn place_root_refs(&self) -> &[Ref] {
 		self.dom.root().children()
+	}
+
+	pub fn generation(&self) -> u64 {
+		self.generation
 	}
 }

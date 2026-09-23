@@ -5,7 +5,7 @@
 -- op slice, and it is whitelisted because `Selection:Set` changes Studio
 -- *UI state only* — which instances are highlighted in the Explorer — never
 -- the DataModel itself. No instance is created, destroyed, reparented, or
--- edited, nothing syncs back to disk, and an undo waypoint is not required.
+-- edited, and nothing syncs back to disk.
 -- Every other mutating op (set/new/rm/mv/…) belongs to a later slice with
 -- write guardrails and audit logging.
 

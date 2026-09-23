@@ -3,13 +3,15 @@
   "title": "wsync open",
   "category": "Studio control",
   "description": "Selects one or more Studio instances by path.",
-  "usage": "wsync open [--project <path>] [--port <port>] [--raw] <studio-path>...",
+  "usage": "wsync open [--project <path>] [--port <port>] [--raw] (<studio-path>... | --path <studio-path>...)",
   "examples": [
     "wsync open ReplicatedStorage/Client/UIController",
-    "wsync open Workspace/Baseplate ReplicatedStorage/Client"
+    "wsync open Workspace/Baseplate ReplicatedStorage/Client",
+    "wsync open --path Workspace/Baseplate --path ReplicatedStorage/Client"
   ],
   "notes": [
     "This is a shorthand over `wsync select set --paths '[...]'`.",
-    "With the `OpenInEditor` plugin setting on, selecting a script also opens it in the Studio script editor."
+    "With the `OpenInEditor` plugin setting on, selecting a script also opens it in the Studio script editor.",
+    "Paths are positional, `--path` (repeatable), or both; they merge in order and a path given twice is selected once."
   ]
 }

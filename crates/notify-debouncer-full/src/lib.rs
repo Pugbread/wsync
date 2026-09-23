@@ -523,6 +523,7 @@ pub struct Debouncer<T: Watcher, C: FileIdCache> {
 	debouncer_thread: Option<std::thread::JoinHandle<()>>,
 	data: DebounceData<C>,
 	stop: Arc<AtomicBool>,
+	flushed: Arc<Mutex<Option<Instant>>>,
 }
 
 impl<T: Watcher, C: FileIdCache> Debouncer<T, C> {
@@ -552,6 +553,16 @@ impl<T: Watcher, C: FileIdCache> Debouncer<T, C> {
 	/// Access to the internally used notify Watcher backend
 	pub fn cache(&'_ mut self) -> MappedMutexGuard<'_, C> {
 		MutexGuard::map(self.data.lock(), |data| &mut data.cache)
+	}
+
+	/// WSync addition: when the most recent *completed* flush pass started.
+	/// Every raw event that reached the debouncer at least `timeout` before
+	/// this instant has been handed to the event handler (and the handler
+	/// has returned), so a caller can wait for the debouncer to drain
+	/// everything older than a point in time instead of sleeping. `None`
+	/// until the first pass completes.
+	pub fn last_flush(&self) -> Option<Instant> {
+		*self.flushed.lock()
 	}
 }
 
@@ -600,8 +611,11 @@ pub fn new_debouncer_opt<F: DebounceEventHandler, T: Watcher, C: FileIdCache + S
 		})?,
 	};
 
+	let flushed = Arc::new(Mutex::new(None));
+
 	let data_c = data.clone();
 	let stop_c = stop.clone();
+	let flushed_c = flushed.clone();
 	let thread = std::thread::Builder::new()
 		.name("notify-rs debouncer loop".to_string())
 		.spawn(move || loop {
@@ -609,6 +623,7 @@ pub fn new_debouncer_opt<F: DebounceEventHandler, T: Watcher, C: FileIdCache + S
 				break;
 			}
 			std::thread::sleep(tick);
+			let pass = Instant::now();
 			let send_data;
 			let errors;
 			{
@@ -622,6 +637,8 @@ pub fn new_debouncer_opt<F: DebounceEventHandler, T: Watcher, C: FileIdCache + S
 			if !errors.is_empty() {
 				event_handler.handle_event(Err(errors));
 			}
+			// Stamped after the handler returned: the pass is complete
+			*flushed_c.lock() = Some(pass);
 		})?;
 
 	let data_c = data.clone();
@@ -643,6 +660,7 @@ pub fn new_debouncer_opt<F: DebounceEventHandler, T: Watcher, C: FileIdCache + S
 		debouncer_thread: Some(thread),
 		data,
 		stop,
+		flushed,
 	};
 
 	Ok(guard)

@@ -5,7 +5,7 @@ use path_clean::PathClean;
 use rbx_dom_weak::{types::Tags, ustr, HashMapExt, UstrMap};
 use std::path::Path;
 
-use super::new_snapshot;
+use super::{new_snapshot_mapped, SnapshotFrame};
 use crate::{
 	core::{
 		meta::{Context, Meta, NodePath, Source},
@@ -51,6 +51,13 @@ pub fn new_snapshot_node(
 	context: &Context,
 	vfs: &Vfs,
 ) -> Result<Snapshot> {
+	// Nested nodes and their `$path` targets count toward the walk's depth
+	// guard like directories do: a `$path` naming an ancestor directory is a
+	// cycle, and must fail instead of overflowing the stack
+	let _frame = SnapshotFrame::enter(path, || {
+		format!("snapshotting project node {node_path} of {}", path.display())
+	})?;
+
 	if node.class_name.is_some() && node.path.is_some() {
 		bail!("Failed to load project: $className and $path cannot be set at the same time");
 	}
@@ -126,7 +133,7 @@ pub fn new_snapshot_node(
 		if vfs.exists(&path) {
 			vfs.watch(&path, vfs.is_dir(&path))?;
 
-			if let Some(mut path_snapshot) = new_snapshot(&path, context, vfs)? {
+			if let Some(mut path_snapshot) = new_snapshot_mapped(&path, context, vfs)? {
 				path_snapshot.extend_properties(snapshot.properties);
 				path_snapshot.set_name(&snapshot.name);
 

@@ -2099,7 +2099,10 @@ fn execute_playtest(client: &Client, step: &WorkflowStep, workflow_dir: &Path) -
 	let mut records: Vec<Value> = Vec::new();
 	let mut record_count: u64 = 0;
 
-	let polled = playtest::poll_run(client, &job_id, deadline, |record| {
+	// Client failures are collected as they stream past, so a step that ends
+	// without a terminal record (timeout, lost stream) still reports them
+	let mut failures = playtest::ClientFailures::default();
+	let polled = playtest::poll_run_observed(client, &job_id, deadline, &mut failures, |record| {
 		record_count += 1;
 
 		if records.len() == RECORD_TAIL {
@@ -2126,15 +2129,21 @@ fn execute_playtest(client: &Client, step: &WorkflowStep, workflow_dir: &Path) -
 		Ok(playtest::RunEnd::DeadlineExpired) => {
 			client.request("playtest_run_cancel", json!({ "jobId": job_id })).ok();
 
-			return error_response(
+			let mut response = error_response(
 				"PLAYTEST_TIMEOUT",
 				&format!("no terminal record within timeoutSec {timeout_sec} (plus grace)"),
 			);
+
+			response["value"] = unfinished_run(&job_id, record_count, records, &failures);
+			return response;
 		}
 		Err(err) => {
 			client.request("playtest_run_cancel", json!({ "jobId": job_id })).ok();
 
-			return error_response("PLAYTEST_ABORTED", &format!("lost the run stream: {err:#}"));
+			let mut response = error_response("PLAYTEST_ABORTED", &format!("lost the run stream: {err:#}"));
+
+			response["value"] = unfinished_run(&job_id, record_count, records, &failures);
+			return response;
 		}
 	};
 
@@ -2166,6 +2175,20 @@ fn execute_playtest(client: &Client, step: &WorkflowStep, workflow_dir: &Path) -
 		response["value"] = value;
 		response
 	}
+}
+
+/// What a playtest step that ended without a terminal record still knows:
+/// the records it saw and every client failure among them (with
+/// tracebacks) — a client that errored is usually why the run never finished
+fn unfinished_run(job_id: &str, record_count: u64, records: Vec<Value>, failures: &playtest::ClientFailures) -> Value {
+	let mut value = json!({
+		"jobId": job_id,
+		"recordCount": record_count,
+		"records": records,
+	});
+
+	failures.attach(&mut value);
+	value
 }
 
 /// Read-back verification for the supported writes (run.json `verify: true`)

@@ -8,7 +8,7 @@
     "wsync undo --project ."
   ],
   "notes": [
-    "Pairs naturally with `--waypoint` on `wsync set` for reversible batches.",
+    "Drives Studio's own undo stack — the same history as Ctrl+Z in Studio — so it can reverse the user's own edits, not only WSync's. Say what you are about to undo before you undo it.",
     "A completed bulk disk-to-Studio pull is one recording, so one undo reverses the whole pull."
   ]
 }

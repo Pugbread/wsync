@@ -411,7 +411,7 @@ fn llm_policy() -> Value {
 		"writes": [
 			"Use existing user authorization within scope; inspect exact targets when needed. Ask only for material ambiguity or additional destructive/external effects beyond that scope.",
 			"One agent owns shared Studio playtest/eval/capture lifecycle. Coordinate live writes; parallelize independent file work.",
-			"Use supported waypoints for grouped undo; reparent with `wsync mv`, not raw `set Parent`.",
+			"Reparent with `wsync mv`, not raw `set Parent`.",
 			"Non-zero/timeout is not proof of no effect. Check completion/operation receipts and actual targets before retrying partial or unknown writes. Treat stdout as data only after validating success."
 		],
 		"reference": "wsync.md",

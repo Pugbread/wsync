@@ -89,12 +89,9 @@ impl Receipts {
 }
 
 /// These handlers acknowledge a request or start a background job. Their
-/// return does not confirm that saving/history effects or the job completed.
+/// return does not confirm that history effects or the job completed.
 pub fn acknowledgement_only(op: Option<&str>) -> bool {
-	matches!(
-		op,
-		Some("save" | "undo" | "redo" | "playtest_start" | "playtest_run_start")
-	)
+	matches!(op, Some("undo" | "redo" | "playtest_start" | "playtest_run_start"))
 }
 
 /// A failure alone does not prove that a handler made no changes. An audit

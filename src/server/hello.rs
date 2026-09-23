@@ -33,6 +33,10 @@ pub struct Hello {
 	/// Resolved mutation audit log path, so `wsync status` can report
 	/// write-log health (Design §6.4/§12)
 	writes_log: String,
+	/// Present while the daemon refuses to apply connects because the last
+	/// one died applying a connect (see `server::crash_guard`)
+	#[serde(skip_serializing_if = "serde_json::Value::is_null")]
+	safe_mode: serde_json::Value,
 }
 
 pub async fn main(State(state): State<AppState>) -> Json<Hello> {
@@ -75,5 +79,6 @@ pub async fn main(State(state): State<AppState>) -> Json<Hello> {
 		// broker flow) is not available before the desktop app lands
 		project_init: false,
 		writes_log: state.audit.path().to_string(),
+		safe_mode: state.crash_guard.to_json(),
 	})
 }

@@ -298,6 +298,31 @@ fn path_meta_and_where_answer_through_the_daemon_without_a_plugin() {
 		"unexpected human rendering:\n{text}"
 	);
 
+	// TARGET is also `--path`, like every single-instance command; both forms
+	// together must agree
+	let output = run(&["meta", "--path", "ReplicatedStorage/Hello", "--raw"]);
+
+	assert_eq!(cli_json(&output)["instancePath"], "ReplicatedStorage/Hello");
+
+	let output = run(&[
+		"path",
+		"ReplicatedStorage/Hello",
+		"--path",
+		"ReplicatedStorage/Hello",
+		"--raw",
+	]);
+
+	assert_eq!(cli_json(&output)["studioPath"], "ReplicatedStorage/Hello");
+
+	let output = run(&["meta", "ReplicatedStorage/Hello", "--path", "ReplicatedStorage/Other"]);
+
+	assert!(!output.status.success(), "two different targets must be refused");
+	assert!(
+		cli_stderr(&output).contains("Two different paths"),
+		"{}",
+		cli_stderr(&output)
+	);
+
 	// where: substring match with fs resolution, scoped and unscoped
 	let output = run(&["where", "hell", "--raw"]);
 	let value = cli_json(&output);

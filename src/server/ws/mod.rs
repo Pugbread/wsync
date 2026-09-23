@@ -186,6 +186,10 @@ async fn plugin_connection(state: AppState, mut socket: WebSocket, hello: Client
 		return;
 	}
 
+	// A socket blip reconnects without a fresh compare; the sync base resumes
+	// recording only if nothing on disk changed while the plugin was away
+	state.sync_base.on_reconnect(core.tree().generation());
+
 	journal(&state, &format!("Plugin connected: {} (ws)", hello.name));
 	ws.emit(Event::PluginStatus {
 		connected: true,
@@ -313,6 +317,10 @@ fn cleanup_plugin(state: &AppState, queue_id: u32, hello: &ClientHello) {
 	// A pending divergence set is only valid against the Studio state that
 	// produced it; the plugin going away makes it stale (Design §7.2)
 	state.divergence.invalidate("plugin disconnected");
+
+	// Nothing the tree does from here reaches Studio, so it stops being the
+	// agreed state
+	state.sync_base.on_disconnect(state.core.tree().generation());
 
 	journal(state, &format!("Plugin disconnected: {}", hello.name));
 	ws.emit(Event::PluginStatus {

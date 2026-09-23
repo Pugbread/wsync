@@ -3,15 +3,11 @@ local WSync = script:FindFirstAncestor("WSync")
 local Dom = require(WSync.Lib.Dom)
 
 local Log = require(WSync.Log)
+local Util = require(WSync.Util)
 local Types = require(WSync.Types)
 local Config = require(WSync.Config)
 
 local equals = require(WSync.Helpers.equals)
-local setWaypoint = require(WSync.Helpers.setWaypoint)
-
--- History owns the ChangeHistoryService transaction state; no cycle — the
--- handler chain never requires back into Core (see Remote/Handlers/History)
-local History = require(WSync.Remote.Handlers.History)
 
 local Error = require(script.Parent.Parent.Error)
 
@@ -22,17 +18,30 @@ local ReadProcessor = require(script.Parent.Read)
 
 local MESH_RELOAD_PROPERTIES = { "MeshContent", "InitialSize" }
 
---- Per-batch waypoint, gated (pinned wave-4 contract): while a daemon
---- transaction recording is open (`transaction_begin` .. sync frames ..
---- `transaction_finish`), the recording brackets every applied change, so
---- the per-batch waypoints are suppressed — a daemon-driven bulk pull lands
---- as exactly one Studio Undo, and SetWaypoint never fires mid-recording.
-local function batchWaypoint(action: string, name: string?)
-	if History.shouldSuppressBatchWaypoints() then
-		return
+-- An update for a ref the tree does not know is a change that did NOT reach
+-- Studio, so it stays a warning — but a bounded one: a daemon replaying
+-- changes for refs this session never received would otherwise flood the
+-- Output. At most this many per window; the rest are counted and summed up
+-- in one line at the end of each batch.
+local UNKNOWN_UPDATE_WARNINGS = 5
+local UNKNOWN_UPDATE_WINDOW = 10
+
+--- Where an instance sits, for log lines. Never throws.
+local function pathOf(instance: Instance?): string?
+	if instance == nil then
+		return nil
 	end
 
-	setWaypoint(action, name)
+	local ok, path = pcall(function()
+		return instance:GetFullName()
+	end)
+
+	return if ok then path else nil
+end
+
+--- An addition, for log lines: name, class and hex ref.
+local function describeAddition(snapshot: Types.AddedSnapshot): string
+	return `'{Util.safeStringify(snapshot.name)}' ({Util.safeStringify(snapshot.class)}) {Util.safeStringify(snapshot.id)}`
 end
 
 local function loadMesh(path: string): MeshPart?
@@ -112,35 +121,116 @@ end
 local WriteProcessor = {}
 WriteProcessor.__index = WriteProcessor
 
-function WriteProcessor.new(tree, transport)
+function WriteProcessor.new(tree, transport, read)
 	return setmetatable({
 		tree = tree,
 		-- The transport interface (Transport/init.luau) — used for on-demand
 		-- subtree fetches when `LiveHydrate` resolves missing parents
 		transport = transport,
+		-- The session's read processor, told about the moves a class swap
+		-- makes so syncback does not read them as Studio edits
+		-- (`swapInstance`). Optional: without one, nothing is announced
+		read = read,
+		-- Rate limit for unknown-ref update warnings (UNKNOWN_UPDATE_*)
+		unknownUpdates = { windowStart = -math.huge, count = 0, suppressed = 0 },
 	}, WriteProcessor)
 end
 
+--- Apply one daemon sync batch. Every change is applied on its own: one that
+--- fails — a property Studio rejects, a class it refuses to create, a bug —
+--- is logged with its hex ref (and path, when the tree knows it) and
+--- skipped, and the rest of the batch and the connection carry on. An error
+--- that escaped here used to unwind through Core's sync loop and end the
+--- session, over a single change.
 function WriteProcessor:applyChanges(changes: Types.Changes, initial: boolean?)
 	Log.trace("Applying changes..")
 
-	batchWaypoint("Sync")
-
 	for _, snapshot in changes.additions do
-		self:applyAddition(snapshot, initial)
+		self:__isolated(function()
+			self:applyAddition(snapshot, initial)
+		end, function()
+			return `addition of {describeAddition(snapshot)}`
+		end)
 	end
 
 	for _, snapshot in changes.updates do
-		self:applyUpdate(snapshot, initial)
+		self:__isolated(function()
+			self:applyUpdate(snapshot, initial)
+		end, function()
+			local path = pathOf(self.tree:getInstance(snapshot.id))
+			return `update of {Util.safeStringify(snapshot.id)}{if path then ` ({path})` else ""}`
+		end)
 	end
 
 	for _, object in changes.removals do
-		self:applyRemoval(object, initial)
+		self:__isolated(function()
+			self:applyRemoval(object)
+		end, function()
+			local path = pathOf(if type(object) == "buffer" then self.tree:getInstance(object) else object)
+			return `removal of {Util.safeStringify(object)}{if path then ` ({path})` else ""}`
+		end)
 	end
 
-	if initial then
-		batchWaypoint("Initial Sync")
+	self:__flushUnknownUpdates()
+end
+
+--- Run one change's application; a failure is logged and swallowed.
+--- `describe` is only called on failure, and a failure in it is swallowed
+--- too.
+function WriteProcessor:__isolated(apply: () -> (), describe: () -> string)
+	local ok, err = pcall(apply)
+
+	if ok then
+		return
 	end
+
+	local described, what = pcall(describe)
+
+	Log.warn(
+		`Skipped the {if described then what else "change"} from the server: {Util.safeStringify(err)}`
+	)
+end
+
+--- Warn about an update for a ref the tree does not know, within the
+--- UNKNOWN_UPDATE_* budget.
+function WriteProcessor:__warnUnknownUpdate(snapshot: Types.UpdatedSnapshot)
+	local limiter = self.unknownUpdates
+	local now = os.clock()
+
+	if now - limiter.windowStart >= UNKNOWN_UPDATE_WINDOW then
+		limiter.windowStart = now
+		limiter.count = 0
+	end
+
+	if limiter.count >= UNKNOWN_UPDATE_WARNINGS then
+		limiter.suppressed += 1
+		return
+	end
+
+	limiter.count += 1
+
+	local target = Util.safeStringify(snapshot.id)
+
+	if snapshot.class then
+		target ..= ` (class change to {Util.safeStringify(snapshot.class)})`
+	end
+
+	Log.warn(Error.new(Error.NoInstanceUpdate, target))
+end
+
+--- The one summary line for the unknown-ref updates the budget held back.
+function WriteProcessor:__flushUnknownUpdates()
+	local suppressed = self.unknownUpdates.suppressed
+
+	if suppressed == 0 then
+		return
+	end
+
+	self.unknownUpdates.suppressed = 0
+
+	Log.warn(
+		`…and {suppressed} more update{Util.plural(suppressed)} for instances that do not exist in the tree — not applied in Studio`
+	)
 end
 
 function WriteProcessor:applyAddition(
@@ -165,7 +255,7 @@ function WriteProcessor:applyAddition(
 		end
 
 		if not parent then
-			local err = Error.new(Error.NoInstanceAdd, snapshot)
+			local err = Error.new(Error.NoInstanceAdd, `{describeAddition(snapshot)}, parent {Util.safeStringify(snapshot.parent)}`)
 			Log.warn(err)
 
 			return
@@ -208,7 +298,7 @@ function WriteProcessor:applyAddition(
 			instance = service
 			isService = true
 		else
-			local err = Error.new(Error.HydrationFailed, snapshot)
+			local err = Error.new(Error.HydrationFailed, describeAddition(snapshot))
 			Log.warn(err)
 
 			return
@@ -238,19 +328,18 @@ function WriteProcessor:applyAddition(
 		end
 	end
 
+	-- Tracked before it is parented: a watcher that sees the arrival at once
+	-- (Immediate signal behavior) must read it as already synced, not as a
+	-- new Studio instance to push back to disk under a fresh ref
+	self.tree:insertInstance(instance, snapshot.id, snapshot.meta)
+
 	if not isService then
 		instance.Parent = parent
 	end
 
-	self.tree:insertInstance(instance, snapshot.id, snapshot.meta)
-
 	for _, child in snapshot.children do
 		child.parent = snapshot.id
 		self:applyAddition(child, initial)
-	end
-
-	if not initial then
-		batchWaypoint("Add", instance.Name)
 	end
 
 	return instance
@@ -296,9 +385,7 @@ function WriteProcessor:applyUpdate(snapshot: Types.UpdatedSnapshot, initial: bo
 		end
 
 		if not instance then
-			local err = Error.new(Error.NoInstanceUpdate, snapshot)
-			Log.warn(err)
-
+			self:__warnUnknownUpdate(snapshot)
 			return
 		end
 	end
@@ -324,13 +411,17 @@ function WriteProcessor:applyUpdate(snapshot: Types.UpdatedSnapshot, initial: bo
 		self.tree:updateMeta(snapshot.id, snapshot.meta)
 	end
 
+	-- The instance this update replaces, when it needs a new one: a class
+	-- change or a mesh reload (`swapInstance`, at the end)
+	local replaced: Instance? = nil
+
 	if
-		snapshot.class
+		(snapshot.class and snapshot.class ~= instance.ClassName)
 		or (snapshot.meta and snapshot.meta.meshSource and shouldReloadMesh(instance, snapshot.properties))
 	then
 		local newInstance
 
-		if snapshot.class then
+		if snapshot.class and snapshot.class ~= instance.ClassName then
 			if not Dom.isCreatable(snapshot.class) then
 				warnNotCreatable(snapshot.class)
 				return
@@ -363,15 +454,9 @@ function WriteProcessor:applyUpdate(snapshot: Types.UpdatedSnapshot, initial: bo
 			end
 		end
 
-		for _, child in instance:GetChildren() do
-			child.Parent = newInstance
-		end
-
-		newInstance.Parent = instance.Parent
-		instance.Parent = nil
-
-		self.tree:updateInstance(snapshot.id, newInstance)
-
+		-- Built in full — name and properties below — before it takes the old
+		-- instance's place: unparented, none of those writes reach syncback
+		replaced = instance
 		instance = newInstance
 	end
 
@@ -431,14 +516,51 @@ function WriteProcessor:applyUpdate(snapshot: Types.UpdatedSnapshot, initial: bo
 		end
 	end
 
-	if not initial then
-		batchWaypoint("Update", instance.Name)
+	if replaced then
+		self:swapInstance(snapshot.id, replaced, instance)
 	end
 
 	return instance
 end
 
-function WriteProcessor:applyRemoval(object: Types.Ref | Instance, initial: boolean?): Instance?
+--- Put `replacement` in the place of `instance`: the class-change half of an
+--- update (a Folder gaining `init.luau` becomes a ModuleScript, a script
+--- renamed to another suffix changes class) and the mesh reload. Same parent,
+--- every child moved across, the ref moved with it, the old instance
+--- destroyed — the instance is replaced, never duplicated, and later updates
+--- and removals by the same ref reach the replacement. `replacement` arrives
+--- built (name, properties) and unparented.
+---
+--- The order is what keeps syncback from echoing the swap to disk as a
+--- delete and re-create of the subtree, whether Studio fires the events at
+--- once or deferred:
+---   1. the tree points at the replacement before anything moves, so its
+---      arrival reads as already synced and the old instance's departure as
+---      an unknown instance's
+---   2. each child's move is announced to the read processor
+---      (`ReadProcessor:expectMove`), which would otherwise read the child
+---      leaving the old instance as a deletion
+---   3. the children move before the replacement is parented, so the
+---      Watcher — which drops a child's wiring when it leaves the old
+---      instance — rewires the whole subtree when the replacement arrives
+function WriteProcessor:swapInstance(id: Types.Ref, instance: Instance, replacement: Instance)
+	local parent = instance.Parent
+
+	self.tree:updateInstance(id, replacement)
+
+	for _, child in instance:GetChildren() do
+		if self.read then
+			self.read:expectMove(child, replacement)
+		end
+
+		child.Parent = replacement
+	end
+
+	replacement.Parent = parent
+	instance:Destroy()
+end
+
+function WriteProcessor:applyRemoval(object: Types.Ref | Instance): Instance?
 	Log.trace("Applying removal of", object)
 
 	-- The subtree is untracked with the instance (Tree.removeSubtree): its
@@ -456,8 +578,9 @@ function WriteProcessor:applyRemoval(object: Types.Ref | Instance, initial: bool
 		local instance = self.tree:getInstance(object)
 
 		if not instance then
-			local err = Error.new(Error.NoInstanceRemove, object)
-			Log.warn(err)
+			-- Benign: whatever the ref named is already gone from Studio's
+			-- view, which is where the removal wanted it
+			Log.debug(Error.new(Error.NoInstanceRemove, object))
 
 			return
 		end
@@ -473,10 +596,6 @@ function WriteProcessor:applyRemoval(object: Types.Ref | Instance, initial: bool
 		instance.Parent = nil
 
 		object = instance
-	end
-
-	if not initial then
-		batchWaypoint("Remove", (object :: Instance).Name)
 	end
 
 	return object

@@ -25,13 +25,14 @@
       ]
     }
   },
-  "usage": "wsync tag <add|rm> [--project <path>] [--port <port>] --path <studio-path> --tag <tag> [--raw]",
+  "usage": "wsync tag <add|rm> [--project <path>] [--port <port>] (<studio-path> | --path <studio-path>) --tag <tag> [--raw]",
   "examples": [
-    "wsync tag add --project . --path Workspace/Box --tag Enemy",
+    "wsync tag add Workspace/Box --project . --tag Enemy",
     "wsync tag rm --project . --path Workspace/Box --tag Enemy"
   ],
   "notes": [
     "Successful tag mutations are written to `writes.log`.",
-    "Tags on projected instances sync back to their `.data.json` sidecar."
+    "Tags on projected instances sync back to their `.data.json` sidecar.",
+    "The Studio path is positional or `--path` — every single-instance command takes both forms; passing both is accepted only when they name the same path."
   ]
 }

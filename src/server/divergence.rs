@@ -4,13 +4,14 @@
 //! immediately over the live sync channel. All request/response shapes and
 //! bounds are pinned protocol contracts.
 //!
-//! Under the Studio-first ruling (Design §7.0) the choice flow only exists on
-//! `"scope": "full"` projects. On a code-scope project a committed non-empty
-//! comparison never broadcasts `choice-needed`: the daemon immediately runs
-//! the fenced Studio → disk apply — `differs` gets Studio content with the
-//! disk original preserved, Studio-only entries are written out, disk-only
-//! files stay untouched on the live disk — and leaves the disk-side entries
-//! behind as the passive `disk-review` set.
+//! A committed comparison never asks (Design §7.0). Every difference is
+//! decided three ways against the sync base (`sync_base`, `three_way`): the
+//! side that moved since the last sync wins; when both moved, or there is no
+//! base to tell, Studio wins and the disk side goes to the backlog. What
+//! Studio wins lands through the fenced root apply (`bulk`), what disk wins is
+//! pushed to Studio as one bracketed replay, and the plugin re-pairs its
+//! instances afterwards so nothing written during the connect is orphaned.
+//! The legacy choice endpoints below remain for full-scope tooling.
 
 use axum::{
 	body::Bytes,
@@ -18,13 +19,14 @@ use axum::{
 	http::StatusCode,
 	response::{IntoResponse, Json, Response},
 };
-use log::{debug, info, trace};
+use log::{debug, info, trace, warn};
 use rbx_dom_weak::{types::Ref, types::Variant, ustr};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
-	collections::{BTreeSet, HashMap},
+	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
 	fs,
+	path::{Path, PathBuf},
 	sync::Mutex,
 };
 use uuid::Uuid;
@@ -38,12 +40,21 @@ use crate::{
 	core::{
 		changes::Changes,
 		conflict::{self, ContentState},
+		meta::SourceEntry,
 		snapshot::UpdatedSnapshot,
+		tree::Tree,
 		Core,
 	},
 	lock,
 	project::Scope,
-	server::{self, backlog, bulk, ws::frames::codes, ws::frames::Event, AppState},
+	server::{
+		self, backlog, bulk, crash_guard,
+		sync_base::{self, BaseView, Key, Place},
+		three_way::{self, Winner},
+		ws::frames::codes,
+		ws::frames::Event,
+		AppState,
+	},
 	util,
 };
 
@@ -81,6 +92,17 @@ struct Entry {
 	change: EntryChange,
 	class: String,
 	instance_path: String,
+	studio: Studio,
+}
+
+/// What the plugin reported about the Studio side of an entry, for the
+/// three-way classification (absent from plugins older than the sync base)
+#[derive(Debug, Clone, Default)]
+struct Studio {
+	key: Option<Key>,
+	/// Descendants of a `remove` root, keyed relative to it; `None` when not
+	/// sent or truncated
+	descendants: Option<BTreeMap<String, Option<Key>>>,
 }
 
 /// One frozen divergence item with its dense sequential id
@@ -92,6 +114,22 @@ struct Item {
 	instance_path: String,
 	state: &'static str,
 	class: String,
+	studio: Studio,
+}
+
+impl Item {
+	fn three_way_state(&self) -> three_way::State {
+		match self.state {
+			"only-on-disk" => three_way::State::OnlyOnDisk,
+			"differs" => three_way::State::Differs,
+			_ => three_way::State::MissingOnDisk,
+		}
+	}
+
+	/// The served root an item lives under (first instance-path segment)
+	fn root(&self) -> Option<&str> {
+		self.instance_path.split('/').next().filter(|root| !root.is_empty())
+	}
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -122,6 +160,7 @@ struct Upload {
 	submission_id: String,
 	next_chunk: u64,
 	entries: Vec<Entry>,
+	place: Option<Place>,
 }
 
 #[derive(Debug)]
@@ -183,6 +222,10 @@ struct CompareRequest {
 	final_chunk: bool,
 	#[serde(default)]
 	restart: bool,
+	/// The connecting place, so a sync base is only ever read by the place it
+	/// was recorded against (absent from older plugins)
+	#[serde(default)]
+	place: Option<Place>,
 	entries: Vec<CompareEntry>,
 }
 
@@ -196,6 +239,55 @@ struct CompareEntry {
 	#[allow(dead_code)]
 	name: String,
 	instance_path: String,
+	/// SHA-256 of Studio's LF-normalized editor source, for scripts on
+	/// `update` and `remove` entries
+	#[serde(default)]
+	source_sha256: Option<String>,
+	/// Studio's descendants of a `remove` root (bounded by the plugin)
+	#[serde(default)]
+	descendants: Option<Vec<CompareDescendant>>,
+	#[serde(default)]
+	descendants_truncated: bool,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct CompareDescendant {
+	/// Relative to the entry's instance path
+	path: String,
+	class: String,
+	#[serde(default)]
+	source_sha256: Option<String>,
+}
+
+impl CompareEntry {
+	/// The Studio side as far as the plugin reported it. Only `update` and
+	/// `remove` entries describe an instance that exists in Studio
+	fn studio(&self, change: EntryChange, scope: Scope) -> Studio {
+		if change == EntryChange::Add {
+			return Studio::default();
+		}
+
+		let key = Key::from_studio(&self.class, self.source_sha256.as_deref());
+
+		let descendants = match (&self.descendants, change) {
+			(Some(descendants), EntryChange::Remove) if !self.descendants_truncated => Some(
+				descendants
+					.iter()
+					.filter(|descendant| scope.allows_class(&descendant.class))
+					.map(|descendant| {
+						(
+							descendant.path.clone(),
+							Key::from_studio(&descendant.class, descendant.source_sha256.as_deref()),
+						)
+					})
+					.collect(),
+			),
+			_ => None,
+		};
+
+		Studio { key, descendants }
+	}
 }
 
 /// What a `/compare` chunk resolved to while the divergence lock was held.
@@ -204,8 +296,13 @@ struct CompareEntry {
 enum Ingested {
 	/// Fully answered synchronously (receipts, errors, full-scope commits)
 	Done(Response),
-	/// A code-scope commit froze `items`; the auto-apply runs next
-	StudioFirst { items: Vec<Item>, accepted: u64, next: u64 },
+	/// A comparison froze `items`; the connect apply runs next
+	StudioFirst {
+		items: Vec<Item>,
+		accepted: u64,
+		next: u64,
+		place: Option<Place>,
+	},
 }
 
 /// `POST /compare` — the plugin's chunked divergence upload (Design §7.2).
@@ -266,12 +363,18 @@ pub async fn compare(State(state): State<AppState>, body: Bytes) -> Response {
 			change,
 			class: entry.class.clone(),
 			instance_path: entry.instance_path.clone(),
+			studio: entry.studio(change, scope),
 		});
 	}
 
 	match ingest_chunk(&state, &request, entries, scope) {
 		Ingested::Done(response) => response,
-		Ingested::StudioFirst { items, accepted, next } => studio_first_commit(&state, items, accepted, next).await,
+		Ingested::StudioFirst {
+			items,
+			accepted,
+			next,
+			place,
+		} => connect_commit(&state, items, accepted, next, place).await,
 	}
 }
 
@@ -305,7 +408,11 @@ fn ingest_chunk(state: &AppState, request: &CompareRequest, entries: Vec<Entry>,
 				submission_id: request.submission_id.clone(),
 				next_chunk: 0,
 				entries: Vec::new(),
+				place: request.place,
 			});
+
+			// From here until the commit the tree is not the agreed state
+			state.sync_base.begin_compare(request.place);
 		}
 		Some(upload) => {
 			if upload.submission_id != request.submission_id {
@@ -331,6 +438,7 @@ fn ingest_chunk(state: &AppState, request: &CompareRequest, entries: Vec<Entry>,
 
 	upload.entries.extend(entries);
 	upload.next_chunk += 1;
+	upload.place = upload.place.or(request.place);
 
 	let accepted = request.chunk_index;
 	let next = upload.next_chunk;
@@ -352,12 +460,14 @@ fn ingest_chunk(state: &AppState, request: &CompareRequest, entries: Vec<Entry>,
 
 	if upload.entries.is_empty() {
 		// Both sides agree. This is the moment agreement is proven for the
-		// whole projection, so every baseline stamps. Nothing is cleared
-		// alongside it: the backlog is not pending work, it is what was kept,
-		// and it expires on its own schedule rather than on a clean connect.
+		// whole projection, so every baseline stamps and the sync base is
+		// recorded. Nothing is cleared alongside it: the backlog is not
+		// pending work, it is what was kept, and it expires on its own
+		// schedule rather than on a clean connect.
 		drop(inner);
 
 		seed_all_baselines(&state.core);
+		commit_sync_base(state, &HashSet::new(), BTreeSet::new(), false);
 
 		info!("Divergence comparison committed clean: sides are in sync");
 
@@ -367,95 +477,140 @@ fn ingest_chunk(state: &AppState, request: &CompareRequest, entries: Vec<Entry>,
 				"acceptedChunk": accepted,
 				"nextChunk": next,
 				"committed": true,
+				"clean": true,
 			}))
 			.into_response(),
 		);
 	}
 
+	let place = upload.place;
 	let (items, _stats) = freeze(&state.core, upload.entries);
 
-	// Studio-first, always: no choice, no prompt, whatever the scope. The
-	// caller runs the apply outside the divergence lock (it awaits plugin ops)
-	// and the disk side goes to the backlog rather than to a question.
+	// No choice, no prompt, whatever the scope. The caller runs the apply
+	// outside the divergence lock (it awaits plugin ops); what loses goes to
+	// the backlog rather than to a question.
 	let _ = scope;
 
-	Ingested::StudioFirst { items, accepted, next }
+	Ingested::StudioFirst {
+		items,
+		accepted,
+		next,
+		place,
+	}
 }
 
-/// Commits a code-scope comparison Studio-first (Design §7.0): runs the
-/// fenced Studio → disk apply immediately — no `choice-needed`, no prompt,
-/// no `changes_threshold` — and leaves the disk-side entries behind as the
-/// passive `disk-review` set. Deltas: `differs` → Studio content lands on
-/// disk with the disk original preserved into the review store; disk-only →
-/// left untouched on the live disk (the staged swap overlays them forward);
-/// Studio-only → written to disk as part of the apply
-/// Commits a comparison Studio-first: runs the fenced Studio → disk apply
-/// immediately — no choice, no prompt — and moves whatever disk content lost
-/// into the backlog.
+/// Commits a comparison: decides every difference three ways against the
+/// sync base (Studio-first when there is none, Design §7.0), writes what
+/// Studio wins to disk through the fenced root apply, pushes what disk wins
+/// to Studio, and moves every disk original that lost into the backlog.
 ///
-/// Studio is the only authority here, so the deltas resolve without asking:
-/// `differs` → Studio's content lands on disk and the disk original is
-/// backlogged; `only-on-disk` → the file leaves the workspace for the backlog,
-/// because a file Studio does not have is the divergence this model exists to
-/// end; `missing-on-disk` → written out as part of the apply.
-async fn studio_first_commit(state: &AppState, items: Vec<Item>, accepted: u64, next: u64) -> Response {
+/// Nothing asks. Where the base shows that only one side moved since the last
+/// sync, that side wins and nothing is backlogged. Where both moved, or the
+/// base cannot tell, Studio wins and the disk side is kept in the backlog —
+/// the old Studio-first rule, now reserved for real conflicts. A file Studio
+/// deleted leaves the disk for the backlog; a file created on disk while the
+/// two were apart goes to Studio instead.
+async fn connect_commit(
+	state: &AppState,
+	items: Vec<Item>,
+	accepted: u64,
+	next: u64,
+	place: Option<Place>,
+) -> Response {
 	let transfer_id = Uuid::new_v4().to_string();
 	let workspace_dir = state.core.project().workspace_dir.clone();
+	let base = state.sync_base.view(place);
+	let winners = decide(&state.core, &items, base.as_ref());
 
-	// `differs` originals are preserved under the fence, then moved into the
-	// backlog once the apply has actually succeeded — a failed apply must not
-	// leave the only copy of someone's work in a half-built entry
+	// The last daemon died applying a connect: decide, report, apply nothing
+	if let Some(safe_mode) = state.crash_guard.safe_mode() {
+		return refuse_in_safe_mode(state, &items, &winners, base.is_some(), safe_mode, accepted, next);
+	}
+
+	let guard_generation = state.crash_guard.begin();
+
+	// Roots that need Studio's content on disk: something Studio wins that
+	// exists in Studio. Everything else is handled without a pull
+	let staged_roots: BTreeSet<String> = items
+		.iter()
+		.zip(&winners)
+		.filter(|(item, winner)| **winner != Winner::Disk && item.state != "only-on-disk")
+		.filter_map(|(item, _)| item.root().map(str::to_owned))
+		.collect();
+
 	let staging = workspace_dir
 		.join(BACKUPS_DIR)
 		.join("backlog-staging")
 		.join(&transfer_id);
-	let mut preserve = HashMap::new();
-	let mut differs: Vec<String> = Vec::new();
-	let mut disk_only: Vec<String> = Vec::new();
 
-	for item in &items {
-		let Some(path) = item.path.clone().filter(|path| backlog::safe_rel_path(path)) else {
-			debug!(
-				"Skipping backlog candidate {}: no safe disk path behind it",
-				item.instance_path
-			);
-			continue;
-		};
+	let mut options = bulk::StudioFirstOptions {
+		workspace_dir: workspace_dir.clone(),
+		staging: staging.clone(),
+		..Default::default()
+	};
 
-		match item.state {
-			"differs" => {
-				preserve.insert(workspace_dir.join(&path), staging.join(&path));
-				differs.push(path);
+	// What each disk-only item is on disk: its own directory when it has
+	// one, otherwise its files and sidecars — so nothing of it (an empty
+	// folder, an orphaned `.meta.json`) is left behind when it leaves
+	let mut disk_only_paths: HashMap<u32, Vec<PathBuf>> = HashMap::new();
+
+	{
+		let tree = state.core.tree();
+
+		for (item, winner) in items.iter().zip(&winners) {
+			let staged = item.root().is_some_and(|root| staged_roots.contains(root));
+
+			match (item.state, winner) {
+				("differs", Winner::StudioKeepDisk) => {
+					if let Some(live) = safe_live_path(&workspace_dir, item.path.as_deref()) {
+						if live.is_file() {
+							options.preserve.push(live);
+						}
+					}
+				}
+				("differs", Winner::Disk) if staged => {
+					options
+						.keep_live
+						.push((item.instance, bulk::file_entries(&tree, item.instance)));
+				}
+				("only-on-disk", _) => {
+					let paths = own_paths(&tree, item.instance, &workspace_dir);
+
+					if staged {
+						options.disk_only.extend(paths.iter().cloned());
+					}
+
+					disk_only_paths.insert(item.id, paths);
+				}
+				("missing-on-disk", Winner::Disk) if staged => options.drop_staged.push(item.instance),
+				_ => {}
 			}
-			"only-on-disk" => disk_only.push(path),
-			_ => {}
 		}
 	}
 
-	// Roots carrying Studio-side content (differs / missing-on-disk) are
-	// pulled and swapped whole; roots with only disk-only entries have nothing
-	// to pull and are handled by the backlog sweep below
-	let staged_roots: BTreeSet<String> = items
-		.iter()
-		.filter(|item| item.state != "only-on-disk")
-		.filter_map(|item| item.instance_path.split('/').next())
-		.filter(|root| !root.is_empty())
-		.map(str::to_owned)
-		.collect();
+	let count = |wanted: Winner| winners.iter().filter(|winner| **winner == wanted).count();
 
 	info!(
-		"Studio-first apply {transfer_id}: {} staged root(s), {} replaced, {} disk-only",
-		staged_roots.len(),
-		differs.len(),
-		disk_only.len()
+		"Connect {transfer_id}: {} difference(s) — {} to Studio, {} to disk, {} kept in the backlog ({}), {} staged root(s)",
+		items.len(),
+		count(Winner::Disk),
+		count(Winner::Studio),
+		count(Winner::StudioKeepDisk),
+		if base.is_some() {
+			"three-way against the sync base"
+		} else {
+			"no sync base: Studio-first"
+		},
+		staged_roots.len()
 	);
-
-	let options = bulk::StudioFirstOptions { preserve };
 
 	let backups = match bulk::apply_roots(state, &transfer_id, &staged_roots, Some(&options)).await {
 		Ok(backups) => backups,
 		Err((status, mut payload)) => {
 			fs::remove_dir_all(&staging).ok();
+
+			// A failed apply is not a crash
+			state.crash_guard.settle(guard_generation);
 
 			payload["acceptedChunk"] = json!(accepted);
 			payload["nextChunk"] = json!(next);
@@ -465,6 +620,8 @@ async fn studio_first_commit(state: &AppState, items: Vec<Item>, accepted: u64, 
 		}
 	};
 
+	let report = std::mem::take(&mut *lock!(options.report));
+
 	// The VFS is paused across the moves for the same reason the apply pauses
 	// it: content leaving disk here is the resolution, not an edit to
 	// broadcast, and a disk-only file has no instance in Studio to remove
@@ -473,33 +630,123 @@ async fn studio_first_commit(state: &AppState, items: Vec<Item>, accepted: u64, 
 	vfs.pause();
 
 	let mut backlogged = 0;
+	let mut to_studio: Vec<Item> = Vec::new();
+	let mut left_disk: Vec<Ref> = Vec::new();
 
-	for path in &differs {
-		if state
-			.backlog
-			.capture(path, &staging.join(path), backlog::Reason::InitialSync)
-			.is_some()
-		{
-			backlogged += 1;
+	for (item, winner) in items.iter().zip(&winners) {
+		match (item.state, winner) {
+			("differs", Winner::StudioKeepDisk) => {
+				if let Some(live) = safe_live_path(&workspace_dir, item.path.as_deref()) {
+					if report.preserved.contains(&live) {
+						backlogged += keep(state, &workspace_dir, &live, &options.preserved_path(&live));
+					}
+				}
+			}
+			("differs", Winner::Disk) => {
+				if report.demoted.contains(&item.instance) {
+					// Studio laid it out differently, so Studio's version took
+					// the path; the disk version is kept instead of pushed
+					for (_, files) in options.keep_live.iter().filter(|(id, _)| *id == item.instance) {
+						for live in files.iter().filter(|live| report.preserved.contains(*live)) {
+							backlogged += keep(state, &workspace_dir, live, &options.preserved_path(live));
+						}
+					}
+				} else {
+					to_studio.push(item.clone());
+				}
+			}
+			("only-on-disk", _) => {
+				let paths = disk_only_paths.remove(&item.id).unwrap_or_default();
+				let mut pushable = *winner == Winner::Disk;
+				let mut leaves = false;
+
+				for live in &paths {
+					if report.preserved.contains(live) {
+						let original = options.preserved_path(live);
+
+						if report.claimed.contains(live) {
+							// Studio has content at this very path after all
+							// (an instance the connect could not pair): its
+							// version stands, the disk original is kept if it
+							// differs, and nothing here is pushed
+							pushable = false;
+
+							if !bulk::same_contents(&original, live) {
+								backlogged += keep(state, &workspace_dir, live, &original);
+							}
+						} else if !pushable {
+							backlogged += keep(state, &workspace_dir, live, &original);
+							remove_any(live);
+							leaves = true;
+						}
+					} else if !pushable {
+						// Nothing was staged under this root: move it straight
+						backlogged += keep(state, &workspace_dir, live, live);
+						leaves = true;
+					}
+				}
+
+				if pushable {
+					to_studio.push(item.clone());
+				} else if leaves {
+					left_disk.push(item.instance);
+				}
+			}
+			("missing-on-disk", Winner::Disk) => to_studio.push(item.clone()),
+			_ => {}
 		}
 	}
 
 	fs::remove_dir_all(&staging).ok();
 
-	for path in &disk_only {
-		if state
-			.backlog
-			.capture(path, &workspace_dir.join(path), backlog::Reason::InitialSync)
-			.is_some()
-		{
-			backlogged += 1;
-		}
-	}
+	// What left the disk leaves the tree too. Studio never had it, so there
+	// is nothing to tell the plugin — but a tree still holding it would keep
+	// answering for its path: a new file written there later would be sent
+	// as an update to an instance Studio never received, and deleting it
+	// would send Studio a removal for an id it never saw
+	forget_instances(state, &left_disk);
 
 	vfs.resume();
 
-	// Baselines stamp as today: the tree now holds exactly the applied state
+	let pushed = to_studio.len();
+
+	if !to_studio.is_empty() {
+		let changes = build_disk_apply(&state.core, &to_studio);
+
+		let replayed = if state.ws.plugin_frames().is_ok() {
+			bulk::replay_disk_bracketed(state, &transfer_id, changes)
+		} else {
+			state
+				.core
+				.queue()
+				.push(server::SyncChanges(changes), None)
+				.map_err(|err| format!("Failed to queue sync frames: {err}"))
+		};
+
+		if let Err(err) = replayed {
+			warn!("Connect {transfer_id}: failed to push {pushed} disk change(s) to Studio: {err}");
+		}
+	}
+
+	// The tree now holds the agreed state, except where disk won: those are
+	// in flight to Studio, so their base holds until the writer sees the
+	// session survive them
 	seed_all_baselines(&state.core);
+
+	let hold: HashSet<Ref> = to_studio
+		.iter()
+		.filter(|item| item.state != "missing-on-disk")
+		.map(|item| item.instance)
+		.collect();
+
+	let held_paths: BTreeSet<String> = to_studio
+		.iter()
+		.filter(|item| item.state == "missing-on-disk")
+		.map(|item| item.instance_path.clone())
+		.collect();
+
+	commit_sync_base(state, &hold, held_paths, !to_studio.is_empty());
+	state.crash_guard.settle(guard_generation);
 
 	if backlogged > 0 {
 		info!("Backlogged {backlogged} disk entr(ies) that lost to Studio");
@@ -520,8 +767,218 @@ async fn studio_first_commit(state: &AppState, items: Vec<Item>, accepted: u64, 
 		"transferId": transfer_id,
 		"backups": backups,
 		"backlogged": backlogged,
+		"toStudio": pushed,
+		"toDisk": count(Winner::Studio) + count(Winner::StudioKeepDisk),
+		"threeWay": base.is_some(),
+		// A root swap re-reads what Studio wrote, and anything new to disk
+		// gets a daemon id the plugin has never seen: it must re-pair its
+		// instances before live sync starts, or those instances stay
+		// unreachable in both directions
+		"rehydrate": !staged_roots.is_empty(),
 	}))
 	.into_response()
+}
+
+/// Safe mode's answer to a connect: what it would have done, written to the
+/// report, and a refusal the plugin surfaces instead of going live
+fn refuse_in_safe_mode(
+	state: &AppState,
+	items: &[Item],
+	winners: &[Winner],
+	three_way: bool,
+	safe_mode: crash_guard::SafeMode,
+	accepted: u64,
+	next: u64,
+) -> Response {
+	let decisions: Vec<Value> = items
+		.iter()
+		.zip(winners)
+		.map(|(item, winner)| {
+			json!({
+				"instancePath": item.instance_path,
+				"path": item.path,
+				"state": item.state,
+				"class": item.class,
+				"wouldApply": match winner {
+					Winner::Disk => "disk-to-studio",
+					Winner::Studio => "studio-to-disk",
+					Winner::StudioKeepDisk => "studio-to-disk, disk copy to the backlog",
+				},
+			})
+		})
+		.collect();
+
+	let report = json!({
+		"safeMode": safe_mode,
+		"threeWay": three_way,
+		"differences": decisions,
+	});
+
+	let written = state.crash_guard.write_report(&report);
+
+	warn!(
+		"Safe mode: refused a connect with {} difference(s); nothing was applied{}",
+		items.len(),
+		written
+			.as_ref()
+			.map(|path| format!(" (report: {})", path.display()))
+			.unwrap_or_default()
+	);
+
+	(
+		StatusCode::LOCKED,
+		Json(json!({
+			"ok": false,
+			"error": format!(
+				"WSync is in safe mode: the previous daemon crashed while applying a connect, so this connect \
+				 applied nothing. {} difference(s) are listed in {}. Fix what crashed it (`wsync doctor` checks \
+				 the usual disk hazards), then run `wsync daemon resume` and reconnect.",
+				items.len(),
+				written
+					.map(|path| path.display().to_string())
+					.unwrap_or_else(|| "the daemon log".into())
+			),
+			"safeMode": true,
+			"acceptedChunk": accepted,
+			"nextChunk": next,
+			"committed": false,
+		})),
+	)
+		.into_response()
+}
+
+/// Decides every item against the base
+fn decide(core: &Core, items: &[Item], base: Option<&BaseView>) -> Vec<Winner> {
+	let tree = core.tree();
+	let tree_ambiguous = sync_base::ambiguous_paths(&tree);
+
+	let mut path_counts: HashMap<&str, usize> = HashMap::new();
+
+	for item in items {
+		*path_counts.entry(item.instance_path.as_str()).or_default() += 1;
+	}
+
+	items
+		.iter()
+		.map(|item| {
+			let disk = if item.state == "missing-on-disk" {
+				None
+			} else {
+				tree.get_instance(item.instance)
+					.map(|instance| Key::of(&instance.class, &instance.properties))
+			};
+
+			let input = three_way::Input {
+				state: item.three_way_state(),
+				instance_path: &item.instance_path,
+				disk: disk.as_ref(),
+				studio: item.studio.key.as_ref(),
+				studio_descendants: item.studio.descendants.as_ref(),
+				ambiguous: path_counts.get(item.instance_path.as_str()).copied().unwrap_or(0) > 1
+					|| tree_ambiguous.contains(&item.instance_path),
+			};
+
+			three_way::classify(base, &input)
+		})
+		.collect()
+}
+
+/// Records the tree as the agreed state. `hold`/`held_paths` keep their
+/// previous base (changes still in flight); `settle` makes the writer take a
+/// fresh snapshot on its next tick so those catch up once delivered
+fn commit_sync_base(state: &AppState, hold: &HashSet<Ref>, held_paths: BTreeSet<String>, settle: bool) {
+	let (mut snapshot, generation) = {
+		let tree = state.core.tree();
+
+		(sync_base::snapshot_tree(&tree, hold), tree.generation())
+	};
+
+	snapshot.held.extend(held_paths);
+
+	state.sync_base.commit(snapshot, generation, settle);
+}
+
+/// A workspace path behind a frozen item, if it is safe to touch
+fn safe_live_path(workspace_dir: &Path, path: Option<&str>) -> Option<PathBuf> {
+	path.filter(|path| backlog::safe_rel_path(path))
+		.map(|path| workspace_dir.join(path))
+}
+
+/// Everything an instance occupies on disk by itself: its directory when it
+/// is directory-backed (children included), else its file and sidecars
+fn own_paths(tree: &Tree, id: Ref, workspace_dir: &Path) -> Vec<PathBuf> {
+	let Some(meta) = tree.get_meta(id) else {
+		return Vec::new();
+	};
+
+	let inside = |path: &Path| path.starts_with(workspace_dir) && path != workspace_dir;
+
+	if let Some(folder) = meta.source.relevant().iter().find_map(|entry| match entry {
+		SourceEntry::Folder(path) if inside(path) => Some(path.clone()),
+		_ => None,
+	}) {
+		return vec![folder];
+	}
+
+	meta.source
+		.relevant()
+		.iter()
+		.filter_map(|entry| match entry {
+			SourceEntry::File(path) | SourceEntry::Data(path) if inside(path) => Some(path.clone()),
+			_ => None,
+		})
+		.collect()
+}
+
+/// Moves `source` into the backlog under `live`'s workspace-relative path
+fn keep(state: &AppState, workspace_dir: &Path, live: &Path, source: &Path) -> usize {
+	let Some(relative) = live
+		.strip_prefix(workspace_dir)
+		.ok()
+		.and_then(Path::to_str)
+		.map(|path| path.replace('\\', "/"))
+	else {
+		return 0;
+	};
+
+	usize::from(
+		state
+			.backlog
+			.capture(&relative, source, backlog::Reason::InitialSync)
+			.is_some(),
+	)
+}
+
+fn remove_any(path: &Path) {
+	if path.is_dir() {
+		fs::remove_dir_all(path).ok();
+	} else {
+		fs::remove_file(path).ok();
+	}
+}
+
+/// Drops instances (and their subtrees) from the tree and the conflict
+/// engine without telling anyone — for content that just left the disk and
+/// that Studio never had
+fn forget_instances(state: &AppState, ids: &[Ref]) {
+	if ids.is_empty() {
+		return;
+	}
+
+	let engine = state.core.conflicts();
+	let mut tree = state.core.tree();
+
+	for id in ids {
+		if !tree.exists(*id) {
+			continue;
+		}
+
+		for id in conflict::subtree_refs(&tree, *id) {
+			engine.forget(id);
+		}
+
+		tree.remove_instance(*id);
+	}
 }
 
 /// Classifies entries, projects disk paths through the tree/`Meta`, assigns
@@ -550,6 +1007,7 @@ fn freeze(core: &Core, entries: Vec<Entry>) -> (Vec<Item>, Stats) {
 			instance_path: entry.instance_path,
 			state: entry.change.state(),
 			class: entry.class,
+			studio: entry.studio,
 		});
 	}
 

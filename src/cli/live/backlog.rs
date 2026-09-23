@@ -6,8 +6,10 @@
 //! terminal half of the app's backlog view — list what is waiting, put an entry
 //! back, or drop it.
 //!
-//! Entries expire a day after capture. The backlog is a safety net for an edit
-//! you have not noticed losing, not a version history.
+//! Entries expire a day after capture (`backlog_ttl_hours`) unless pinned. The
+//! backlog is a safety net for an edit you have not noticed losing, not a
+//! version history: `diff` shows an entry against the file there now, and a
+//! path that lost more than once lists its newest entry first.
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
@@ -58,6 +60,24 @@ enum BacklogCommand {
 		#[arg(long)]
 		all: bool,
 	},
+	/// Show an entry against the file at its path now
+	Diff {
+		/// Entry id from `wsync backlog`
+		#[arg(value_name = "ID")]
+		id: String,
+	},
+	/// Keep an entry until it is dropped or restored (it never expires)
+	Pin {
+		/// Entry id from `wsync backlog`
+		#[arg(value_name = "ID")]
+		id: String,
+	},
+	/// Let a pinned entry expire again on its original schedule
+	Unpin {
+		/// Entry id from `wsync backlog`
+		#[arg(value_name = "ID")]
+		id: String,
+	},
 }
 
 impl Backlog {
@@ -78,6 +98,9 @@ impl Backlog {
 			None | Some(BacklogCommand::List) => list(&client, raw),
 			Some(BacklogCommand::Restore { id }) => restore(&client, &id, raw),
 			Some(BacklogCommand::Drop { id, all }) => drop_entry(&client, id, all, raw),
+			Some(BacklogCommand::Diff { id }) => diff(&client, &id, raw),
+			Some(BacklogCommand::Pin { id }) => pin(&client, &id, true, raw),
+			Some(BacklogCommand::Unpin { id }) => pin(&client, &id, false, raw),
 		}
 	}
 }
@@ -101,20 +124,54 @@ fn list(client: &Client, raw: bool) -> Result<()> {
 		return Ok(());
 	}
 
-	for entry in entries {
-		let remaining = entry.get("secondsRemaining").and_then(Value::as_u64).unwrap_or(0);
+	// Newest first within a path, and a path's older versions indented under
+	// it: two entries for one file is one file that lost twice
+	let mut ordered: Vec<&Value> = entries.iter().collect();
+
+	ordered.sort_by(|a, b| {
+		let path = |entry: &Value| entry.get("path").and_then(Value::as_str).unwrap_or("").to_owned();
+		let captured = |entry: &Value| entry.get("capturedAt").and_then(Value::as_u64).unwrap_or(0);
+
+		path(a).cmp(&path(b)).then(captured(b).cmp(&captured(a)))
+	});
+
+	let mut previous_path: Option<&str> = None;
+
+	for entry in ordered {
+		let path = entry.get("path").and_then(Value::as_str).unwrap_or("?");
+		let older = previous_path == Some(path);
+
+		let expiry = if entry.get("pinned").and_then(Value::as_bool).unwrap_or(false) {
+			"pinned".bold().to_string()
+		} else {
+			format!(
+				"expires in {}",
+				human_remaining(entry.get("secondsRemaining").and_then(Value::as_u64).unwrap_or(0))
+			)
+		};
+
+		let captures = entry.get("captures").and_then(Value::as_u64).unwrap_or(1);
+		let repeated = if captures > 1 {
+			format!("  (lost {captures} times)")
+		} else {
+			String::new()
+		};
 
 		print_line(&format!(
-			"{}  {}  {}  expires in {}",
+			"{}{}  {}  {}  {}{}",
+			if older { "  └ older: " } else { "" },
 			entry.get("id").and_then(Value::as_str).unwrap_or("?").dimmed(),
-			entry.get("path").and_then(Value::as_str).unwrap_or("?").bold(),
+			if older { path.normal() } else { path.bold() },
 			entry.get("reason").and_then(Value::as_str).unwrap_or("?"),
-			human_remaining(remaining),
+			expiry,
+			repeated,
 		));
+
+		previous_path = Some(path);
 	}
 
 	wsync_info!(
-		"{} entr(ies) waiting — `wsync backlog restore <id>` puts one back",
+		"{} entr(ies) waiting — `wsync backlog diff <id>` compares one with the file now, `restore <id>` puts it back, `pin <id>` keeps it",
 		entries.len()
 	);
 
@@ -163,6 +220,206 @@ fn drop_entry(client: &Client, id: Option<String>, all: bool, raw: bool) -> Resu
 	Ok(())
 }
 
+fn pin(client: &Client, id: &str, pinned: bool, raw: bool) -> Result<()> {
+	let endpoint = client.post_endpoint("/backlog/pin", &json!({ "id": id, "pinned": pinned }))?;
+	let value = endpoint.json("/backlog/pin")?.clone();
+
+	if raw {
+		print_json(&value);
+
+		return Ok(());
+	}
+
+	let path = value.get("path").and_then(Value::as_str).unwrap_or(id).bold();
+
+	if pinned {
+		wsync_info!("Pinned {path} — it stays until you restore or drop it");
+	} else {
+		wsync_info!("Unpinned {path} — it expires on its original schedule");
+	}
+
+	Ok(())
+}
+
+fn diff(client: &Client, id: &str, raw: bool) -> Result<()> {
+	// Entry ids are UUIDs; anything else never names an entry and must not
+	// reach the query string unescaped
+	if id.is_empty() || !id.chars().all(|char| char.is_ascii_alphanumeric() || char == '-') {
+		bail!("`{id}` is not a backlog entry id — see `wsync backlog`");
+	}
+
+	let route = format!("/backlog/diff?id={id}");
+	let endpoint = client.get_endpoint(&route)?;
+	let value = endpoint.json("/backlog/diff")?.clone();
+
+	if raw {
+		print_json(&value);
+
+		return Ok(());
+	}
+
+	let path = value.get("path").and_then(Value::as_str).unwrap_or(id);
+	let stored = &value["stored"];
+	let current = &value["current"];
+
+	let describe = |side: &Value| -> Option<&'static str> {
+		if side.get("exists").and_then(Value::as_bool) != Some(true) {
+			Some("absent")
+		} else if side.get("directory").and_then(Value::as_bool) == Some(true) {
+			Some("a directory")
+		} else if side.get("binary").and_then(Value::as_bool) == Some(true) {
+			Some("binary")
+		} else if side.get("tooLarge").and_then(Value::as_bool) == Some(true) {
+			Some("too large to diff")
+		} else {
+			None
+		}
+	};
+
+	let stored_text = stored.get("text").and_then(Value::as_str);
+	let current_text = current.get("text").and_then(Value::as_str);
+
+	match (stored_text, current_text, describe(current)) {
+		(Some(stored), Some(current), _) => {
+			if stored == current {
+				wsync_info!("{} — the backlog entry matches the file there now", path.bold());
+
+				return Ok(());
+			}
+
+			print_line(&format!("--- backlog {id}\n+++ {path} (now)"));
+
+			for line in unified_diff(stored, current, 3) {
+				print_line(&line);
+			}
+		}
+		(Some(stored), None, Some("absent")) => {
+			print_line(&format!("--- backlog {id}\n+++ {path} (now: absent)"));
+
+			for line in stored.lines() {
+				print_line(&format!("-{line}").red().to_string());
+			}
+		}
+		_ => {
+			wsync_info!(
+				"{} — backlog entry: {}, file now: {}",
+				path.bold(),
+				describe(stored).unwrap_or("text"),
+				describe(current).unwrap_or("text")
+			);
+		}
+	}
+
+	Ok(())
+}
+
+/// A unified diff of two texts, line based, with `context` lines around each
+/// change. The common prefix and suffix are trimmed first so a typical edit
+/// only runs the quadratic LCS over the region that actually changed
+fn unified_diff(old: &str, new: &str, context: usize) -> Vec<String> {
+	const MAX_CELLS: usize = 4_000_000;
+
+	let old: Vec<&str> = old.lines().collect();
+	let new: Vec<&str> = new.lines().collect();
+
+	let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+	let suffix = old[prefix..]
+		.iter()
+		.rev()
+		.zip(new[prefix..].iter().rev())
+		.take_while(|(a, b)| a == b)
+		.count();
+
+	let old_mid = &old[prefix..old.len() - suffix];
+	let new_mid = &new[prefix..new.len() - suffix];
+
+	// (tag, line): ' ' keep, '-' old only, '+' new only
+	let mut ops: Vec<(char, &str)> = old[..prefix].iter().map(|line| (' ', *line)).collect();
+
+	if old_mid.len().saturating_mul(new_mid.len()) > MAX_CELLS {
+		ops.extend(old_mid.iter().map(|line| ('-', *line)));
+		ops.extend(new_mid.iter().map(|line| ('+', *line)));
+	} else {
+		let (n, m) = (old_mid.len(), new_mid.len());
+		let mut lcs = vec![0u32; (n + 1) * (m + 1)];
+
+		for i in (0..n).rev() {
+			for j in (0..m).rev() {
+				lcs[i * (m + 1) + j] = if old_mid[i] == new_mid[j] {
+					lcs[(i + 1) * (m + 1) + j + 1] + 1
+				} else {
+					lcs[(i + 1) * (m + 1) + j].max(lcs[i * (m + 1) + j + 1])
+				};
+			}
+		}
+
+		let (mut i, mut j) = (0, 0);
+
+		while i < n || j < m {
+			if i < n && j < m && old_mid[i] == new_mid[j] {
+				ops.push((' ', old_mid[i]));
+				i += 1;
+				j += 1;
+			} else if i < n && (j == m || lcs[(i + 1) * (m + 1) + j] >= lcs[i * (m + 1) + j + 1]) {
+				// Removals before additions, as unified diffs read
+				ops.push(('-', old_mid[i]));
+				i += 1;
+			} else {
+				ops.push(('+', new_mid[j]));
+				j += 1;
+			}
+		}
+	}
+
+	ops.extend(old[old.len() - suffix..].iter().map(|line| (' ', *line)));
+
+	// Hunks: runs of changes with `context` unchanged lines around them
+	let changed: Vec<usize> = ops
+		.iter()
+		.enumerate()
+		.filter(|(_, (tag, _))| *tag != ' ')
+		.map(|(index, _)| index)
+		.collect();
+
+	let mut lines = Vec::new();
+	let mut index = 0;
+
+	while index < changed.len() {
+		let start = changed[index].saturating_sub(context);
+		let mut end = changed[index];
+
+		while index < changed.len() && changed[index] <= end + 2 * context + 1 {
+			end = changed[index];
+			index += 1;
+		}
+
+		let end = (end + context + 1).min(ops.len());
+
+		let old_start = ops[..start].iter().filter(|(tag, _)| *tag != '+').count() + 1;
+		let new_start = ops[..start].iter().filter(|(tag, _)| *tag != '-').count() + 1;
+		let old_count = ops[start..end].iter().filter(|(tag, _)| *tag != '+').count();
+		let new_count = ops[start..end].iter().filter(|(tag, _)| *tag != '-').count();
+
+		lines.push(
+			format!("@@ -{old_start},{old_count} +{new_start},{new_count} @@")
+				.cyan()
+				.to_string(),
+		);
+
+		for (tag, line) in &ops[start..end] {
+			let rendered = format!("{tag}{line}");
+
+			lines.push(match tag {
+				'-' => rendered.red().to_string(),
+				'+' => rendered.green().to_string(),
+				_ => rendered,
+			});
+		}
+	}
+
+	lines
+}
+
 fn human_remaining(seconds: u64) -> String {
 	if seconds >= 3600 {
 		return format!("{}h", seconds / 3600);
@@ -173,4 +430,25 @@ fn human_remaining(seconds: u64) -> String {
 	}
 
 	format!("{seconds}s")
+}
+
+#[cfg(test)]
+mod tests {
+	use super::unified_diff;
+
+	#[test]
+	fn a_one_line_edit_is_one_small_hunk() {
+		colored::control::set_override(false);
+
+		let old = "a\nb\nc\nd\ne\nf\ng\nh\n";
+		let new = "a\nb\nc\nd\nE\nf\ng\nh\n";
+		let diff = unified_diff(old, new, 1);
+
+		assert_eq!(diff, vec!["@@ -4,3 +4,3 @@", " d", "-e", "+E", " f"]);
+	}
+
+	#[test]
+	fn identical_texts_have_no_hunks() {
+		assert!(unified_diff("same\n", "same\n", 3).is_empty());
+	}
 }

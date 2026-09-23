@@ -26,13 +26,17 @@ use base64::Engine;
 use chrono::{NaiveDateTime, Utc};
 use log::{debug, info, warn};
 use path_clean::PathClean;
-use rbx_dom_weak::{types::Variant, ustr};
+use rbx_dom_weak::{
+	types::{Ref, Variant},
+	ustr,
+};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
-	collections::{BTreeMap, BTreeSet, HashMap},
+	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
 	fs,
 	path::{Path, PathBuf},
+	sync::Mutex,
 	time::Duration,
 };
 
@@ -50,6 +54,7 @@ use crate::{
 		snapshot::Snapshot,
 		tree::Tree,
 	},
+	lock,
 	middleware::dir,
 	server::{
 		ws::frames::{self, codes, OpError, ServerFrame},
@@ -449,15 +454,193 @@ fn to_snapshot(node: &PulledNode, sources: &HashMap<String, Vec<u8>>) -> Result<
 
 // Keep Studio: staging, fencing, swapping
 
-/// Studio-first apply options (Design §7.0): the promptless code-scope
-/// auto-apply overlays unclaimed live files into the staged root (disk-only
-/// and out-of-projection files survive the swap in place) and preserves the
-/// disk originals of `differs` entries into the review store before the swap
+/// Studio-first apply options (Design §7.0, three-way since the sync base):
+/// what the connect decided per path, applied under the fence right before
+/// the swap. Studio's projection is staged whole; these adjust it where disk
+/// wins and keep a copy of every disk original that is about to lose
 #[derive(Debug, Default)]
 pub struct StudioFirstOptions {
-	/// Absolute live file → absolute preservation target (inside the review
-	/// directory). Copied under the fence, right before the swap
-	pub preserve: HashMap<PathBuf, PathBuf>,
+	/// The workspace the live paths are relative to, and the directory their
+	/// preserved originals are copied into (same relative layout)
+	pub workspace_dir: PathBuf,
+	pub staging: PathBuf,
+	/// Live files whose disk original must be preserved before Studio's
+	/// version replaces them
+	pub preserve: Vec<PathBuf>,
+	/// Disk-only live paths (file or directory): preserved too, and reported
+	/// when Studio's staged projection turns out to claim the same path
+	pub disk_only: Vec<PathBuf>,
+	/// Disk wins over a differing instance: its live files (File/Data
+	/// entries) replace the staged ones, provided both sides lay the instance
+	/// out as the same files
+	pub keep_live: Vec<(Ref, Vec<PathBuf>)>,
+	/// Disk deleted a Studio-only instance and wins: its staged files never
+	/// reach disk
+	pub drop_staged: Vec<Ref>,
+	pub report: Mutex<StudioFirstReport>,
+}
+
+impl StudioFirstOptions {
+	/// Where the preserved original of `live` goes
+	pub fn preserved_path(&self, live: &Path) -> PathBuf {
+		self.staging
+			.join(live.strip_prefix(&self.workspace_dir).unwrap_or(live))
+	}
+}
+
+/// What the fenced apply did with the options, read back by the connect
+#[derive(Debug, Default)]
+pub struct StudioFirstReport {
+	/// Every live path whose original was copied into staging
+	pub preserved: HashSet<PathBuf>,
+	/// Disk-only paths Studio's projection also claims: their live bytes did
+	/// not survive the swap, so they are neither "only on disk" nor pushable
+	pub claimed: HashSet<PathBuf>,
+	/// `keep_live` instances laid out differently on the two sides: Studio's
+	/// version took the path and the live originals were preserved instead
+	pub demoted: Vec<Ref>,
+}
+
+/// Copies a file or a whole directory to `target`, creating parents
+fn preserve_path(live: &Path, target: &Path) -> Result<(), String> {
+	let copy = || -> std::io::Result<()> {
+		if let Some(parent) = target.parent() {
+			fs::create_dir_all(parent)?;
+		}
+
+		if live.is_dir() {
+			copy_dir(live, target)
+		} else {
+			fs::copy(live, target).map(|_| ())
+		}
+	};
+
+	copy().map_err(|err| format!("failed to preserve {} into the backlog staging: {err}", live.display()))
+}
+
+fn copy_dir(source: &Path, target: &Path) -> std::io::Result<()> {
+	fs::create_dir_all(target)?;
+
+	for entry in fs::read_dir(source)? {
+		let entry = entry?;
+		let to = target.join(entry.file_name());
+
+		if entry.file_type()?.is_dir() {
+			copy_dir(&entry.path(), &to)?;
+		} else {
+			fs::copy(entry.path(), &to)?;
+		}
+	}
+
+	Ok(())
+}
+
+/// The File/Data paths an instance is written as, in `tree`
+pub fn file_entries(tree: &Tree, id: Ref) -> Vec<PathBuf> {
+	tree.get_meta(id)
+		.map(|meta| {
+			meta.source
+				.relevant()
+				.iter()
+				.filter_map(|entry| match entry {
+					SourceEntry::File(path) | SourceEntry::Data(path) => Some(path.clone()),
+					_ => None,
+				})
+				.collect()
+		})
+		.unwrap_or_default()
+}
+
+/// Applies the three-way adjustments to one staged root. Runs under the
+/// fence with the VFS paused, before the overlay
+fn prepare_stage(
+	options: &StudioFirstOptions,
+	live_dir: &Path,
+	stage_root: &Path,
+	scratch: &Tree,
+) -> Result<(), String> {
+	let mut report = lock!(options.report);
+
+	// Disk originals first: nothing below may touch the live tree, but the
+	// copies have to exist before the swap moves it away
+	for live in options.preserve.iter().chain(&options.disk_only) {
+		if live.starts_with(live_dir) && live.exists() {
+			preserve_path(live, &options.preserved_path(live))?;
+			report.preserved.insert(live.clone());
+		}
+	}
+
+	for live in &options.disk_only {
+		if let Ok(relative) = live.strip_prefix(live_dir) {
+			if stage_root.join(relative).exists() {
+				report.claimed.insert(live.clone());
+			}
+		}
+	}
+
+	for (id, live_files) in &options.keep_live {
+		let live_files: Vec<&PathBuf> = live_files.iter().filter(|path| path.starts_with(live_dir)).collect();
+
+		if live_files.is_empty() {
+			continue;
+		}
+
+		let live_relative: BTreeSet<&Path> = live_files
+			.iter()
+			.filter_map(|path| path.strip_prefix(live_dir).ok())
+			.collect();
+
+		let staged = file_entries(scratch, *id);
+		let staged_relative: BTreeSet<&Path> = staged
+			.iter()
+			.filter_map(|path| path.strip_prefix(stage_root).ok())
+			.collect();
+
+		if live_relative == staged_relative && live_files.iter().all(|path| path.is_file()) {
+			for relative in live_relative {
+				fs::copy(live_dir.join(relative), stage_root.join(relative))
+					.map_err(|err| format!("failed to keep the disk version of {}: {err}", relative.display()))?;
+			}
+		} else {
+			// Studio lays the instance out differently (a child only one side
+			// has, a sidecar only one side writes): Studio's version takes the
+			// path and the disk original is kept instead of pushed
+			for live in live_files {
+				if live.exists() {
+					preserve_path(live, &options.preserved_path(live))?;
+					report.preserved.insert(live.clone());
+				}
+			}
+
+			report.demoted.push(*id);
+		}
+	}
+
+	for id in &options.drop_staged {
+		let Some(meta) = scratch.get_meta(*id) else {
+			continue;
+		};
+
+		for entry in meta.source.relevant() {
+			let path = entry.path();
+
+			if !path.starts_with(stage_root) || path == stage_root {
+				continue;
+			}
+
+			let removed = if path.is_dir() {
+				fs::remove_dir_all(path)
+			} else if path.exists() {
+				fs::remove_file(path)
+			} else {
+				Ok(())
+			};
+
+			removed.map_err(|err| format!("failed to drop the staged {}: {err}", path.display()))?;
+		}
+	}
+
+	Ok(())
 }
 
 /// Carries unclaimed live entries forward into the staged root (Design §7.0):
@@ -492,6 +675,16 @@ fn overlay_unclaimed(live: &Path, stage: &Path) -> Result<(), String> {
 	}
 
 	walk(live, stage).map_err(|err| format!("failed to overlay unclaimed disk files into the stage: {err}"))
+}
+
+/// Whether two paths hold the same bytes (files) or the same file tree
+/// (directories). Anything unreadable counts as different
+pub fn same_contents(a: &Path, b: &Path) -> bool {
+	match (a.is_dir(), b.is_dir()) {
+		(true, true) => matches!((fingerprint_dir(a), fingerprint_dir(b)), (Ok(a), Ok(b)) if a == b),
+		(false, false) => matches!((fs::read(a), fs::read(b)), (Ok(a), Ok(b)) if a == b),
+		_ => false,
+	}
 }
 
 /// SHA-256 of every file under `dir`, keyed by relative path — the fence
@@ -532,7 +725,7 @@ fn materialize_stage(
 	pulled: &PulledNode,
 	sources: &HashMap<String, Vec<u8>>,
 	context: &Context,
-) -> Result<(), String> {
+) -> Result<Tree, String> {
 	let stage_vfs = Vfs::new(false);
 
 	dir::write_dir(stage_root, &stage_vfs).map_err(|err| format!("failed to create the staging root: {err}"))?;
@@ -556,7 +749,7 @@ fn materialize_stage(
 			.map_err(|err| format!("failed to stage {}: {err:#}", child.name))?;
 	}
 
-	Ok(())
+	Ok(scratch)
 }
 
 /// Everything needed to apply one root, resolved from the live tree up front
@@ -697,7 +890,7 @@ async fn apply_root(
 	fs::create_dir_all(transfer_dir.join(STAGE_DIR))
 		.map_err(|err| format!("failed to create the staging directory: {err}"))?;
 
-	materialize_stage(
+	let scratch = materialize_stage(
 		&stage_root,
 		root_name,
 		&target.class,
@@ -723,26 +916,9 @@ async fn apply_root(
 		}
 
 		if let Some(options) = studio_first {
-			// Preserve the disk originals of `differs` entries under this
-			// root into the review store — the fence just proved these bytes
-			// are the generation the comparison ran against (Design §7.0)
-			for (live_path, preserve_target) in &options.preserve {
-				if !live_path.starts_with(&target.live_dir) || !live_path.is_file() {
-					continue;
-				}
-
-				if let Some(parent) = preserve_target.parent() {
-					fs::create_dir_all(parent)
-						.map_err(|err| format!("failed to create the review preservation directory: {err}"))?;
-				}
-
-				fs::copy(live_path, preserve_target).map_err(|err| {
-					format!(
-						"failed to preserve {} into the review store: {err}",
-						live_path.display()
-					)
-				})?;
-			}
+			// The fence just proved these bytes are the generation the
+			// comparison ran against (Design §7.0)
+			prepare_stage(options, &target.live_dir, &stage_root, &scratch)?;
 
 			// Disk-only and out-of-projection files stay on the live disk:
 			// the stage is overlaid so the swap carries them forward instead

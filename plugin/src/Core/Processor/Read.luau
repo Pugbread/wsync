@@ -80,10 +80,31 @@ function ReadProcessor.new(tree)
 	local excluded: { [Instance]: boolean } = {}
 	setmetatable(excluded, { __mode = "k" })
 
+	-- Children the write processor moved into a replacement instance during a
+	-- class swap (WriteProcessor:swapInstance), each keyed to the parent it
+	-- was moved to. Their removal from the old instance is the swap's own
+	-- echo, not a Studio edit (`expectMove`). Weakly keyed like `excluded`
+	local moving: { [Instance]: Instance } = {}
+	setmetatable(moving, { __mode = "k" })
+
 	return setmetatable({
 		tree = tree,
 		excluded = excluded,
+		moving = moving,
 	}, ReadProcessor)
+end
+
+--- The write processor is about to move `instance` under `parent` while it
+--- swaps that instance's parent for one of a new class (a Folder gaining an
+--- `init.luau`, a script changing suffix). Studio reports the move as the
+--- child leaving the old instance, and read as an edit that is a deletion —
+--- the child's files would go from disk, and nothing would bring them back,
+--- because the swap moves children before the new instance is watched. The
+--- mark is consumed by the first removal seen for the instance, and only
+--- suppresses it while the instance still sits under `parent`: a real delete
+--- or move that happens to come first is never swallowed.
+function ReadProcessor:expectMove(instance: Instance, parent: Instance)
+	self.moving[instance] = parent
 end
 
 --- Does this instance carry the `--!ignoresync` directive (SyncScope)? Only
@@ -430,6 +451,19 @@ end
 
 function ReadProcessor:onRemove(instance: Instance): Types.Ref?
 	Log.trace("Detected removal of", instance)
+
+	local movedTo = self.moving[instance]
+
+	if movedTo ~= nil then
+		self.moving[instance] = nil
+
+		if instance.Parent == movedTo then
+			-- A class swap's own move (`expectMove`): the instance keeps its
+			-- ref under the replacement, nothing changed on disk
+			Log.trace("Instance moved by a class swap. Skipping..")
+			return nil
+		end
+	end
 
 	local id = self.tree:getId(instance)
 

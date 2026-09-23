@@ -18,6 +18,6 @@
     "`--default` restores the named setting to its built-in value, or every setting when no name is given.",
     "`--export <path>` writes the fully resolved configuration (defaults merged with global and workspace overrides) to the given file instead of reading or writing a single key.",
     "Unknown setting names and values that fail the setting's type are rejected before anything is written.",
-    "WSync-specific settings beyond the inherited set are `syncback_model_json` (false), `conflict_engine` (true), `compat_argon` (false), `port_scan_max` (7990), and `auto_open_app_modal` (true). `port` defaults to 7978 and `share_stats` defaults to false — telemetry is strictly opt-in."
+    "WSync-specific settings beyond the inherited set are `syncback_model_json` (false), `conflict_engine` (true), `compat_argon` (false), `port_scan_max` (7990), `auto_open_app_modal` (true), and `backlog_ttl_hours` (24 — hours a backlog entry is kept; pinned entries never expire). `port` defaults to 7978 and `share_stats` defaults to false — telemetry is strictly opt-in."
   ]
 }

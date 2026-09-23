@@ -31,10 +31,14 @@ local Processor = {}
 Processor.__index = Processor
 
 function Processor.new(tree, transport)
+	local read = ReadProcessor.new(tree)
+
 	local self = {
 		tree = tree,
-		read = ReadProcessor.new(tree),
-		write = WriteProcessor.new(tree, transport),
+		read = read,
+		-- The write processor announces a class swap's moves to the read
+		-- processor, so syncback does not push them back as deletions
+		write = WriteProcessor.new(tree, transport, read),
 	}
 
 	return setmetatable(self, Processor)
@@ -276,15 +280,29 @@ end
 --- The marker itself is what the daemon sent, so the untracking is silent:
 --- no removal goes back, the file just becomes a stale copy (disk-only at
 --- the next connect, where Studio-first moves it to the backlog).
+---
+--- Both passes are isolated per change, like the write processor's own
+--- (WriteProcessor:applyChanges): one arrival that cannot be checked is
+--- logged and left alone, and the batch — and the session — carry on.
 function Processor:applyChanges(changes: Types.Changes, initial: boolean?)
 	self.write:applyChanges(changes, initial)
 
+	local function excludeArrivals(id: Types.Ref)
+		local ok, err = pcall(function()
+			self.read:excludeArrivals(self.tree:getInstance(id))
+		end)
+
+		if not ok then
+			Log.warn("Failed to check an arrival from the server for exclusion markers:", id, err)
+		end
+	end
+
 	for _, snapshot in changes.additions do
-		self.read:excludeArrivals(self.tree:getInstance(snapshot.id))
+		excludeArrivals(snapshot.id)
 	end
 
 	for _, snapshot in changes.updates do
-		self.read:excludeArrivals(self.tree:getInstance(snapshot.id))
+		excludeArrivals(snapshot.id)
 	end
 end
 

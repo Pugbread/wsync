@@ -29,7 +29,7 @@ use serde_json::{json, Value};
 use std::{fs, path::PathBuf};
 
 use crate::{
-	cli::client::{clip, field, human_value, kind_of, parse_literal, print_ok, Client, Targeting},
+	cli::client::{clip, field, human_value, kind_of, parse_literal, path_arg, print_ok, Client, Targeting},
 	cli::{source_input::SourceInput, value_schema},
 	wsync_info, wsync_warn,
 };
@@ -46,6 +46,10 @@ pub struct Set {
 	targeting: Targeting,
 
 	/// Studio path, `/`-separated (e.g. `Workspace/Camera`)
+	#[arg(value_name = "STUDIO-PATH", conflicts_with = "batch")]
+	positional_path: Option<String>,
+
+	/// Studio path (the named form of the positional path)
 	#[arg(long, value_name = "STUDIO-PATH", conflicts_with = "batch")]
 	path: Option<String>,
 
@@ -66,11 +70,6 @@ pub struct Set {
 	/// pre-flight guards)
 	#[arg(long = "keep-going")]
 	keep_going: bool,
-
-	/// Bracket the writes in a named change-history waypoint, so one Studio
-	/// undo reverses the batch
-	#[arg(long, value_name = "NAME")]
-	waypoint: Option<String>,
 
 	/// Allow a raw `Parent` assignment instead of refusing and pointing at
 	/// `wsync mv` (single writes only — a batch has no escape)
@@ -105,9 +104,10 @@ impl Set {
 
 	/// The single-write path: exactly one `set` op (set.json's first form)
 	fn apply_single(self) -> Result<()> {
-		let (Some(path), Some(prop), Some(literal)) = (&self.path, &self.prop, &self.value) else {
+		let path = path_arg(self.path.clone(), self.positional_path.clone())?;
+		let (Some(path), Some(prop), Some(literal)) = (&path, &self.prop, &self.value) else {
 			bail!(
-				"`{}` needs --path, --prop and --value together, or --batch <file> instead",
+				"`{}` needs a Studio path (positional or --path), --prop and --value together, or --batch <file> instead",
 				"wsync set".bold()
 			);
 		};
@@ -133,17 +133,6 @@ impl Set {
 		}
 
 		let client = Client::connect(&self.targeting)?;
-
-		// The `set` op carries no waypoint name (only `set_batch` does), so a
-		// single write gets the name as a change-history marker *before* the
-		// write: the plugin already seals every mutation into its own
-		// `WSync: set "<path>"` waypoint, so one undo still reverses it — the
-		// marker just gives the boundary the caller's own label. Best-effort,
-		// exactly like Ro-Sync: a dropped marker costs undo labelling, never
-		// the write
-		if let Some(name) = &self.waypoint {
-			mark_waypoint(&client, name);
-		}
 
 		let args = json!({
 			"path": path,
@@ -264,17 +253,13 @@ impl Set {
 	/// writes cannot reach here — [`Self::read_batch`] refuses them
 	/// unconditionally
 	fn apply_batch(&self, writes: Vec<BatchWrite>) -> Result<()> {
-		let mut args = json!({
+		let args = json!({
 			"writes": writes
 				.iter()
 				.map(|write| json!({ "path": write.path, "prop": write.prop, "value": write.value }))
 				.collect::<Vec<_>>(),
 			"keepGoing": self.keep_going,
 		});
-
-		if let Some(name) = &self.waypoint {
-			args["waypoint"] = json!(name);
-		}
 
 		let client = Client::connect(&self.targeting)?;
 		let envelope = client.request("set_batch", args)?;
@@ -405,15 +390,6 @@ fn screen_name(name: &str, location: &str) -> Result<()> {
 	Ok(())
 }
 
-/// Best-effort change-history marker for a single `--waypoint` write
-fn mark_waypoint(client: &Client, name: &str) {
-	match client.request("waypoint", json!({ "name": name })) {
-		Ok(envelope) if envelope.ok => {}
-		Ok(envelope) => wsync_warn!("Could not set the `{name}` waypoint: {}", envelope.error_message()),
-		Err(err) => wsync_warn!("Could not set the `{name}` waypoint: {err}"),
-	}
-}
-
 /// Per-entry batch results as a table, joined positionally with the writes
 /// that produced them
 fn report_batch(writes: &[BatchWrite], results: &[Value], value: &Value) {
@@ -480,13 +456,18 @@ fn report_batch(writes: &[BatchWrite], results: &[Value], value: &Value) {
 /// Create a new instance under a live Studio parent
 #[derive(Parser)]
 #[command(after_help = value_schema::help())]
+#[command(group(clap::ArgGroup::new("studio_path").required(true).multiple(true).args(["path", "positional_path"])))]
 pub struct New {
 	#[command(flatten)]
 	targeting: Targeting,
 
 	/// Parent Studio path, `/`-separated
+	#[arg(value_name = "PARENT-PATH")]
+	positional_path: Option<String>,
+
+	/// Parent Studio path (the named form of the positional path)
 	#[arg(long, value_name = "PARENT-PATH")]
-	path: String,
+	path: Option<String>,
 
 	/// Class to instantiate (e.g. `Part`, `RemoteEvent`)
 	#[arg(long, value_name = "CLASS")]
@@ -540,7 +521,9 @@ impl New {
 			}
 		}
 
-		let mut args = json!({ "path": self.path, "class": self.class });
+		let path =
+			path_arg(self.path.clone(), self.positional_path.clone())?.context("A parent Studio path is required")?;
+		let mut args = json!({ "path": path, "class": self.class });
 
 		if let Some(name) = &self.name {
 			args["name"] = json!(name);
@@ -575,13 +558,18 @@ impl New {
 
 /// Destroy a live Studio instance
 #[derive(Parser)]
+#[command(group(clap::ArgGroup::new("studio_path").required(true).multiple(true).args(["path", "positional_path"])))]
 pub struct Rm {
 	#[command(flatten)]
 	targeting: Targeting,
 
 	/// Studio path, `/`-separated
+	#[arg(value_name = "STUDIO-PATH")]
+	positional_path: Option<String>,
+
+	/// Studio path (the named form of the positional path)
 	#[arg(long, value_name = "STUDIO-PATH")]
-	path: String,
+	path: Option<String>,
 
 	/// Print machine-readable JSON
 	#[arg(long)]
@@ -590,8 +578,9 @@ pub struct Rm {
 
 impl Rm {
 	pub fn main(self) -> Result<()> {
+		let path = path_arg(self.path.clone(), self.positional_path.clone())?.context("A Studio path is required")?;
 		let client = Client::connect(&self.targeting)?;
-		let value = client.value("rm", json!({ "path": self.path }), self.raw)?;
+		let value = client.value("rm", json!({ "path": path }), self.raw)?;
 
 		if self.raw {
 			print_ok(&value);
@@ -599,12 +588,12 @@ impl Rm {
 			return Ok(());
 		}
 
-		let path = field(&value, "path");
+		let destroyed = field(&value, "path");
 
 		wsync_info!(
 			"Destroyed {} {}",
 			field(&value, "class").bold(),
-			if path.is_empty() { self.path.as_str() } else { path }.bold()
+			if destroyed.is_empty() { path.as_str() } else { destroyed }.bold()
 		);
 
 		Ok(())
@@ -721,13 +710,18 @@ enum AttrCommand {
 
 #[derive(Parser)]
 #[command(after_help = value_schema::help())]
+#[command(group(clap::ArgGroup::new("studio_path").required(true).multiple(true).args(["path", "positional_path"])))]
 struct AttrSet {
 	#[command(flatten)]
 	targeting: Targeting,
 
 	/// Studio path, `/`-separated
+	#[arg(value_name = "STUDIO-PATH")]
+	positional_path: Option<String>,
+
+	/// Studio path (the named form of the positional path)
 	#[arg(long, value_name = "STUDIO-PATH")]
-	path: String,
+	path: Option<String>,
 
 	/// Attribute name
 	#[arg(long, value_name = "ATTRIBUTE")]
@@ -744,13 +738,18 @@ struct AttrSet {
 }
 
 #[derive(Parser)]
+#[command(group(clap::ArgGroup::new("studio_path").required(true).multiple(true).args(["path", "positional_path"])))]
 struct AttrRm {
 	#[command(flatten)]
 	targeting: Targeting,
 
 	/// Studio path, `/`-separated
+	#[arg(value_name = "STUDIO-PATH")]
+	positional_path: Option<String>,
+
+	/// Studio path (the named form of the positional path)
 	#[arg(long, value_name = "STUDIO-PATH")]
-	path: String,
+	path: Option<String>,
 
 	/// Attribute name
 	#[arg(long, value_name = "ATTRIBUTE")]
@@ -762,13 +761,18 @@ struct AttrRm {
 }
 
 #[derive(Parser)]
+#[command(group(clap::ArgGroup::new("studio_path").required(true).multiple(true).args(["path", "positional_path"])))]
 struct AttrLs {
 	#[command(flatten)]
 	targeting: Targeting,
 
 	/// Studio path, `/`-separated
+	#[arg(value_name = "STUDIO-PATH")]
+	positional_path: Option<String>,
+
+	/// Studio path (the named form of the positional path)
 	#[arg(long, value_name = "STUDIO-PATH")]
-	path: String,
+	path: Option<String>,
 
 	/// Print machine-readable JSON
 	#[arg(long)]
@@ -787,11 +791,12 @@ impl Attr {
 
 impl AttrSet {
 	fn main(self) -> Result<()> {
+		let path = path_arg(self.path.clone(), self.positional_path.clone())?.context("A Studio path is required")?;
 		let input = parse_literal(&self.value);
 		value_schema::validate_cli(&input, self.raw)?;
 
 		let args = json!({
-			"path": self.path,
+			"path": path,
 			"name": self.name,
 			"value": input,
 		});
@@ -817,8 +822,9 @@ impl AttrSet {
 
 impl AttrRm {
 	fn main(self) -> Result<()> {
+		let path = path_arg(self.path.clone(), self.positional_path.clone())?.context("A Studio path is required")?;
 		let client = Client::connect(&self.targeting)?;
-		let args = json!({ "path": self.path, "name": self.name });
+		let args = json!({ "path": path, "name": self.name });
 		let value = client.value("rm_attr", args, self.raw)?;
 
 		if self.raw {
@@ -839,8 +845,9 @@ impl AttrRm {
 
 impl AttrLs {
 	fn main(self) -> Result<()> {
+		let path = path_arg(self.path.clone(), self.positional_path.clone())?.context("A Studio path is required")?;
 		let client = Client::connect(&self.targeting)?;
-		let value = client.value("attr_ls", json!({ "path": self.path }), self.raw)?;
+		let value = client.value("attr_ls", json!({ "path": path }), self.raw)?;
 
 		if self.raw {
 			print_ok(&value);
@@ -894,13 +901,18 @@ enum TagCommand {
 }
 
 #[derive(Parser)]
+#[command(group(clap::ArgGroup::new("studio_path").required(true).multiple(true).args(["path", "positional_path"])))]
 struct TagAdd {
 	#[command(flatten)]
 	targeting: Targeting,
 
 	/// Studio path, `/`-separated
+	#[arg(value_name = "STUDIO-PATH")]
+	positional_path: Option<String>,
+
+	/// Studio path (the named form of the positional path)
 	#[arg(long, value_name = "STUDIO-PATH")]
-	path: String,
+	path: Option<String>,
 
 	/// Tag name
 	#[arg(long, value_name = "TAG")]
@@ -912,13 +924,18 @@ struct TagAdd {
 }
 
 #[derive(Parser)]
+#[command(group(clap::ArgGroup::new("studio_path").required(true).multiple(true).args(["path", "positional_path"])))]
 struct TagRm {
 	#[command(flatten)]
 	targeting: Targeting,
 
 	/// Studio path, `/`-separated
+	#[arg(value_name = "STUDIO-PATH")]
+	positional_path: Option<String>,
+
+	/// Studio path (the named form of the positional path)
 	#[arg(long, value_name = "STUDIO-PATH")]
-	path: String,
+	path: Option<String>,
 
 	/// Tag name
 	#[arg(long, value_name = "TAG")]
@@ -940,8 +957,9 @@ impl Tag {
 
 impl TagAdd {
 	fn main(self) -> Result<()> {
+		let path = path_arg(self.path.clone(), self.positional_path.clone())?.context("A Studio path is required")?;
 		let client = Client::connect(&self.targeting)?;
-		let args = json!({ "path": self.path, "tag": self.tag });
+		let args = json!({ "path": path, "tag": self.tag });
 		let value = client.value("add_tag", args, self.raw)?;
 
 		if self.raw {
@@ -974,8 +992,9 @@ impl TagAdd {
 
 impl TagRm {
 	fn main(self) -> Result<()> {
+		let path = path_arg(self.path.clone(), self.positional_path.clone())?.context("A Studio path is required")?;
 		let client = Client::connect(&self.targeting)?;
-		let args = json!({ "path": self.path, "tag": self.tag });
+		let args = json!({ "path": path, "tag": self.tag });
 		let value = client.value("rm_tag", args, self.raw)?;
 
 		if self.raw {
@@ -1001,13 +1020,18 @@ impl TagRm {
 /// Invoke a method on a live Studio instance
 #[derive(Parser)]
 #[command(after_help = value_schema::help())]
+#[command(group(clap::ArgGroup::new("studio_path").required(true).multiple(true).args(["path", "positional_path"])))]
 pub struct Call {
 	#[command(flatten)]
 	targeting: Targeting,
 
 	/// Studio path, `/`-separated
+	#[arg(value_name = "STUDIO-PATH")]
+	positional_path: Option<String>,
+
+	/// Studio path (the named form of the positional path)
 	#[arg(long, value_name = "STUDIO-PATH")]
-	path: String,
+	path: Option<String>,
 
 	/// Method to invoke
 	#[arg(long, value_name = "METHOD")]
@@ -1025,6 +1049,8 @@ pub struct Call {
 
 impl Call {
 	pub fn main(self) -> Result<()> {
+		let path = path_arg(self.path.clone(), self.positional_path.clone())?.context("A Studio path is required")?;
+
 		// Validated before connecting: a malformed --args never reaches a
 		// method that may have side effects
 		let call_args = match &self.args {
@@ -1041,7 +1067,7 @@ impl Call {
 			None => None,
 		};
 
-		let mut args = json!({ "path": self.path, "method": self.method });
+		let mut args = json!({ "path": path, "method": self.method });
 
 		if let Some(call_args) = call_args {
 			value_schema::validate_cli(&call_args, self.raw)?;
@@ -1075,6 +1101,12 @@ pub struct Eval {
 	#[command(flatten)]
 	source: SourceInput,
 
+	/// Make `require` run each ModuleScript's editor text (the draft WSync
+	/// wrote) instead of its committed `.Source`, transitively; nothing is
+	/// committed
+	#[arg(long)]
+	drafts: bool,
+
 	/// Print machine-readable JSON
 	#[arg(long)]
 	raw: bool,
@@ -1083,8 +1115,23 @@ pub struct Eval {
 impl Eval {
 	pub fn main(self) -> Result<()> {
 		let source = self.source.read()?;
+		let mut args = json!({ "source": source });
+
+		if self.drafts {
+			args["drafts"] = json!(true);
+		}
+
 		let client = Client::connect(&self.targeting)?;
-		let value = client.value("eval", json!({ "source": source }), self.raw)?;
+		let value = client.value("eval", args, self.raw)?;
+
+		// A plugin that predates `drafts` ignores the flag and runs the
+		// committed sources; say so rather than let the result pass as a
+		// draft run
+		if self.drafts && value.get("drafts").is_none() {
+			wsync_warn!(
+				"This Studio plugin ignored --drafts, so `require` ran committed sources. Update the WSync plugin"
+			);
+		}
 
 		if self.raw {
 			print_ok(&value);
@@ -1093,6 +1140,25 @@ impl Eval {
 		}
 
 		print_results(&value, "eval");
+
+		if let Some(drafts) = value.get("drafts") {
+			let modules = drafts.get("modules").and_then(Value::as_u64).unwrap_or(0);
+			let from_editor: Vec<&str> = drafts
+				.get("fromEditor")
+				.and_then(Value::as_array)
+				.map(|paths| paths.iter().filter_map(Value::as_str).collect())
+				.unwrap_or_default();
+
+			if from_editor.is_empty() {
+				wsync_info!("--drafts: {modules} module(s) loaded; none had a draft differing from its Source");
+			} else {
+				wsync_info!(
+					"--drafts: {modules} module(s) loaded, {} from editor text: {}",
+					from_editor.len(),
+					from_editor.join(", ")
+				);
+			}
+		}
 
 		Ok(())
 	}

@@ -3,12 +3,14 @@
   "title": "wsync rm",
   "category": "Live writes",
   "description": "Destroys a live Studio instance.",
-  "usage": "wsync rm [--project <path>] [--port <port>] --path <studio-path> [--raw]",
+  "usage": "wsync rm [--project <path>] [--port <port>] (<studio-path> | --path <studio-path>) [--raw]",
   "examples": [
+    "wsync rm Workspace/Box --project .",
     "wsync rm --project . --path Workspace/Box"
   ],
   "notes": [
     "Calls `:Destroy()` through the plugin and records the write in `writes.log`.",
-    "Deletions that reach disk through syncback honor `move_to_bin`; force-overwrite and prune paths back removed trees up to `.wsync-backups/<timestamp>/` first."
+    "Deletions that reach disk through syncback honor `move_to_bin`; force-overwrite and prune paths back removed trees up to `.wsync-backups/<timestamp>/` first.",
+    "The Studio path is positional or `--path` — every single-instance command takes both forms; passing both is accepted only when they name the same path."
   ]
 }

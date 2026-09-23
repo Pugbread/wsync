@@ -23,6 +23,7 @@ pub async fn main(State(state): State<AppState>, request: MsgPack<AuthRequest>) 
 			// Stale-set rule (Design §7.2): the plugin going away
 			// invalidates any pending divergence set
 			state.divergence.invalidate("plugin unsubscribed");
+			state.sync_base.on_disconnect(state.core.tree().generation());
 		}
 
 		(StatusCode::OK, "Unsubscribed successfully").into_response()

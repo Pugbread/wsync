@@ -1,0 +1,19 @@
+{
+  "name": "verify",
+  "title": "wsync verify",
+  "category": "Live diagnostics",
+  "description": "Hashes every synced script on disk against Studio's editor text and lists mismatches, scripts missing on either side, duplicate siblings, double-init folders and other disk layout hazards, backlog-stuck paths, and unsaved editor drafts.",
+  "usage": "wsync verify [--project <path>] [--port <port>] [--no-wait] [--timeout <secs>] [--raw]",
+  "examples": [
+    "wsync verify --project .",
+    "wsync verify --project . --raw",
+    "wsync verify --project . --no-wait"
+  ],
+  "notes": [
+    "Runs the `wait-synced` barrier first so changes still in flight are not reported as drift; `--no-wait` skips it and `--timeout` bounds it.",
+    "Disk text is read through the sync engine's own VFS path and line-ending normalization; Studio text is `ScriptEditorService:GetEditorSource`, falling back to `Source`. Hashing happens in bounded chunks on the plugin.",
+    "Problem categories: content mismatch (with both sizes), missing in Studio, missing on disk, daemon behind disk (a file change the watcher never delivered), duplicate same-named siblings in Studio or in the daemon's projection, disk layout hazard errors from the same scanner `wsync doctor` runs (double-init folders, flat+folder pairs, reshape leftovers), and backlog-stuck paths — backlogged files rewritten on disk that never reached Studio. Editor drafts that differ from the committed Source and hazard warnings are informational.",
+    "Exits 0 only when every problem category is empty. `--raw` prints one JSON report with `clean`, `counts`, and one list per category (each capped, with `truncated` counts).",
+    "Needs a connected Studio plugin build that implements `verify_sources` and `verify_tree`."
+  ]
+}

@@ -18,6 +18,7 @@ use std::{path::PathBuf, time::Instant};
 use crate::{
 	cli::client::{human_value, print_json, Client, Envelope, Hello, Target, Targeting},
 	constants::PROTOCOL_VERSION,
+	core::hazards::{self, Severity},
 	ext::PathExt,
 	project::Project,
 	wsync_info, wsync_warn,
@@ -202,8 +203,13 @@ impl Status {
 		});
 		let stale = target.record.is_some() && hello.as_ref().is_none_or(|hello| !target.record_is_live(hello));
 
-		let plugin =
-			Client::open_probed(&target, hello.clone()).and_then(|client| client.request("version", json!({})).ok());
+		let client = Client::open_probed(&target, hello.clone());
+		let plugin = client
+			.as_ref()
+			.and_then(|client| client.request("version", json!({})).ok());
+		// Changes for Studio the daemon has not seen applied yet; `None` when
+		// no daemon answers or it predates `GET /sync/pending`
+		let outbound = client.as_ref().and_then(outbound_pending);
 
 		if self.raw {
 			print_json(&json!({
@@ -233,8 +239,10 @@ impl Status {
 					// what the plugin matches against when it auto-discovers
 					"gameId": hello.as_ref().and_then(|hello| hello.game_id),
 					"placeIds": hello.as_ref().map(|hello| hello.place_ids.clone()),
+					"safeMode": hello.as_ref().and_then(|hello| hello.safe_mode.clone()),
 				},
 				"plugin": plugin_json(plugin.as_ref()),
+				"outbound": outbound,
 				"sourcemap": { "present": sourcemap.exists(), "path": sourcemap.to_string() },
 				// `present` is the file on disk; `pending` now means "no daemon
 				// has reported an audit-log location" — the only state in which
@@ -289,6 +297,19 @@ impl Status {
 			),
 		}
 
+		if let Some(safe_mode) = hello.as_ref().and_then(|hello| hello.safe_mode.as_ref()) {
+			wsync_warn!(
+				"Safe mode: the previous daemon (PID {}) died applying a connect, so connects apply nothing{}. \
+				 Fix the cause, then `wsync daemon resume` and reconnect",
+				safe_mode.get("previousPid").and_then(Value::as_u64).unwrap_or(0),
+				safe_mode
+					.get("report")
+					.and_then(Value::as_str)
+					.map(|report| format!(" (last report: {report})"))
+					.unwrap_or_default()
+			);
+		}
+
 		match &plugin {
 			Some(envelope) if envelope.ok => println!(
 				"Plugin    connected (v{}, Studio {})",
@@ -305,6 +326,27 @@ impl Status {
 			),
 			Some(envelope) => println!("Plugin    not connected ({})", envelope.error_message()),
 			None => println!("Plugin    unknown (no daemon to ask)"),
+		}
+
+		if let Some(outbound) = &outbound {
+			let number = |key: &str| outbound.get(key).and_then(Value::as_u64).unwrap_or(0);
+			let events = number("unprocessedEvents");
+			let events = if events > 0 {
+				format!(", {events} file event(s) not processed yet")
+			} else {
+				String::new()
+			};
+
+			if outbound.pointer("/plugin/tracked").and_then(Value::as_bool) == Some(true) {
+				println!(
+					"Outbound  {} pending change(s): {} queued, {} sent but not confirmed by `wsync wait-synced`{events}",
+					number("total").to_string().bold(),
+					number("queuedChanges"),
+					number("unconfirmedChanges"),
+				);
+			} else if !events.is_empty() {
+				println!("Outbound  no WebSocket plugin to deliver to{events}");
+			}
 		}
 
 		println!(
@@ -329,6 +371,17 @@ impl Status {
 
 		Ok(())
 	}
+}
+
+/// `GET /sync/pending` — the pending-outbound counts (wait-synced.json)
+fn outbound_pending(client: &Client) -> Option<Value> {
+	let endpoint = client.get_endpoint("/sync/pending").ok()?;
+
+	if endpoint.unavailable() || endpoint.status >= 400 {
+		return None;
+	}
+
+	endpoint.json.and_then(|json| json.get("pending").cloned())
 }
 
 fn plugin_json(plugin: Option<&Envelope>) -> Value {
@@ -424,6 +477,8 @@ impl Doctor {
 	pub fn main(self) -> Result<()> {
 		let target = Target::resolve(&self.targeting)?;
 		let mut checks = Vec::new();
+		// The loaded project, for the disk-hazard scan
+		let mut loaded = None;
 
 		// 1. Project file
 		if !target.project_exists {
@@ -435,11 +490,14 @@ impl Doctor {
 			));
 		} else {
 			match Project::load(&target.project_path) {
-				Ok(project) => checks.push(Check::pass(
-					"project-file",
-					"Project file",
-					format!("{} parses ({})", target.project_path.to_string(), project.name),
-				)),
+				Ok(project) => {
+					checks.push(Check::pass(
+						"project-file",
+						"Project file",
+						format!("{} parses ({})", target.project_path.to_string(), project.name),
+					));
+					loaded = Some(project);
+				}
 				Err(err) => checks.push(Check::fail(
 					"project-file",
 					"Project file",
@@ -480,13 +538,20 @@ impl Doctor {
 				"Daemon reachable",
 				format!("v{} on port {} (PID {})", hello.version, target.port, hello.pid),
 			)),
-			None => checks.push(Check::fail(
+			// Offline is a state doctor reports on, not a failure of its
+			// own: the disk checks below still run and decide the exit code
+			None => checks.push(Check::warn(
 				"daemon",
 				"Daemon reachable",
-				format!("Nothing answers GET /hello on port {}", target.port),
+				format!(
+					"Nothing answers GET /hello on port {} — offline, only the disk checks ran",
+					target.port
+				),
 				"Start it with `wsync daemon start --project <path>`, or pass --port for a daemon on another port",
 			)),
 		}
+
+		let offline = hello.is_none();
 
 		// 4. Identity: the answering daemon serves this project, on the boot
 		// the record names
@@ -592,13 +657,52 @@ impl Doctor {
 			}
 		}
 
+		// 8. Disk hazards (core::hazards): read from the files alone, so they
+		// run with or without a daemon — offline they are the whole report
+		let scan = loaded.as_ref().map(hazards::scan);
+		let scope = if offline { "offline check" } else { "disk check" };
+
+		match &scan {
+			Some(scan) if scan.is_clean() => checks.push(Check::pass(
+				"disk-hazards",
+				"Disk hazards",
+				format!(
+					"{scope}: none in {} directories, {} files",
+					scan.directories, scan.files
+				),
+			)),
+			Some(scan) => {
+				let detail = format!(
+					"{scope}: {} error(s), {} warning(s) in {} directories, {} files",
+					scan.errors(),
+					scan.warnings(),
+					scan.directories,
+					scan.files
+				);
+				let advice = "Each hazard below names its fix";
+
+				checks.push(if scan.errors() > 0 {
+					Check::fail("disk-hazards", "Disk hazards", detail, advice)
+				} else {
+					Check::warn("disk-hazards", "Disk hazards", detail, advice)
+				});
+			}
+			None => checks.push(Check::skip(
+				"disk-hazards",
+				"Disk hazards",
+				"No loadable project to scan",
+			)),
+		}
+
 		let count = |status: &str| checks.iter().filter(|check| check.status == status).count();
 		let failures = count("fail");
 
 		if self.raw {
 			print_json(&json!({
 				"ok": failures == 0,
+				"offline": offline,
 				"checks": checks.iter().map(Check::to_json).collect::<Vec<_>>(),
+				"hazards": scan.as_ref().map(hazards::ScanReport::to_json),
 				"summary": {
 					"pass": count("pass"),
 					"warn": count("warn"),
@@ -619,6 +723,38 @@ impl Doctor {
 
 				if let Some(advice) = &check.advice {
 					println!("         {}", advice.dimmed());
+				}
+			}
+
+			if let Some(scan) = scan.as_ref().filter(|scan| !scan.is_clean()) {
+				println!();
+				println!(
+					"{}",
+					if offline {
+						"Offline checks — disk hazards (no daemon needed):"
+					} else {
+						"Disk hazards:"
+					}
+					.bold()
+				);
+
+				// Paths read relative to the project here; `--raw` keeps them
+				// absolute
+				let workspace = format!(
+					"{}{}",
+					target.project_path.get_parent().display(),
+					std::path::MAIN_SEPARATOR
+				);
+				let relative = |text: &str| text.replace(&workspace, "");
+
+				for hazard in &scan.hazards {
+					let kind = match hazard.severity {
+						Severity::Error => hazard.kind.as_str().red(),
+						Severity::Warning => hazard.kind.as_str().yellow(),
+					};
+
+					println!("  {kind:<18} {}", relative(&hazard.message));
+					println!("  {:<18} {}", "", format!("fix: {}", relative(&hazard.fix)).dimmed());
 				}
 			}
 		}

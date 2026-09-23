@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-	cli::client::{clip, field, human_value, print_json, Client, Targeting},
+	cli::client::{clip, field, human_value, path_arg, print_json, Client, Targeting},
 	config::Config,
 	docsgen::ProjectFacts,
 	ext::PathExt,
@@ -23,13 +23,18 @@ use crate::{
 
 /// Read an instance view, or one property, from the live Studio session
 #[derive(Parser)]
+#[command(group(clap::ArgGroup::new("studio_path").required(true).multiple(true).args(["path", "positional_path"])))]
 pub struct Get {
 	#[command(flatten)]
 	targeting: Targeting,
 
 	/// Studio path, `/`-separated (e.g. `Workspace/Camera`)
+	#[arg(value_name = "STUDIO-PATH")]
+	positional_path: Option<String>,
+
+	/// Studio path (the named form of the positional path)
 	#[arg(long, value_name = "STUDIO-PATH")]
-	path: String,
+	path: Option<String>,
 
 	/// Read only this property instead of the whole instance view
 	#[arg(long, value_name = "PROPERTY")]
@@ -42,11 +47,12 @@ pub struct Get {
 
 impl Get {
 	pub fn main(self) -> Result<()> {
+		let path = path_arg(self.path, self.positional_path)?.context("A Studio path is required")?;
 		let client = Client::connect(&self.targeting)?;
 
 		let args = match &self.prop {
-			Some(prop) => json!({ "path": self.path, "prop": prop }),
-			None => json!({ "path": self.path }),
+			Some(prop) => json!({ "path": path, "prop": prop }),
+			None => json!({ "path": path }),
 		};
 
 		let value = client.value("get", args, self.raw)?;
@@ -117,9 +123,13 @@ pub struct Ls {
 	#[command(flatten)]
 	targeting: Targeting,
 
-	/// Studio path; empty (the default) lists the DataModel services
-	#[arg(long, value_name = "STUDIO-PATH", default_value = "")]
-	path: String,
+	/// Studio path; omitted (the default) lists the DataModel services
+	#[arg(value_name = "STUDIO-PATH")]
+	positional_path: Option<String>,
+
+	/// Studio path (the named form of the positional path)
+	#[arg(long, value_name = "STUDIO-PATH")]
+	path: Option<String>,
 
 	/// Print machine-readable JSON
 	#[arg(long)]
@@ -128,8 +138,9 @@ pub struct Ls {
 
 impl Ls {
 	pub fn main(self) -> Result<()> {
+		let path = path_arg(self.path, self.positional_path)?.unwrap_or_default();
 		let client = Client::connect(&self.targeting)?;
-		let value = client.value("ls", json!({ "path": self.path }), self.raw)?;
+		let value = client.value("ls", json!({ "path": path }), self.raw)?;
 
 		if self.raw {
 			print_json(&value);
@@ -172,9 +183,13 @@ pub struct Tree {
 	#[command(flatten)]
 	targeting: Targeting,
 
-	/// Studio path; empty (the default) starts at the DataModel
-	#[arg(long, value_name = "STUDIO-PATH", default_value = "")]
-	path: String,
+	/// Studio path; omitted (the default) starts at the DataModel
+	#[arg(value_name = "STUDIO-PATH")]
+	positional_path: Option<String>,
+
+	/// Studio path (the named form of the positional path)
+	#[arg(long, value_name = "STUDIO-PATH")]
+	path: Option<String>,
 
 	/// How many levels below the root to walk (0 = the root only)
 	#[arg(long, default_value = "3")]
@@ -187,8 +202,9 @@ pub struct Tree {
 
 impl Tree {
 	pub fn main(self) -> Result<()> {
+		let path = path_arg(self.path, self.positional_path)?.unwrap_or_default();
 		let client = Client::connect(&self.targeting)?;
-		let value = client.value("tree", json!({ "path": self.path, "depth": self.depth }), self.raw)?;
+		let value = client.value("tree", json!({ "path": path, "depth": self.depth }), self.raw)?;
 
 		if self.raw {
 			print_json(&value);
@@ -261,13 +277,18 @@ fn print_node(node: &Value, prefix: &str, last: bool, root: bool) {
 
 /// Print inspectable live Studio properties for one instance
 #[derive(Parser)]
+#[command(group(clap::ArgGroup::new("studio_path").required(true).multiple(true).args(["path", "positional_path"])))]
 pub struct Props {
 	#[command(flatten)]
 	targeting: Targeting,
 
 	/// Studio path, `/`-separated
+	#[arg(value_name = "STUDIO-PATH")]
+	positional_path: Option<String>,
+
+	/// Studio path (the named form of the positional path)
 	#[arg(long, value_name = "STUDIO-PATH")]
-	path: String,
+	path: Option<String>,
 
 	/// Print machine-readable JSON
 	#[arg(long)]
@@ -276,8 +297,9 @@ pub struct Props {
 
 impl Props {
 	pub fn main(self) -> Result<()> {
+		let path = path_arg(self.path, self.positional_path)?.context("A Studio path is required")?;
 		let client = Client::connect(&self.targeting)?;
-		let value = client.value("props", json!({ "path": self.path }), self.raw)?;
+		let value = client.value("props", json!({ "path": path }), self.raw)?;
 
 		if self.raw {
 			print_json(&value);

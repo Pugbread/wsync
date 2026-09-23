@@ -20,6 +20,23 @@ end
 function Tree:insertInstance(instance: Instance, id: Types.Ref, meta: Types.Meta)
 	local strId = buffer.tostring(id)
 
+	-- One instance, one id: re-pairing (a rehydrate after the daemon re-read
+	-- its tree) may hand an already-tracked instance a new id, or an id to a
+	-- different instance. The stale half of either pairing must go, or a
+	-- later removal by the old id would take the instance down with it
+	local previousId = self.idMap[instance]
+
+	if previousId ~= nil and previousId ~= strId then
+		self.instanceMap[previousId] = nil
+		self.metaMap[previousId] = nil
+	end
+
+	local previousInstance = self.instanceMap[strId]
+
+	if previousInstance ~= nil and previousInstance ~= instance then
+		self.idMap[previousInstance] = nil
+	end
+
 	self.instanceMap[strId] = instance
 	self.idMap[instance] = strId
 

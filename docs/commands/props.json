@@ -3,13 +3,14 @@
   "title": "wsync props",
   "category": "Live inspection",
   "description": "Prints inspectable live Studio properties for one instance.",
-  "usage": "wsync props --path <studio-path> [--project <path>] [--port <port>] [--raw]",
+  "usage": "wsync props (<studio-path> | --path <studio-path>) [--project <path>] [--port <port>] [--raw]",
   "examples": [
-    "wsync props --path Workspace/Baseplate",
+    "wsync props Workspace/Baseplate",
     "wsync props --path ReplicatedStorage/Client/UIController --raw"
   ],
   "notes": [
-    "This is a focused view over `wsync get --path <path>`.",
-    "`Ref`-typed and `SharedString` properties are not encodable and are omitted."
+    "This is a focused view over `wsync get <path>`.",
+    "`Ref`-typed and `SharedString` properties are not encodable and are omitted.",
+    "The Studio path is positional or `--path` — every single-instance command takes both forms; passing both is accepted only when they name the same path."
   ]
 }

@@ -17,7 +17,7 @@ use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-use crate::cli::client::kind_of;
+use crate::cli::client::{kind_of, path_arg};
 
 /// Build a read-only JSON plan for a mutating command without executing it
 #[derive(Parser)]
@@ -45,7 +45,7 @@ impl Plan {
 		let plan = match self.command {
 			PlanCommand::Set(command) => command.plan()?,
 			PlanCommand::New(command) => command.plan()?,
-			PlanCommand::Rm(command) => command.plan(),
+			PlanCommand::Rm(command) => command.plan()?,
 			PlanCommand::Mv(command) => command.plan(),
 			PlanCommand::Resolve(command) => command.plan()?,
 		};
@@ -57,10 +57,15 @@ impl Plan {
 }
 
 #[derive(Parser)]
+#[command(group(clap::ArgGroup::new("studio_path").required(true).multiple(true).args(["path", "positional_path"])))]
 struct PlanSet {
 	/// Studio path, `/`-separated
+	#[arg(value_name = "STUDIO-PATH")]
+	positional_path: Option<String>,
+
+	/// Studio path (the named form of the positional path)
 	#[arg(long, value_name = "STUDIO-PATH")]
-	path: String,
+	path: Option<String>,
 
 	/// Property name
 	#[arg(long, value_name = "PROPERTY")]
@@ -73,6 +78,8 @@ struct PlanSet {
 
 impl PlanSet {
 	fn plan(self) -> Result<Value> {
+		let path = path_arg(self.path.clone(), self.positional_path.clone())?.context("A Studio path is required")?;
+
 		// The same codec `wsync set` applies: a JSON literal, with bare text
 		// falling back to a string — so the plan and the execution agree on
 		// what the value will be
@@ -90,13 +97,13 @@ impl PlanSet {
 
 		Ok(plan_record(
 			"set",
-			json!({ "path": self.path, "prop": self.prop, "value": value }),
+			json!({ "path": path, "prop": self.prop, "value": value }),
 			&["studio"],
 			&["daemon", "studio-plugin"],
 			risks,
 			format!(
 				"wsync set --path {} --prop {} --value {}",
-				shell_quote(&self.path),
+				shell_quote(&path),
 				shell_quote(&self.prop),
 				shell_quote(&self.value)
 			),
@@ -105,10 +112,15 @@ impl PlanSet {
 }
 
 #[derive(Parser)]
+#[command(group(clap::ArgGroup::new("studio_path").required(true).multiple(true).args(["path", "positional_path"])))]
 struct PlanNew {
 	/// Parent Studio path
+	#[arg(value_name = "PARENT-PATH")]
+	positional_path: Option<String>,
+
+	/// Parent Studio path (the named form of the positional path)
 	#[arg(long, value_name = "PARENT-PATH")]
-	path: String,
+	path: Option<String>,
 
 	/// Class to instantiate
 	#[arg(long, value_name = "CLASS")]
@@ -125,6 +137,7 @@ struct PlanNew {
 
 impl PlanNew {
 	fn plan(self) -> Result<Value> {
+		let path = path_arg(self.path, self.positional_path)?.context("A parent Studio path is required")?;
 		let props = match self.props.as_deref() {
 			Some(text) => {
 				let parsed: Value =
@@ -144,7 +157,7 @@ impl PlanNew {
 
 		let mut command = format!(
 			"wsync new --path {} --class {}",
-			shell_quote(&self.path),
+			shell_quote(&path),
 			shell_quote(&self.class)
 		);
 
@@ -158,7 +171,7 @@ impl PlanNew {
 
 		Ok(plan_record(
 			"new",
-			json!({ "parentPath": self.path, "class": self.class, "name": self.name, "props": props }),
+			json!({ "parentPath": path, "class": self.class, "name": self.name, "props": props }),
 			&["studio"],
 			&["daemon", "studio-plugin"],
 			Vec::new(),
@@ -168,22 +181,29 @@ impl PlanNew {
 }
 
 #[derive(Parser)]
+#[command(group(clap::ArgGroup::new("studio_path").required(true).multiple(true).args(["path", "positional_path"])))]
 struct PlanRm {
 	/// Studio path, `/`-separated
+	#[arg(value_name = "STUDIO-PATH")]
+	positional_path: Option<String>,
+
+	/// Studio path (the named form of the positional path)
 	#[arg(long, value_name = "STUDIO-PATH")]
-	path: String,
+	path: Option<String>,
 }
 
 impl PlanRm {
-	fn plan(self) -> Value {
-		plan_record(
+	fn plan(self) -> Result<Value> {
+		let path = path_arg(self.path, self.positional_path)?.context("A Studio path is required")?;
+
+		Ok(plan_record(
 			"rm",
-			json!({ "path": self.path }),
+			json!({ "path": path }),
 			&["studio"],
 			&["daemon", "studio-plugin"],
 			vec!["destructive: destroys the target instance in Studio".to_owned()],
-			format!("wsync rm --path {}", shell_quote(&self.path)),
-		)
+			format!("wsync rm --path {}", shell_quote(&path)),
+		))
 	}
 }
 
@@ -327,15 +347,34 @@ mod tests {
 	#[test]
 	fn plans_carry_the_documented_shape() {
 		let plan = PlanRm {
-			path: "Workspace/OldPart".into(),
+			positional_path: None,
+			path: Some("Workspace/OldPart".into()),
 		}
-		.plan();
+		.plan()
+		.unwrap();
 
 		assert_eq!(plan["ok"], true);
 		assert_eq!(plan["readOnly"], true);
 		assert_eq!(plan["mutates"], json!(["studio"]));
 		assert!(plan["risks"][0].as_str().unwrap().contains("destructive"));
 		assert_eq!(plan["executeCommand"], "wsync rm --path 'Workspace/OldPart'");
+
+		// The positional form plans the same command; two different paths
+		// are refused
+		let positional = PlanRm {
+			positional_path: Some("Workspace/OldPart".into()),
+			path: None,
+		}
+		.plan()
+		.unwrap();
+
+		assert_eq!(positional, plan);
+		assert!(PlanRm {
+			positional_path: Some("Workspace/A".into()),
+			path: Some("Workspace/B".into()),
+		}
+		.plan()
+		.is_err());
 	}
 
 	#[test]

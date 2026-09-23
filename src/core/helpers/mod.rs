@@ -2,6 +2,7 @@ use crate::Properties;
 
 mod migrations;
 
+pub mod reshape;
 pub mod syncback;
 
 #[inline]

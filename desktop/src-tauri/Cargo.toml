@@ -16,6 +16,12 @@ serde_json = "1"
 tauri-build = { version = "2.6", features = [] }
 
 [dependencies]
+# Local wall-clock stamps for the notes this host appends to a daemon's journal
+# when the daemon can no longer write one itself (a crash, a lost heartbeat).
+# The engine's `DaemonLog::note` stamps with `chrono::Local`, and the lines must
+# be indistinguishable. Already compiled into this binary (via `serde_with`, with
+# `clock` enabled), so naming it here adds no crate to the tree.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # 32 CSPRNG bytes per project serve, for the daemon owner token (Design 11).
 getrandom = "0.3"
 # Design 7.0's experience-name lookup (`games.roblox.com`) is the only outbound
@@ -44,6 +50,11 @@ serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 tauri = { version = "2.11", features = [] }
 tauri-plugin-dialog = "2.7"
+# The OS notification for a daemon that died or stopped answering: the one event
+# worth interrupting someone outside the window for, because edits on disk stop
+# reaching Studio. Sent from the host only (`daemon.rs`), so the webview is
+# granted none of this plugin's commands in `capabilities/main.json`.
+tauri-plugin-notification = "2.4"
 tauri-plugin-updater = "2.10"
 # `process` + `signal`: the daemons are long-lived children this host owns and
 # must reap. `net` is both halves of the loopback surface — the client in

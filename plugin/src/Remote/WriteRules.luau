@@ -18,7 +18,7 @@ local WriteRules = {}
 WriteRules.LIMITS = {
 	maxPropNameBytes = 128, -- mirrors Handlers/Inspect and query prop names
 	maxBatchWrites = 500,
-	maxWaypointNameBytes = 200,
+	maxTransactionNameBytes = 200,
 	maxAttrNameBytes = 100, -- the engine's attribute-name limit
 	maxTagBytes = 512,
 	maxCallArgs = 64,
@@ -315,16 +315,6 @@ function WriteRules.isTransactionOpen(state: TransactionState): boolean
 	return state.open
 end
 
---- The sync-frame waypoint gate (pinned wave-4 contract): while the explicit
---- transaction's recording is open, the write processor's per-batch
---- waypoints must be suppressed — the recording brackets every applied sync
---- frame, so a daemon-driven bulk application lands as exactly one Studio
---- Undo. `beginTransaction` only marks the state open once Studio granted
---- the recording, so "transaction open" and "recording open" coincide.
-function WriteRules.shouldSuppressBatchWaypoints(state: TransactionState): boolean
-	return state.open
-end
-
 --- Open the single transaction. Raises CONFLICT when one is already open or
 --- when Studio refuses the recording, INVALID_ARGUMENT for a bad name.
 --- Returns the transaction's display name.
@@ -343,8 +333,8 @@ function WriteRules.beginTransaction(state: TransactionState, rawName: any, tryB
 			fail(INVALID_ARGUMENT, "name must be a string")
 		end
 
-		if #rawName > WriteRules.LIMITS.maxWaypointNameBytes then
-			fail(INVALID_ARGUMENT, `name exceeds {WriteRules.LIMITS.maxWaypointNameBytes} bytes`)
+		if #rawName > WriteRules.LIMITS.maxTransactionNameBytes then
+			fail(INVALID_ARGUMENT, `name exceeds {WriteRules.LIMITS.maxTransactionNameBytes} bytes`)
 		end
 
 		if rawName ~= "" then

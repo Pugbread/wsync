@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::{ColorChoice, Parser, Subcommand};
+use clap::{ColorChoice, CommandFactory, FromArgMatches, Parser, Subcommand};
 use clap_verbosity_flag::Verbosity;
 use env_logger::fmt::WriteStyle;
 use log::LevelFilter;
@@ -13,6 +13,7 @@ mod client;
 mod cloud;
 mod config;
 mod daemon;
+mod daemon_banner;
 mod debug;
 mod doc;
 mod exec;
@@ -90,6 +91,10 @@ pub struct Cli {
 		hide_possible_values = true
 	)]
 	pub color: ColorChoice,
+
+	/// The project this invocation addresses, for the daemon-down banner
+	#[arg(skip)]
+	daemon_check: Option<daemon_banner::DaemonCheck>,
 }
 
 impl Cli {
@@ -101,11 +106,22 @@ impl Cli {
 				"diff" | "changes" | "conflicts" | "decision" | "resolve" | "review"
 			) {
 				clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, format!(
-					"`wsync {command}` belongs to the retired conflict-review workflow. WSync now uses Studio-first sync. Use `wsync backlog list --project <path>` to inspect retained disk edits; `backlog restore` writes them back. Run `wsync commands` for the current offline index and `wsync refresh --project <path>` to update stale project instructions.\n"
+					"`wsync {command}` belongs to the retired conflict-review workflow. WSync now resolves differences without a review (the side that changed wins; real conflicts keep the disk side in the backlog). Use `wsync backlog list --project <path>` to inspect retained disk edits; `backlog restore` writes them back. Run `wsync commands` for the current offline index and `wsync refresh --project <path>` to update stale project instructions.\n"
 				)).exit();
 			}
 		}
-		Cli::parse_from(args)
+
+		// `Cli::parse_from`, split open so the daemon-down banner can read
+		// each command's project argument generically before the command
+		// structs take ownership of the matches
+		let mut matches = Cli::command().get_matches_from(args);
+		let daemon_check = daemon_banner::DaemonCheck::from_matches(&matches);
+		let mut cli = Cli::from_arg_matches_mut(&mut matches)
+			.map_err(|err| err.format(&mut Cli::command()))
+			.unwrap_or_else(|err| err.exit());
+
+		cli.daemon_check = daemon_check;
+		cli
 	}
 
 	pub fn profile(&self) -> bool {
@@ -149,6 +165,12 @@ impl Cli {
 	}
 
 	pub fn main(self) -> Result<()> {
+		// Before the command runs, so the warning lands even when the
+		// command then fails or hangs (stderr only: `--raw` stdout stays JSON)
+		if let Some(check) = &self.daemon_check {
+			check.warn_if_down();
+		}
+
 		match self.command {
 			Commands::Init(command) => command.main(),
 			Commands::Serve(command) => command.main(),
@@ -176,6 +198,8 @@ impl Cli {
 			Commands::Status(command) => command.main(),
 			Commands::Doctor(command) => command.main(),
 			Commands::Capabilities(command) => command.main(),
+			Commands::WaitSynced(command) => command.main(),
+			Commands::Verify(command) => command.main(),
 
 			// Live inspection
 			Commands::Get(command) => command.main(),
@@ -209,8 +233,6 @@ impl Cli {
 			Commands::Tag(command) => command.main(),
 			Commands::Call(command) => command.main(),
 			Commands::Eval(command) => command.main(),
-			Commands::Save(command) => command.main(),
-			Commands::Waypoint(command) => command.main(),
 			Commands::Undo(command) => command.main(),
 			Commands::Redo(command) => command.main(),
 
@@ -274,6 +296,8 @@ pub enum Commands {
 	Status(live::Status),
 	Doctor(live::Doctor),
 	Capabilities(live::Capabilities),
+	WaitSynced(live::WaitSynced),
+	Verify(live::Verify),
 
 	Get(live::Get),
 	Ls(live::Ls),
@@ -304,8 +328,6 @@ pub enum Commands {
 	Tag(live::Tag),
 	Call(live::Call),
 	Eval(live::Eval),
-	Save(live::Save),
-	Waypoint(live::Waypoint),
 	Undo(live::Undo),
 	Redo(live::Redo),
 

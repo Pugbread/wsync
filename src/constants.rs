@@ -148,6 +148,31 @@ pub const WRITES_LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 /// Result bound for the daemon-side `where` op (registry contract)
 pub const WHERE_MATCH_LIMIT: usize = 500;
 
+/// `wait-synced`: the default overall deadline, and the upper bound on a
+/// caller-supplied one
+pub const WAIT_SYNCED_DEFAULT_TIMEOUT_MS: u64 = 30_000;
+pub const WAIT_SYNCED_MAX_TIMEOUT_MS: u64 = 600_000;
+
+/// `wait-synced`: grace for the OS to deliver a finished write to the file
+/// watcher. The debouncer stage waits for a flush pass that started at least
+/// this long plus the debounce window after the barrier began. The OS queue
+/// is the one leg nothing can observe, so this is the barrier's only
+/// time-based assumption; FSEvents/inotify normally deliver within a few ms
+pub const WATCHER_DELIVERY_SLACK: Duration = Duration::from_millis(150);
+
+/// `verify`: bounds for one `verify_sources` chunk — entries, and the summed
+/// disk bytes the plugin may have to hash (Luau SHA-256 is the slow part)
+pub const VERIFY_CHUNK_MAX_ENTRIES: usize = 256;
+pub const VERIFY_CHUNK_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// `verify`: scripts per `verify_tree` page, and the per-op deadline (the
+/// plugin hashes and walks; these outlast live ops like the bulk ops do)
+pub const VERIFY_TREE_PAGE: usize = 2000;
+pub const VERIFY_OP_TIMEOUT_MS: u64 = 30_000;
+
+/// `verify`: entries listed per report category; counts stay exact
+pub const VERIFY_LIST_LIMIT: usize = 500;
+
 // Set of default sync rules that is used to determine
 // what middleware should be used to process a file
 // users can override these rules in the project file

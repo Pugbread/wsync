@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context as AnyhowContext, Result};
+use anyhow::{anyhow, bail, Context as AnyhowContext, Result};
 use log::{debug, error, trace, warn};
 use path_clean::PathClean;
 use rbx_dom_weak::{types::Ref, HashMapExt, Instance, Ustr, UstrMap};
@@ -7,15 +7,19 @@ use std::path::{Path, PathBuf};
 use crate::{
 	config::Config,
 	core::{
-		helpers::syncback::{rename_path, serialize_properties, validate_properties, verify_name, verify_path},
+		helpers::{
+			reshape::{self, Reshape},
+			syncback::{rename_path, serialize_properties, validate_properties, verify_name, verify_path},
+		},
 		meta::{Meta, NodePath, Source, SourceEntry, SourceKind},
 		snapshot::{AddedSnapshot, Snapshot, UpdatedSnapshot},
 		tree::Tree,
 	},
+	crash_handler,
 	ext::PathExt,
 	middleware::{
 		data::{self, write_original_name},
-		dir, Middleware,
+		dir, stack_position, Middleware, MAX_MODEL_DEPTH, SNAPSHOT_STACK_BUDGET,
 	},
 	project::{Project, ProjectNode},
 	vfs::Vfs,
@@ -35,8 +39,56 @@ macro_rules! filter_warn {
 	};
 }
 
+/// How far a recursive write has descended into a Studio-sent subtree.
+/// Subtrees are written one level per instance, so a pathologically deep one
+/// must fail with an error rather than overflow the processor thread's stack
+/// (which aborts the daemon without a word). Both halves of the snapshot
+/// walk's guard apply: a level count, and a stack budget measured from where
+/// the write began — debug frames here are large enough that the count alone
+/// would not fit a 2 MiB stack
+#[derive(Clone, Copy)]
+struct Nesting {
+	depth: usize,
+	base: usize,
+}
+
+impl Nesting {
+	fn root() -> Self {
+		Self {
+			depth: 0,
+			base: stack_position(),
+		}
+	}
+
+	fn child(self) -> Self {
+		Self {
+			depth: self.depth + 1,
+			..self
+		}
+	}
+
+	fn check(self, name: &str) -> Result<()> {
+		let stack = self.base.saturating_sub(stack_position());
+
+		if self.depth > MAX_MODEL_DEPTH || stack > SNAPSHOT_STACK_BUDGET {
+			bail!(
+				"Instance {name} is nested deeper than this write can follow ({} levels, {} KiB of stack) below the added subtree's root; refusing to write it",
+				self.depth,
+				stack / 1024
+			);
+		}
+
+		Ok(())
+	}
+}
+
 pub fn apply_addition(snapshot: AddedSnapshot, tree: &mut Tree, vfs: &Vfs) -> Result<()> {
 	trace!("Adding {:?} with parent {:?}", snapshot.id, snapshot.parent);
+
+	let _breadcrumb = crash_handler::breadcrumb(format!(
+		"applying the Studio addition of {} ({}) under {:?}",
+		snapshot.name, snapshot.class, snapshot.parent
+	));
 
 	if !tree.exists(snapshot.parent) {
 		warn!(
@@ -175,7 +227,10 @@ pub fn apply_addition(snapshot: AddedSnapshot, tree: &mut Tree, vfs: &Vfs) -> Re
 		parent_meta: &mut Meta,
 		tree: &mut Tree,
 		vfs: &Vfs,
+		nesting: Nesting,
 	) -> Result<Source> {
+		nesting.check(&snapshot.name)?;
+
 		// Code scope: nested out-of-projection children are skipped whole
 		// (their subtrees stay Studio-authoritative)
 		if !parent_meta.context.scope().allows_class(&snapshot.class) {
@@ -186,7 +241,8 @@ pub fn apply_addition(snapshot: AddedSnapshot, tree: &mut Tree, vfs: &Vfs) -> Re
 			return Ok(parent_meta.source.clone());
 		}
 
-		let config = Config::new();
+		// Read once, not held: the reshape below reads the config again
+		let rojo_mode = Config::new().rojo_mode;
 
 		let mut parent_path = parent_path.to_owned();
 
@@ -199,7 +255,7 @@ pub fn apply_addition(snapshot: AddedSnapshot, tree: &mut Tree, vfs: &Vfs) -> Re
 				.filter(|rule| {
 					if let Some(pattern) = rule.child_pattern.as_ref() {
 						!((pattern.as_str().starts_with(".src") || pattern.as_str().ends_with(".data.json"))
-							&& config.rojo_mode)
+							&& rojo_mode)
 					} else {
 						true
 					}
@@ -210,6 +266,13 @@ pub fn apply_addition(snapshot: AddedSnapshot, tree: &mut Tree, vfs: &Vfs) -> Re
 
 			let name = sync_rule.get_name(&parent_path);
 			let mut folder_path = parent_path.with_file_name(&name);
+
+			// An empty folder of that name is what an interrupted reshape
+			// used to leave; it holds nothing, so it must not block this one
+			if reshape::is_empty_dir(&folder_path, vfs)? {
+				debug!("Removing the empty leftover folder {}", folder_path.display());
+				vfs.remove(&folder_path)?;
+			}
 
 			if !verify_path(&mut folder_path, &mut snapshot.name, parent_meta, vfs) {
 				return Ok(parent_meta.source.clone());
@@ -233,14 +296,16 @@ pub fn apply_addition(snapshot: AddedSnapshot, tree: &mut Tree, vfs: &Vfs) -> Re
 			};
 
 			let mut source = Source::child_file(&folder_path, &file_path);
+			let mut moves = vec![(parent_path.clone(), file_path.clone())];
 
-			dir::write_dir(&folder_path, vfs)?;
-			vfs.rename(&parent_path, &file_path)?;
-
-			if let Some(data_paths) = data_paths {
-				source.add_data(&data_paths.1);
-				vfs.rename(&data_paths.0, &data_paths.1)?;
+			if let Some((old_data, new_data)) = data_paths {
+				source.add_data(&new_data);
+				moves.push((old_data, new_data));
 			}
+
+			// Script and sidecar move as one crash-safe transaction: a crash
+			// can no longer leave `X.luau` beside `X/` (see `reshape`)
+			Reshape::to_folder(&parent_path, &folder_path, moves, vfs)?.run(vfs)?;
 
 			parent_path = folder_path;
 
@@ -268,13 +333,14 @@ pub fn apply_addition(snapshot: AddedSnapshot, tree: &mut Tree, vfs: &Vfs) -> Re
 
 			for mut child in snapshot.children {
 				child.properties = validate_properties(child.properties.clone(), meta.context.syncback_filter());
-				add_non_project_instances(snapshot.id, &path, child, &mut meta, tree, vfs)?;
+				add_non_project_instances(snapshot.id, &path, child, &mut meta, tree, vfs, nesting.child())?;
 			}
 		}
 
 		Ok(parent_source)
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	fn add_project_instances(
 		parent_id: Ref,
 		path: &Path,
@@ -283,13 +349,16 @@ pub fn apply_addition(snapshot: AddedSnapshot, tree: &mut Tree, vfs: &Vfs) -> Re
 		parent_node: &mut ProjectNode,
 		parent_meta: &Meta,
 		tree: &mut Tree,
-	) {
+		nesting: Nesting,
+	) -> Result<()> {
+		nesting.check(&snapshot.name)?;
+
 		if !parent_meta.context.scope().allows_class(&snapshot.class) {
 			debug!(
 				"Skipping project-node addition of {} ({}): class is outside the code-scope projection",
 				snapshot.name, snapshot.class
 			);
-			return;
+			return Ok(());
 		}
 
 		let mut node = ProjectNode {
@@ -317,15 +386,29 @@ pub fn apply_addition(snapshot: AddedSnapshot, tree: &mut Tree, vfs: &Vfs) -> Re
 
 		for mut child in snapshot.children {
 			child.properties = validate_properties(child.properties, filter);
-			add_project_instances(parent_id, path, node_path.clone(), child, &mut node, parent_meta, tree);
+			add_project_instances(
+				parent_id,
+				path,
+				node_path.clone(),
+				child,
+				&mut node,
+				parent_meta,
+				tree,
+				nesting.child(),
+			)?;
 		}
 
 		parent_node.tree.insert(snapshot.name, node);
+
+		Ok(())
 	}
+
+	let nesting = Nesting::root();
 
 	match parent_meta.source.get().clone() {
 		SourceKind::Path(path) => {
-			let parent_source = add_non_project_instances(parent_id, &path, snapshot, &mut parent_meta, tree, vfs)?;
+			let parent_source =
+				add_non_project_instances(parent_id, &path, snapshot, &mut parent_meta, tree, vfs, nesting)?;
 
 			parent_meta.set_source(parent_source);
 			tree.update_meta(parent_id, parent_meta);
@@ -335,7 +418,7 @@ pub fn apply_addition(snapshot: AddedSnapshot, tree: &mut Tree, vfs: &Vfs) -> Re
 				let custom_path = path.with_file_name(custom_path.path()).clean();
 
 				let parent_source =
-					add_non_project_instances(parent_id, &custom_path, snapshot, &mut parent_meta, tree, vfs)?;
+					add_non_project_instances(parent_id, &custom_path, snapshot, &mut parent_meta, tree, vfs, nesting)?;
 
 				let parent_source = Source::project(&name, &path, *node, node_path.clone())
 					.with_relevant(parent_source.relevant().to_owned());
@@ -349,7 +432,16 @@ pub fn apply_addition(snapshot: AddedSnapshot, tree: &mut Tree, vfs: &Vfs) -> Re
 					.find_node_by_path(&node_path)
 					.context(format!("Failed to find project node with path {node_path:?}"))?;
 
-				add_project_instances(parent_id, &path, node_path.clone(), snapshot, node, &parent_meta, tree);
+				add_project_instances(
+					parent_id,
+					&path,
+					node_path.clone(),
+					snapshot,
+					node,
+					&parent_meta,
+					tree,
+					nesting,
+				)?;
 
 				project.save(&path)?;
 			}
@@ -365,6 +457,14 @@ pub fn apply_addition(snapshot: AddedSnapshot, tree: &mut Tree, vfs: &Vfs) -> Re
 
 pub fn apply_update(snapshot: UpdatedSnapshot, tree: &mut Tree, vfs: &Vfs) -> Result<()> {
 	trace!("Updating {:?}", snapshot.id);
+
+	let _breadcrumb = crash_handler::breadcrumb(format!(
+		"applying the Studio update of {:?} ({})",
+		snapshot.id,
+		tree.get_meta(snapshot.id)
+			.and_then(|meta| meta.source.get().path().map(|path| path.display().to_string()))
+			.unwrap_or_else(|| "no source".into())
+	));
 
 	if let Some(instance) = tree.get_instance(snapshot.id) {
 		let context = &tree.get_meta(snapshot.id).unwrap().context;
@@ -661,6 +761,13 @@ pub fn apply_update(snapshot: UpdatedSnapshot, tree: &mut Tree, vfs: &Vfs) -> Re
 pub fn apply_removal(id: Ref, tree: &mut Tree, vfs: &Vfs) -> Result<()> {
 	trace!("Removing {id:?}");
 
+	let _breadcrumb = crash_handler::breadcrumb(format!(
+		"applying the Studio removal of {id:?} ({})",
+		tree.get_meta(id)
+			.and_then(|meta| meta.source.get().path().map(|path| path.display().to_string()))
+			.unwrap_or_else(|| "no source".into())
+	));
+
 	if let Some(instance) = tree.get_instance(id) {
 		let filter = tree.get_meta(id).unwrap().context.syncback_filter();
 
@@ -709,36 +816,58 @@ pub fn apply_removal(id: Ref, tree: &mut Tree, vfs: &Vfs) -> Result<()> {
 
 		let meta = tree.get_meta_mut(parent.referent()).unwrap();
 
-		if let SourceKind::Path(folder_path) = meta.source.get() {
+		if let SourceKind::Path(folder_path) = meta.source.get().clone() {
 			let name = folder_path.get_name();
 
 			if let Some(file) = meta.source.get_file() {
+				let init_path = file.path().to_owned();
 				let file_path = meta
 					.context
 					.sync_rules()
 					.iter()
-					.find(|rule| rule.matches_child(file.path()))
-					.and_then(|rule| rule.locate(folder_path, name, false));
+					.find(|rule| rule.matches_child(&init_path))
+					.and_then(|rule| rule.locate(&folder_path, name, false));
 
 				if let Some(new_path) = file_path {
-					vfs.rename(file.path(), &new_path)?;
 					let mut source = Source::file(&new_path);
+					let mut moves = vec![(init_path.clone(), new_path.clone())];
 
 					if let Some(data) = meta.source.get_data() {
 						let data_path = meta
 							.context
 							.sync_rules_of_type(&Middleware::InstanceData, true)
 							.iter()
-							.find_map(|rule| rule.locate(folder_path, name, false));
+							.find_map(|rule| rule.locate(&folder_path, name, false));
 
-						if let Some(new_path) = data_path {
-							vfs.rename(data.path(), &new_path)?;
-							source.add_data(&new_path);
+						if let Some(new_data) = data_path {
+							moves.push((data.path().to_owned(), new_data.clone()));
+							source.add_data(&new_data);
 						}
 					}
 
-					vfs.remove(folder_path)?;
-					meta.set_source(source);
+					let moving: Vec<&Path> = moves.iter().map(|(from, _)| from.as_path()).collect();
+					let reshape = Reshape::to_flat(&folder_path, &new_path, moves.clone(), vfs)?;
+
+					// The folder goes with the reshape, so it only demotes when
+					// it holds nothing but the moving files (an unprojected or
+					// ignored file would be deleted with it), and only into free
+					// names; otherwise the folder form stays, which is valid
+					if !reshape::holds_only(&folder_path, &moving, vfs)? {
+						debug!(
+							"Keeping the folder form of {}: it holds other files",
+							folder_path.display()
+						);
+					} else if let Some(taken) = reshape.targets().into_iter().find(|target| vfs.exists(target)) {
+						warn!(
+							"Keeping the folder form of {}: {} already exists",
+							folder_path.display(),
+							taken.display()
+						);
+					} else {
+						// Script and sidecar move as one crash-safe transaction
+						reshape.run(vfs)?;
+						meta.set_source(source);
+					}
 				}
 			}
 		}

@@ -212,6 +212,20 @@ impl WsState {
 		slot.as_ref().map(|conn| (conn.name.clone(), conn.transport_name()))
 	}
 
+	/// The core-queue listener id of the connected WS plugin (`wait-synced`
+	/// reads that listener's delivery accounting). `None` without a plugin or
+	/// for the long-poll transport
+	pub fn plugin_queue_id(&self) -> Option<u32> {
+		match &*lock!(self.plugin) {
+			Some(PluginConn {
+				queue_id,
+				transport: PluginTransport::Ws { .. },
+				..
+			}) => Some(*queue_id),
+			_ => None,
+		}
+	}
+
 	/// Returns the WS plugin's outbound frame queue, or a typed reason why
 	/// requests cannot be routed right now
 	pub fn plugin_frames(&self) -> Result<mpsc::Sender<String>, &'static str> {

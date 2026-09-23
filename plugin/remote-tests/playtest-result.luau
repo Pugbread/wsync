@@ -108,4 +108,85 @@ check(not malformed.ok and malformed.error:find("explicit return count",1,true),
 local cycle = {} cycle[1] = cycle
 local failed = ResultEnvelope.build(table.pack(true,cycle), Codec.encode)
 check(not failed.ok and failed.error:find("table cycle",1,true), "codec failure lost its typed message")
-print(`Playtest result transport: {checks} checks passed using real exec/playscript wrappers, real envelope builder and real Codec.`)
+local transportChecks = checks
+
+-- The run's terminal record repeats every client failure, so a caller reading
+-- only the last record still sees why the main script sat waiting
+local RunState = require("./RunState")
+local function newRun()
+	local config = RunState.validate({script="return 1", clientScript="error('x')", mode="multiplayer", players=2, timeoutSec=5})
+	local run = RunState.create(config, "{}", "job-test", 0)
+	RunState.markReady(run, "server", 0.1)
+	RunState.markBooted(run, "rt-server|main", "main", 0.2)
+	return run
+end
+local function finish(run, terminal, now)
+	check(RunState.requestTerminal(run, terminal, now), "terminal request refused")
+	check(RunState.finalize(run, nil, now), "finalize refused")
+	local page = RunState.poll(run, 0, nil, nil, now)
+	check(page.done, "terminal page not done")
+	return page.records[#page.records], page
+end
+local clientTraceback = "Workspace.Door:12: attempt to index nil\nRunner:3 function __wsync_run"
+-- The incident: a client errors, the server keeps waiting, the hard timeout fires
+local run = newRun()
+RunState.enqueue(run, {type="clientResult", context="client:1", ok=false, error="Workspace.Door:12: attempt to index nil", traceback=clientTraceback}, 1)
+RunState.enqueue(run, {type="clientResult", context="client:2", ok=true, value=1, count=1}, 1.1)
+RunState.enqueue(run, {type="log", context="client:2", level="error", message="LocalScript:4: nope"}, 1.2)
+RunState.enqueue(run, {type="log", context="client:2", level="error", message="LocalScript:4: nope"}, 1.3)
+RunState.enqueue(run, {type="log", context="server", level="error", message="server noise"}, 1.4)
+RunState.enqueue(run, {type="log", context="client:1", level="warn", message="a warning"}, 1.5)
+check(RunState.checkDeadlines(run, 4.9, "running") == nil, "hard timeout fired early")
+local timeout = RunState.checkDeadlines(run, 5, "running")
+check(timeout ~= nil and timeout.outcome == "timeout", "hard timeout not detected")
+check(RunState.requestTerminal(run, timeout, 5), "timeout terminal refused")
+-- A client failure landing during teardown still makes the terminal
+RunState.enqueue(run, {type="clientResult", context="client:2", ok=false, error="client playscript failed to boot"}, 5.5)
+timeout.jobStatus = "stopped"
+check(RunState.finalize(run, nil, 6), "finalize refused")
+local page = RunState.poll(run, 0, nil, nil, 6)
+local last = page.records[#page.records]
+check(page.done and page.exit == 3, "timeout must still exit 3")
+check(last.type == "result" and last.outcome == "timeout" and last.exitCode == 3 and last.jobStatus == "stopped", "timeout record is not self-contained")
+local failures = last.clientFailures
+check(type(failures) == "table" and #failures == 3, "client failures missing from the timeout record")
+check(failures[1].context == "client:1" and failures[1].source == "clientResult" and failures[1].traceback == clientTraceback and failures[1].t == 1, "client traceback lost")
+check(failures[2].source == "log" and failures[2].context == "client:2" and failures[2].count == 2, "identical client error lines must collapse")
+check(failures[3].error == "client playscript failed to boot" and failures[3].traceback == nil, "late client failure lost")
+check(last.clientFailuresOmitted == nil, "nothing was omitted")
+local carrier
+for _, record in page.records do
+	if record.seq == failures[1].seq then carrier = record end
+end
+check(carrier ~= nil and carrier.type == "clientResult" and carrier.traceback == clientTraceback, "seq must name the progress record that carried the failure")
+-- Every outcome carries them; a clean run keeps the old shape
+local success = finish(newRun(), {outcome="success", ok=true, value=1}, 1)
+check(success.clientFailures == nil and success.exitCode == 0, "a clean run grew a clientFailures field")
+run = newRun()
+RunState.enqueue(run, {type="clientResult", context="client:1", ok=false, error="boom", traceback="boom\nRunner:1"}, 1)
+success = finish(run, {outcome="success", ok=true, value=1}, 2)
+check(success.ok and #success.clientFailures == 1, "a success must still report its failed clients")
+run = newRun()
+RunState.enqueue(run, {type="clientResult", context="client:1", ok=false, error="boom"}, 1)
+local aborted = finish(run, {outcome="aborted", ok=false, reason="stopped from Studio", jobStatus="ended"}, 2)
+check(aborted.type == "aborted" and aborted.exitCode == 4 and #aborted.clientFailures == 1, "aborted record lost its client failures")
+-- Bounded: caps count the overflow, and text is cut on a UTF-8 boundary
+run = newRun()
+for index = 1, RunState.LIMITS.maxClientFailureResults + 3 do
+	RunState.enqueue(run, {type="clientResult", context="client:1", ok=false, error=`boom {index}`}, 1)
+end
+for index = 1, RunState.LIMITS.maxClientFailureLogs + 2 do
+	RunState.enqueue(run, {type="log", context="client:1", level="error", message=`line {index}`}, 1)
+end
+local wide = string.rep("é", RunState.LIMITS.clientFailureTracebackBytes)
+RunState.enqueue(run, {type="clientResult", context="client:2", ok=false, error=wide, traceback=wide}, 1)
+local capped = finish(run, {outcome="failure", ok=false, error="main failed"}, 2)
+check(#capped.clientFailures == RunState.LIMITS.maxClientFailureResults + RunState.LIMITS.maxClientFailureLogs, "caps not applied")
+check(capped.clientFailuresOmitted == 6, "overflow not counted")
+run = newRun()
+RunState.enqueue(run, {type="clientResult", context="client:2", ok=false, error=wide, traceback=wide}, 1)
+local entry = finish(run, {outcome="failure", ok=false, error="main failed"}, 2).clientFailures[1]
+check(entry.error:sub(-11) == "<truncated>" and #entry.error <= RunState.LIMITS.clientFailureErrorBytes + 11, "error text not capped")
+check(entry.traceback:sub(-11) == "<truncated>" and utf8.len(entry.traceback:sub(1, -12)) ~= nil, "traceback cut mid code point")
+print(`Playtest result transport: {transportChecks} checks passed using real exec/playscript wrappers, real envelope builder and real Codec.`)
+print(`Playtest run terminal: {checks - transportChecks} checks passed using the real RunState.`)

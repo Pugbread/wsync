@@ -29,6 +29,9 @@ const test = fs.readFileSync(path.join(root, 'plugin/remote-tests/playtest-resul
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'wsync-playtest-result-'));
 try {
   fs.copyFileSync(path.join(root, 'plugin/src/Playtest/ResultEnvelope.luau'), path.join(temp, 'ResultEnvelope.luau'));
+  // The run state machine is require-free too: its terminal record is where
+  // client failures must survive a timeout
+  fs.copyFileSync(path.join(root, 'plugin/src/Playtest/RunState.luau'), path.join(temp, 'RunState.luau'));
   fs.copyFileSync(path.join(root, 'plugin/src/Remote/Codec.luau'), path.join(temp, 'Codec.luau'));
   fs.writeFileSync(path.join(temp, 'test.luau'), 'local HttpService = {}\nlocal LIMITS = {resultBytes=1024*1024}\n' + wrappers + '\n' + cap + '\n' + test);
   const result = spawnSync(runner, [path.join(temp, 'test.luau')], { encoding:'utf8', timeout:60000 });

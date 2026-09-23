@@ -1,3 +1,4 @@
+use anyhow::Result;
 use rbx_dom_weak::{types::Ref, WeakDom};
 
 use crate::{
@@ -18,7 +19,7 @@ pub fn save_mesh(properties: &Properties) -> Option<String> {
 }
 
 #[inline]
-pub fn snapshot_from_dom(dom: WeakDom, id: Ref) -> Snapshot {
+pub fn snapshot_from_dom(dom: WeakDom, id: Ref) -> Result<Snapshot> {
 	snapshot::snapshot_from_dom(dom, id)
 }
 

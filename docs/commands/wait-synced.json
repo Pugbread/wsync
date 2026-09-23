@@ -1,0 +1,19 @@
+{
+  "name": "wait-synced",
+  "title": "wsync wait-synced",
+  "category": "Live diagnostics",
+  "description": "Blocks until Studio has applied every disk change the daemon had seen when it was called — the barrier to put after a batch of file edits and before anything that reads Studio.",
+  "usage": "wsync wait-synced [--project <path>] [--port <port>] [--timeout <secs>] [--raw]",
+  "examples": [
+    "wsync wait-synced --project .",
+    "wsync wait-synced --project . --timeout 60 --raw"
+  ],
+  "notes": [
+    "A real barrier, not a sleep: the daemon waits for the file watcher's debouncer to flush past the moment the command started, drains the sync processor, confirms every resulting change reached the plugin connection, then asks the plugin a question it only answers after applying everything queued before it — including script source writes still landing in the editor.",
+    "Exits 0 once synced and reports how many changes were confirmed and how long it took. Exits non-zero with the failing stage (`watcher`, `processor`, `queue`, `studio`) and the pending count on timeout (default 30 s), when no Studio plugin is connected, or when no daemon answers.",
+    "A disk edit that clashes with Studio is not pending: Studio wins at once and the disk bytes move to the backlog. Entries captured while waiting are listed as never delivered; `wsync backlog restore <id>` puts one back.",
+    "File events that arrive while a Studio change is being written to disk (or within 300 ms after) are ignored as its echo. The barrier counts the ones it saw as `suppressedEvents` and warns: a real edit caught in that window is not delivered until the file is saved again.",
+    "`wsync status` shows the pending-outbound count (queued, and sent but not yet confirmed by a `wait-synced`) without waiting.",
+    "Needs the WebSocket plugin transport and a plugin build that implements `sync_barrier`."
+  ]
+}

@@ -3,7 +3,7 @@
 -- table for the dispatcher. Meta/Inspect/Query/ClassInfo/Logs are read-only
 -- (Selection.ops.select_set is a whitelisted UI-state exception — see
 -- Handlers/Selection.luau); Write and History carry the mutating slice with
--- its guardrails (Parent guard, cross-service mv force, per-op waypoints,
+-- its guardrails (Parent guard, cross-service mv force,
 -- `meta.mutation`/`meta.audit` tagging — see Handlers/Write.luau); Bulk
 -- carries the read-only bulk-transfer pair (`read_subtree`/`source_read`)
 -- behind Core's session bridge (Design §7.4-A); Capture renders and streams
@@ -11,7 +11,8 @@
 -- session registry; Clipboard serializes/pastes native instance payloads
 -- (Design §5.4; wave-5 pinned contracts); Playtest drives Studio playtests
 -- and their PlayServer/PlayClient runtime agents over PluginConnectionService
--- (playtest.json; wave-6 pinned contracts). Every handler returns a JSON-safe
+-- (playtest.json; wave-6 pinned contracts); Sync answers the `wait-synced`
+-- barrier and the read-only `verify` checks. Every handler returns a JSON-safe
 -- value or raises a RemoteError (Remote/Error.luau).
 
 local Meta = require(script.Meta)
@@ -27,6 +28,7 @@ local Capture = require(script.Capture)
 local Transmit = require(script.Transmit)
 local Clipboard = require(script.Clipboard)
 local Playtest = require(script.Playtest)
+local Sync = require(script.Sync)
 
 export type Handler = (args: { [string]: any }, ctx: any) -> any
 
@@ -47,6 +49,7 @@ for _, family in
 		Transmit.ops,
 		Clipboard.ops,
 		Playtest.ops,
+		Sync.ops,
 	} :: { { [string]: Handler } }
 do
 	for name, handler in family do

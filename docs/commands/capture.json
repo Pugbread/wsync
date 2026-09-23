@@ -34,13 +34,14 @@
       ]
     }
   },
-  "usage": "wsync capture <ui|model|viewport> [TARGET] [--project <path>] [--port <port>] [--size WxH] [--region x,y,w,h] [--view <preset>] [--direction x,y,z] [--camera-cframe <12 floats>] [--padding 1.0-4.0] [--fov 1-120] [--world] [--skybox] [--framed] [--ui none|overlay] [-o|--output <file>] [--timeout <seconds>] [--raw]",
+  "usage": "wsync capture <ui|model|viewport> [TARGET | --path <TARGET>] [--project <path>] [--port <port>] [--size WxH] [--region x,y,w,h] [--view <preset>] [--direction x,y,z] [--camera-cframe <12 floats>] [--padding 1.0-4.0] [--fov 1-120] [--world] [--skybox] [--framed] [--ui none|overlay] [-o|--output <file>] [--timeout <seconds>] [--raw]",
   "examples": [
     "wsync capture ui --project . --size 1920x1080 --output ./captures/hud.png --raw",
     "wsync capture ui StarterGui/HUD/InventoryPanel --project . --size 1200x800 --output ./captures/inventory.png --raw",
     "wsync capture ui --project . --region 120,80,1280,720 --size 1920x1080 -o ./captures/hud-region.png --raw",
     "wsync capture model Workspace/Map/Boss --project . --view isometric --size 1024x1024 --padding 1.25 --fov 32 --output ./captures/boss.png --raw",
     "wsync capture model Workspace/Map/Boss --project . --camera-cframe '0,10,20,1,0,0,0,1,0,0,0,1' --framed --size 1600x900 --output ./captures/boss-authored.png --raw",
+    "wsync capture model --path Workspace/Map/Boss --project . --view front --size 1024x1024 --output ./captures/boss-front.png --raw",
     "wsync capture model Workspace/Vehicle --project . --world --skybox --direction 1,-0.65,1 --size 1600x900 --output ./captures/vehicle-scene.png",
     "wsync capture viewport --project . --region 120,80,1280,720 --size 1920x1080 --output ./captures/viewport-transparent.png --raw",
     "wsync capture viewport --project . --skybox --ui overlay --size 1920x1080 --output ./captures/viewport-world.png --raw"
@@ -54,6 +55,7 @@
     "For every no-skybox capture, WSync temporarily moves every `Sky` and `Atmosphere` descendant out from under `Lighting` before rendering and watches for matching descendants added while capture is active. Cleanup restores each object to its exact original parent—even after preparation, rendering, transport, or PNG failure—and falls back to `Lighting` only if that parent disappeared. Camera, UI, Lighting properties, and temporary clones receive the same protected cleanup.",
     "`--size WIDTHxHEIGHT` is optional and requests exact output dimensions. Without it, model captures use the focused-render default of 1024x1024 while UI and viewport captures keep their native/current render dimensions. `--output`/`-o`, `--timeout`, and `--raw` are common to every capture type; default files are `wsync-ui.png`, `wsync-model.png`, and `wsync-viewport.png`. Each axis is limited to 4096 pixels and the image to 16777216 pixels.",
     "The plugin sends tightly packed RGBA8 in bounded chunks. The CLI checks dimensions, exact byte length, offsets, and EOF, then encodes and verifies the PNG locally. Raw output includes the absolute output path, MIME type, byte size, dimensions, SHA-256, and prepared capture metadata without placing pixels on stdout.",
-    "Negative camera vectors and CFrame components are accepted as separate option values, for example --direction -1,0,0. The equals form --direction=-1,0,0 works too."
+    "Negative camera vectors and CFrame components are accepted as separate option values, for example --direction -1,0,0. The equals form --direction=-1,0,0 works too.",
+    "`ui` and `model` take TARGET positionally or as `--path`, like every single-instance command; passing both is accepted only when they agree."
   ]
 }
